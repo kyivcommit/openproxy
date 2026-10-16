@@ -885,6 +885,33 @@ struct ProxyServerTests {
         #expect(fetcher.calls == ["openai/gpt-5"])
     }
 
+    @Test func upstreamHostHeaderIsTheConfiguredAuthority() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-host-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let ca = CertAuthority(directory: directory)
+        try ca.loadOrCreate()
+        let upstream = try RecordingUpstream(ca: ca)
+        do {
+            try await upstream.start()
+            let client = NIOUpstreamClient(
+                resolver: StaticResolver(addresses: ["127.0.0.1"]),
+                host: "openrouter.ai", port: upstream.port,
+                trustRoots: [upstream.caCertificate], allowLoopback: true)
+            _ = try await client.send(UpstreamRequest(
+                method: "GET", path: "/api/v1/models",
+                headers: [("Host", "evil.example.com")], body: Data()))
+            let received = try #require(upstream.received.first)
+            #expect(received.header("host") == "openrouter.ai:\(upstream.port)")
+        } catch {
+            await upstream.stop()
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        await upstream.stop()
+        try? FileManager.default.removeItem(at: directory)
+    }
+
     @Test func nonLoopbackPeerRejected() throws {        let foreign = try SocketAddress(ipAddress: "10.0.0.1", port: 1234)
         let loopback = try SocketAddress(ipAddress: "127.0.0.1", port: 1234)
         #expect(!ProxyServer.isAllowedPeer(foreign, allowNonLoopback: false))

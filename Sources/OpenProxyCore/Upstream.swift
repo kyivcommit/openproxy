@@ -82,30 +82,56 @@ public enum UpstreamError: Error, Equatable, Sendable {
 /// points `openrouter.ai` at the proxy) cannot feed us our own address, and
 /// keeps the last known good answer for offline/DoS fallbacks.
 public final class DoHResolver: HostResolver, @unchecked Sendable {
-    private let endpoint: URL
-    private let session: URLSession
-    private let lock = NSLock()
-    private var cache: [String: [String]] = [:]
+    struct Record: Sendable {
+        var addresses: [String]
+        /// Minimum record TTL, or nil when the answer carried none.
+        var ttl: TimeInterval?
+    }
 
-    public init(endpoint: URL = URL(string: "https://cloudflare-dns.com/dns-query")!) {
+    private let endpoint: URL
+    private let now: @Sendable () -> Date
+    private let maxStale: TimeInterval
+    private let fetch: @Sendable (String) async throws -> Record
+    private let lock = NSLock()
+    private var cache: [String: (record: Record, storedAt: Date)] = [:]
+
+    public convenience init(endpoint: URL = URL(string: "https://cloudflare-dns.com/dns-query")!) {
+        self.init(endpoint: endpoint, now: Date.init, maxStale: 3600)
+    }
+
+    /// `fetch`, `now` and `maxStale` are injection points for tests; production
+    /// uses the Cloudflare query and a one-hour cap on stale answers.
+    init(
+        endpoint: URL,
+        now: @escaping @Sendable () -> Date,
+        maxStale: TimeInterval,
+        fetch: (@Sendable (String) async throws -> Record)? = nil
+    ) {
         self.endpoint = endpoint
+        self.now = now
+        self.maxStale = maxStale
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 10
-        self.session = URLSession(configuration: configuration)
+        let session = URLSession(configuration: configuration)
+        self.fetch = fetch ?? { host in try await Self.query(host, endpoint: endpoint, session: session) }
     }
 
     public func resolve(_ host: String) async throws -> [String] {
-        if let addresses = try? await query(host), !addresses.isEmpty {
-            lock.withLock { cache[host] = addresses }
-            return addresses
+        if let record = try? await fetch(host), !record.addresses.isEmpty {
+            lock.withLock { cache[host] = (record, now()) }
+            return record.addresses
         }
-        if let cached = lock.withLock({ cache[host] }), !cached.isEmpty {
-            return cached
+        // A failed lookup may fall back to the last good answer, but no further
+        // than the record's TTL (or the cap when the answer had none).
+        if let entry = lock.withLock({ cache[host] }), !entry.record.addresses.isEmpty {
+            let age = now().timeIntervalSince(entry.storedAt)
+            let allowedAge = min(entry.record.ttl ?? maxStale, maxStale)
+            if age <= allowedAge { return entry.record.addresses }
         }
         throw UpstreamError.noAddress(host)
     }
 
-    private func query(_ host: String) async throws -> [String] {
+    private static func query(_ host: String, endpoint: URL, session: URLSession) async throws -> Record {
         var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "name", value: host),
@@ -121,10 +147,12 @@ public final class DoHResolver: HostResolver, @unchecked Sendable {
             throw UpstreamError.noAddress(host)
         }
         let answers = object["Answer"] as? [[String: Any]] ?? []
-        // type 1 == A record; AAAA answers are skipped so the client stays IPv4.
-        return answers.compactMap { answer in
+        // Only A records carry an address; a CNAME's target is a name, not an IP.
+        let addresses = answers.compactMap { answer in
             (answer["type"] as? Int) == 1 ? answer["data"] as? String : nil
         }
+        let ttl = answers.compactMap { $0["TTL"] as? Double }.min()
+        return Record(addresses: addresses, ttl: ttl)
     }
 }
 
@@ -209,7 +237,9 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
             do {
                 var head = HTTPRequestHead(version: .http1_1, method: HTTPMethod(rawValue: request.method), uri: request.path)
                 for (name, value) in request.headers { head.headers.add(name: name, value: value) }
-                if head.headers.first(name: "Host") == nil { head.headers.add(name: "Host", value: host) }
+                // The client's Host is meaningless to us (we dial a resolved IP);
+                // use the configured authority, matching the TLS SNI.
+                head.headers.replaceOrAdd(name: "Host", value: port == 443 ? host : "\(host):\(port)")
                 try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()
                 if !request.body.isEmpty {
                     var buffer = channel.allocator.buffer(capacity: request.body.count)
