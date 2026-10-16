@@ -165,6 +165,14 @@ public final class AppModel {
                 break
             case .uninstallAndQuit:
                 await uninstall()
+                // Terminate only once the hosts entry is confirmed gone: a cancelled or
+                // failed uninstall would otherwise leave openrouter.ai pointing at a dead
+                // listener the moment the app exits.
+                if status.hostsEntry {
+                    warn("Quit was cancelled: openrouter.ai is still routed to this Mac, so quitting "
+                        + "would break every client. Fix the uninstall problem, then quit again.")
+                    return
+                }
             }
         }
         quitDecision.terminate()
