@@ -30,6 +30,10 @@ struct MenuView: View {
             statsBlock
             Divider()
             statusBlock
+            if let unreachable = model.unreachableWarning {
+                Divider()
+                unreachableBlock(unreachable)
+            }
             if !model.warnings.isEmpty {
                 Divider()
                 warningBlock
@@ -106,6 +110,13 @@ struct MenuView: View {
             Text(label)
         }
         .font(.caption)
+    }
+
+    private func unreachableBlock(_ message: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("⚠︎ \(message)").font(.caption).foregroundStyle(.orange)
+            Button("Uninstall") { Task { await model.uninstall() } }
+        }
     }
 
     private var warningBlock: some View {

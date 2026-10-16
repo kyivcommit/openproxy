@@ -10,6 +10,16 @@ public protocol ProxyServerControlling: Sendable {
 
 extension ProxyServer: ProxyServerControlling {}
 
+extension InstallStatus {
+    /// Spec 9: with the hosts entry installed but nothing listening on 443, every
+    /// client's `openrouter.ai` is broken until the proxy runs or the user uninstalls.
+    public var unreachableWarning: String? {
+        guard hostsEntry, !portListening else { return nil }
+        return "openrouter.ai is routed to 127.0.0.1 but the proxy is not listening, "
+            + "so all clients are blocked. Press Uninstall to restore access."
+    }
+}
+
 /// UI-free view model. It owns the live settings, the stats summary and the
 /// install status, and turns failures into `warnings` instead of throwing, so the
 /// menu always has something to show.
@@ -37,6 +47,10 @@ public final class AppModel {
     public private(set) var summary: StatsSummary
     public private(set) var warnings: [String] = []
     public private(set) var loginItemStatus: LoginItemStatus = .notRegistered
+
+    /// Derived from `status`, so it stays visible for as long as the danger lasts
+    /// (proxy quit/crashed with the hosts entry still routed) and clears itself.
+    public var unreachableWarning: String? { status.unreachableWarning }
 
     /// How often an open menu refreshes the summary and status.
     public let refreshInterval: Duration
