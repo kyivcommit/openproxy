@@ -240,7 +240,7 @@ public final class ProxyServer: @unchecked Sendable {
     private func sendUpstream(_ request: UpstreamRequest, timeout: TimeInterval) async throws -> UpstreamResponse {
         let sendTask = Task { try await upstream.send(request) }
         let timeoutTask = Task {
-            try await Task.sleep(nanoseconds: UInt64(max(timeout, 0) * 1_000_000_000))
+            try await Task.sleep(nanoseconds: Self.timeoutNanoseconds(timeout))
             sendTask.cancel()
         }
         defer { timeoutTask.cancel() }
@@ -325,6 +325,13 @@ public final class ProxyServer: @unchecked Sendable {
     static func isStreaming(_ body: Data) -> Bool {
         guard let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else { return false }
         return object["stream"] as? Bool == true
+    }
+
+    /// Clamps a first-byte timeout before converting to nanoseconds: a huge or NaN interval
+    /// would trap in the `UInt64` conversion, and anything past an hour is effectively forever.
+    static func timeoutNanoseconds(_ timeout: TimeInterval) -> UInt64 {
+        let clamped = timeout.isFinite ? min(max(timeout, 0), 3600) : 0
+        return UInt64(clamped * 1_000_000_000)
     }
 
     static func serverTLSConfiguration(

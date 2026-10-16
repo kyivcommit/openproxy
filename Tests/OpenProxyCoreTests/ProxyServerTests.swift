@@ -1062,6 +1062,14 @@ struct ProxyServerTests {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    @Test func timeoutNanosecondsClampsHugeAndNaNValues() {
+        // `UInt64(1e11 * 1e9)` and `UInt64(NaN)` both trap; the timeout must clamp instead.
+        #expect(ProxyServer.timeoutNanoseconds(1e11) == 3600 * 1_000_000_000)
+        #expect(ProxyServer.timeoutNanoseconds(.nan) == 0)
+        #expect(ProxyServer.timeoutNanoseconds(-5) == 0)
+        #expect(ProxyServer.timeoutNanoseconds(0.5) == 500_000_000)
+    }
+
     @Test func tlsMinimumVersionIs12OnServerAndClient() throws {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "openproxy-tls-\(UUID().uuidString)")

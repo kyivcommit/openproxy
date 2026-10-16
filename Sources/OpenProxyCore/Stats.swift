@@ -143,10 +143,11 @@ public final class StatsStore: @unchecked Sendable {
         bindText(stmt, 5, r.tier.rawValue)
         bindText(stmt, 6, r.actualTier)
         bindText(stmt, 7, r.provider)
-        sqlite3_bind_int(stmt, 8, Int32(r.status))
-        sqlite3_bind_int(stmt, 9, Int32(r.ttfbMs))
-        sqlite3_bind_int(stmt, 10, Int32(r.retries))
-        sqlite3_bind_int(stmt, 11, r.usedFallback ? 1 : 0)
+        // int64 everywhere: tokens and durations can exceed Int32.max and `Int32(...)` would trap.
+        sqlite3_bind_int64(stmt, 8, Int64(r.status))
+        sqlite3_bind_int64(stmt, 9, Int64(r.ttfbMs))
+        sqlite3_bind_int64(stmt, 10, Int64(r.retries))
+        sqlite3_bind_int64(stmt, 11, r.usedFallback ? 1 : 0)
         bindText(stmt, 12, r.skippedReason)
         bindInt(stmt, 13, r.promptTokens)
         bindInt(stmt, 14, r.completionTokens)
@@ -212,7 +213,7 @@ public final class StatsStore: @unchecked Sendable {
 
     private func bindInt(_ stmt: OpaquePointer, _ index: Int32, _ value: Int?) {
         if let value {
-            sqlite3_bind_int(stmt, index, Int32(value))
+            sqlite3_bind_int64(stmt, index, Int64(value))
         } else {
             sqlite3_bind_null(stmt, index)
         }
