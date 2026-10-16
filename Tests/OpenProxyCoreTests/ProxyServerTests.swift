@@ -847,6 +847,44 @@ struct ProxyServerTests {
         }
     }
 
+    @Test func catalogNotConsultedUnlessRewritableEnabledAndTiered() async throws {
+        let fetcher = FakeEndpointsFetcher(hasFlex: true)
+        let body = Data(#"{"model":"openai/gpt-5"}"#.utf8)
+        let auth = ["Authorization": "Bearer x"]
+
+        // Non-rewritable path: no lookup even for a tier that needs availability.
+        try await withServer(
+            settings: Settings(enabled: true, tier: .flex), replies: [FakeReply()], fetcher: fetcher
+        ) { harness in
+            _ = try await harness.request("POST", "/api/v1/embeddings", body: body, headers: auth)
+        }
+        #expect(fetcher.calls.isEmpty)
+
+        // Disabled: no lookup.
+        try await withServer(
+            settings: Settings(enabled: false, tier: .flex), replies: [FakeReply()], fetcher: fetcher
+        ) { harness in
+            _ = try await harness.request("POST", chatPath, body: body, headers: auth)
+        }
+        #expect(fetcher.calls.isEmpty)
+
+        // auto tier needs no availability.
+        try await withServer(
+            settings: Settings(enabled: true, tier: .auto), replies: [FakeReply()], fetcher: fetcher
+        ) { harness in
+            _ = try await harness.request("POST", chatPath, body: body, headers: auth)
+        }
+        #expect(fetcher.calls.isEmpty)
+
+        // Flex on a rewritable enabled path does look up.
+        try await withServer(
+            settings: Settings(enabled: true, tier: .flex), replies: [FakeReply()], fetcher: fetcher
+        ) { harness in
+            _ = try await harness.request("POST", chatPath, body: body, headers: auth)
+        }
+        #expect(fetcher.calls == ["openai/gpt-5"])
+    }
+
     @Test func nonLoopbackPeerRejected() throws {        let foreign = try SocketAddress(ipAddress: "10.0.0.1", port: 1234)
         let loopback = try SocketAddress(ipAddress: "127.0.0.1", port: 1234)
         #expect(!ProxyServer.isAllowedPeer(foreign, allowNonLoopback: false))

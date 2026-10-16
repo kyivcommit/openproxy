@@ -115,8 +115,13 @@ public final class ProxyServer: @unchecked Sendable {
         // The policy applies only to POSTs to the rewritable paths; everything else
         // passes through byte-for-byte and never triggers a TierCatalog lookup.
         let isRewritable = requestHead.method == .POST
+        // Only consult the catalog when the policy could actually inject a tier.
+        let needsAvailability = isRewritable
+            && settings.enabled
+            && Rewriter.rewritablePaths.contains(path)
+            && (settings.tier == .priority || settings.tier == .flex)
         var availability: TierAvailability?
-        if isRewritable, let model {
+        if needsAvailability, let model {
             // Missing Authorization makes the catalog return nil without a fetch.
             availability = await catalog.availability(model: model, authorization: authorization)
         }
