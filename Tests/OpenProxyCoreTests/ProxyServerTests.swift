@@ -97,6 +97,36 @@ final class SlowCancelClient: UpstreamClient, @unchecked Sendable {
     var count: Int { lock.withLock { _count } }
 }
 
+/// A connector whose connect never completes, standing in for a black-holed
+/// upstream; `started` fires once the connect has been attempted. `finish()`
+/// fails the pending connect so the test's future is not left unfulfilled (NIO
+/// traps on an unfulfilled promise in debug builds).
+private final class HangingConnector: UpstreamConnector, @unchecked Sendable {
+    let started: Signal
+    private let lock = NSLock()
+    private var promise: EventLoopPromise<Channel>?
+
+    init(started: Signal) { self.started = started }
+
+    func connect(
+        host: String, port: Int, group: EventLoopGroup,
+        initializer: @escaping @Sendable (Channel) -> EventLoopFuture<Void>
+    ) -> EventLoopFuture<Channel> {
+        let promise = group.next().makePromise(of: Channel.self)
+        lock.withLock { self.promise = promise }
+        started.send()
+        return promise.futureResult
+    }
+
+    func finish() {
+        let promise = lock.withLock { () -> EventLoopPromise<Channel>? in
+            defer { self.promise = nil }
+            return self.promise
+        }
+        promise?.fail(TestFailure())
+    }
+}
+
 // MARK: - Test client
 
 /// Trusts the test CA without hostname pinning (the client dials 127.0.0.1 while
@@ -1068,6 +1098,28 @@ struct ProxyServerTests {
         await #expect(throws: UpstreamError.self) {
             _ = try await client.send(UpstreamRequest(method: "GET", path: "/", headers: [], body: Data()))
         }
+    }
+
+    @Test func cancelDuringConnectReturnsWithinOneSecond() async throws {
+        let started = Signal()
+        let connector = HangingConnector(started: started)
+        defer { connector.finish() }
+        let client = NIOUpstreamClient(
+            resolver: StaticResolver(addresses: ["93.184.216.34"]),
+            host: "openrouter.ai", port: 443, trustRoots: nil, allowLoopback: false,
+            connector: connector)
+        let task = Task {
+            try await client.send(UpstreamRequest(method: "GET", path: "/", headers: [], body: Data()))
+        }
+        // Wait until the connect is actually in flight (a fixed sleep would be flaky).
+        await started.wait()
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        task.cancel()
+        _ = await task.result
+        // Without the cancellation fix this would block for the 10 s connect timeout.
+        #expect(clock.now - start < .seconds(1))
     }
 }
 

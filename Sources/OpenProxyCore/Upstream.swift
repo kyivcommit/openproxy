@@ -154,6 +154,90 @@ public final class DoHResolver: HostResolver, @unchecked Sendable {
     }
 }
 
+/// Opens the TCP channel to a resolved address (TLS handlers included).
+/// Injectable so tests can substitute a connect that never completes.
+protocol UpstreamConnector: Sendable {
+    func connect(
+        host: String, port: Int, group: EventLoopGroup,
+        initializer: @escaping @Sendable (Channel) -> EventLoopFuture<Void>
+    ) -> EventLoopFuture<Channel>
+}
+
+struct ClientBootstrapConnector: UpstreamConnector {
+    var timeout: TimeAmount = .seconds(10)
+
+    func connect(
+        host: String, port: Int, group: EventLoopGroup,
+        initializer: @escaping @Sendable (Channel) -> EventLoopFuture<Void>
+    ) -> EventLoopFuture<Channel> {
+        ClientBootstrap(group: group)
+            .connectTimeout(timeout)
+            .channelInitializer(initializer)
+            .connect(host: host, port: port)
+    }
+}
+
+/// Bridges a possibly never-completing NIO connect into an `async` await that
+/// returns as soon as the task is cancelled. The channel is captured as soon as
+/// NIO creates it (before the TCP connect finishes) so cancellation can abort the
+/// in-flight connect instead of waiting for the 10 s connect timeout.
+final class PendingConnect: @unchecked Sendable {
+    private let lock = NSLock()
+    private var channel: Channel?
+    private var continuation: CheckedContinuation<Channel, Error>?
+    private var result: Result<Channel, Error>?
+    private var cancelled = false
+
+    func capture(_ channel: Channel) { lock.withLock { self.channel = channel } }
+
+    func resolve(_ result: Result<Channel, Error>) {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            // The await already threw; drop a channel that arrived too late.
+            if case .success(let channel) = result { channel.close(promise: nil) }
+            return
+        }
+        guard let continuation else {
+            self.result = result
+            lock.unlock()
+            return
+        }
+        self.continuation = nil
+        lock.unlock()
+        continuation.resume(with: result)
+    }
+
+    func wait() async throws -> Channel {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if cancelled {
+                lock.unlock()
+                continuation.resume(throwing: CancellationError())
+            } else if let result {
+                lock.unlock()
+                continuation.resume(with: result)
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
+    }
+
+    /// Cancels the wait and closes the in-flight channel so the connect aborts.
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let continuation = self.continuation
+        self.continuation = nil
+        let channel = self.channel
+        self.channel = nil
+        lock.unlock()
+        continuation?.resume(throwing: CancellationError())
+        channel?.close(promise: nil)
+    }
+}
+
 /// The production upstream client: connects to a resolved IP (never a loopback
 /// or local address, to avoid talking to the proxy itself), speaks TLS with the
 /// host's SNI, and streams the HTTP/1.1 response back chunk by chunk.
@@ -164,6 +248,7 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
     private let tlsConfiguration: TLSConfiguration
     private let localAddresses: Set<String>
     private let allowLoopback: Bool
+    private let connector: UpstreamConnector
     private let group: EventLoopGroup
 
     public convenience init(
@@ -182,12 +267,14 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
         host: String,
         port: Int,
         trustRoots: [Certificate]?,
-        allowLoopback: Bool
+        allowLoopback: Bool,
+        connector: UpstreamConnector = ClientBootstrapConnector()
     ) {
         self.resolver = resolver
         self.host = host
         self.port = port
         self.allowLoopback = allowLoopback
+        self.connector = connector
         var tls = TLSConfiguration.makeClientConfiguration()
         tls.minimumTLSVersion = .tlsv12
         if let trustRoots {
@@ -206,63 +293,82 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
     var minimumTLSVersion: TLSVersion { tlsConfiguration.minimumTLSVersion }
 
     public func send(_ request: UpstreamRequest) async throws -> UpstreamResponse {
-        let answers = try await resolver.resolve(host)
-        guard let address = answers.first(where: { !isForbidden($0) }) else {
-            throw UpstreamError.forbiddenAddress(answers.first ?? host)
-        }
-
         let counter = UpstreamByteCounter()
         let body = BackpressuredBody(counter: counter)
         let promise = group.next().makePromise(of: HTTPResponseHead.self)
         let handler = UpstreamHTTPHandler(promise: promise, body: body)
-
-        let channel = try await ClientBootstrap(group: group)
-            .connectTimeout(.seconds(10))
-            .channelInitializer { channel in
-                do {
-                    let context = try NIOSSLContext(configuration: self.tlsConfiguration)
-                    try channel.pipeline.syncOperations.addHandler(
-                        NIOSSLClientHandler(context: context, serverHostname: self.host))
-                    try channel.pipeline.syncOperations.addHandler(HTTPRequestEncoder())
-                    try channel.pipeline.syncOperations.addHandler(ByteToMessageHandler(HTTPResponseDecoder()))
-                    try channel.pipeline.syncOperations.addHandler(handler)
-                    return channel.eventLoop.makeSucceededVoidFuture()
-                } catch {
-                    return channel.eventLoop.makeFailedFuture(error)
-                }
-            }
-            .connect(host: address, port: port)
-            .get()
-        body.attach(channel: channel)
+        let pending = PendingConnect()
 
         return try await withTaskCancellationHandler {
             do {
-                var head = HTTPRequestHead(version: .http1_1, method: HTTPMethod(rawValue: request.method), uri: request.path)
-                for (name, value) in request.headers { head.headers.add(name: name, value: value) }
-                // The client's Host is meaningless to us (we dial a resolved IP);
-                // use the configured authority, matching the TLS SNI.
-                head.headers.replaceOrAdd(name: "Host", value: port == 443 ? host : "\(host):\(port)")
-                try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()
-                if !request.body.isEmpty {
-                    var buffer = channel.allocator.buffer(capacity: request.body.count)
-                    buffer.writeBytes(request.body)
-                    try await channel.writeAndFlush(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
+                // Resolve and connect sit inside the cancellation handler: a client
+                // disconnect while either is in flight must not wait for the connect
+                // timeout.
+                try Task.checkCancellation()
+                let answers = try await resolver.resolve(host)
+                try Task.checkCancellation()
+                guard let address = answers.first(where: { !isForbidden($0) }) else {
+                    throw UpstreamError.forbiddenAddress(answers.first ?? host)
                 }
-                try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
 
-                let responseHead = try await promise.futureResult.get()
-                let headers = responseHead.headers.map { ($0.name, $0.value) }
-                return UpstreamResponse(
-                    status: Int(responseHead.status.code), headers: headers, body: body.makeStream(),
-                    onCancel: { channel.close(promise: nil) }, byteCounter: counter)
+                let connect = connector.connect(host: address, port: port, group: group) { [self] channel in
+                    pending.capture(channel)
+                    return makePipeline(channel: channel, handler: handler)
+                }
+                connect.whenComplete { pending.resolve($0) }
+                let channel = try await pending.wait()
+                body.attach(channel: channel)
+
+                do {
+                    try Task.checkCancellation()
+                    var head = HTTPRequestHead(version: .http1_1, method: HTTPMethod(rawValue: request.method), uri: request.path)
+                    for (name, value) in request.headers { head.headers.add(name: name, value: value) }
+                    // The client's Host is meaningless to us (we dial a resolved IP);
+                    // use the configured authority, matching the TLS SNI.
+                    head.headers.replaceOrAdd(name: "Host", value: port == 443 ? host : "\(host):\(port)")
+                    try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()
+                    if !request.body.isEmpty {
+                        var buffer = channel.allocator.buffer(capacity: request.body.count)
+                        buffer.writeBytes(request.body)
+                        try await channel.writeAndFlush(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
+                    }
+                    try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
+
+                    let responseHead = try await promise.futureResult.get()
+                    let headers = responseHead.headers.map { ($0.name, $0.value) }
+                    return UpstreamResponse(
+                        status: Int(responseHead.status.code), headers: headers, body: body.makeStream(),
+                        onCancel: { channel.close(promise: nil) }, byteCounter: counter)
+                } catch {
+                    channel.close(promise: nil)
+                    throw error
+                }
             } catch {
-                channel.close(promise: nil)
+                // Fail the head promise on any early exit so it is never leaked;
+                // NIO traps on an unfulfilled promise in debug builds.
+                promise.fail(error)
                 throw error
             }
         } onCancel: {
-            // Cancel during connect/write/head-wait: drop the connection so the
-            // in-flight future fails promptly instead of running to completion.
-            channel.close(promise: nil)
+            // Cancel during resolve/connect/write/head-wait: fail the head promise
+            // and close the pending channel so the in-flight future fails promptly
+            // instead of running to its 10 s connect timeout.
+            promise.fail(CancellationError())
+            pending.cancel()
+        }
+    }
+
+    private func makePipeline(channel: Channel, handler: UpstreamHTTPHandler) -> EventLoopFuture<Void> {
+        do {
+            let context = try NIOSSLContext(configuration: tlsConfiguration)
+            try channel.pipeline.syncOperations.addHandler(
+                NIOSSLClientHandler(context: context, serverHostname: host))
+            try channel.pipeline.syncOperations.addHandler(HTTPRequestEncoder())
+            try channel.pipeline.syncOperations.addHandler(ByteToMessageHandler(HTTPResponseDecoder()))
+            try channel.pipeline.syncOperations.addHandler(handler)
+            return channel.eventLoop.makeSucceededVoidFuture()
+        } catch {
+            return channel.eventLoop.makeFailedFuture(error)
         }
     }
 
