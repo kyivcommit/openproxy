@@ -213,6 +213,34 @@ struct AppModelTests {
         #expect(model.loginItemStatus == .requiresApproval)
     }
 
+    @Test func failedSettingsSaveBecomesWarningAndKeepsValue() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-save-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // A regular file where the settings directory should be makes createDirectory fail.
+        let blocker = dir.appending(path: "blocker")
+        try Data("x".utf8).write(to: blocker)
+
+        let store = SettingsStore(url: blocker.appending(path: "settings.json"))
+        let model = AppModel(
+            settingsStore: store,
+            stats: try StatsStore(path: ":memory:"),
+            installer: Installer(
+                caPEMURL: dir.appending(path: "ca.pem"),
+                runner: FakeRunner(),
+                hostsPath: dir.appending(path: "hosts").path),
+            server: FakeServer(),
+            loginItem: FakeLoginItem())
+
+        model.settings.sort = .price
+
+        // The in-memory value (UI and per-request reader) stays consistent; only the disk write failed.
+        #expect(model.settings.sort == .price)
+        #expect(store.settings.sort == .price)
+        #expect(model.warnings.contains { $0.contains("settings") })
+    }
+
     @Test func portInUseBecomesWarningAndLeavesHostsUntouched() async throws {
         let h = try Harness()
         h.server.startError = PortInUse()

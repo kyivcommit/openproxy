@@ -23,7 +23,13 @@ public final class AppModel {
         set {
             currentSettings = newValue
             settingsStore.settings = newValue
-            try? settingsStore.save()
+            do {
+                try settingsStore.save()
+            } catch {
+                // The in-memory value still drives the UI and each request; only the
+                // disk copy is stale, so warn and keep the shown value.
+                warn("Could not save settings: \(error).")
+            }
         }
     }
 
@@ -61,7 +67,7 @@ public final class AppModel {
             try await server.start()
         } catch {
             // Spec 9: a busy port must not change the hosts entry, and the user must see why.
-            warnings.append("Proxy server failed to start: \(error). The hosts entry was left unchanged.")
+            warn("Proxy server failed to start: \(error). The hosts entry was left unchanged.")
         }
     }
 
@@ -73,7 +79,7 @@ public final class AppModel {
         do {
             try await installer.install()
         } catch {
-            warnings.append("Install failed: \(error). The system was not fully changed.")
+            warn("Install failed: \(error). The system was not fully changed.")
         }
         await refresh()
     }
@@ -82,7 +88,7 @@ public final class AppModel {
         do {
             try await installer.uninstall()
         } catch {
-            warnings.append("Uninstall failed: \(error).")
+            warn("Uninstall failed: \(error).")
         }
         await refresh()
     }
