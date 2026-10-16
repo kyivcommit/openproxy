@@ -22,6 +22,19 @@ public struct UpstreamRequest: Sendable {
     }
 }
 
+/// Tracks bytes read from the upstream socket that have not yet been handed to
+/// the consumer, so a slow client cannot make the proxy buffer without bound.
+public final class UpstreamByteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    public init() {}
+
+    func add(_ count: Int) { lock.withLock { value += count } }
+    func subtract(_ count: Int) { lock.withLock { value = max(0, value - count) } }
+    public var count: Int { lock.withLock { value } }
+}
+
 /// The upstream response head plus a stream of body chunks. Only the head is
 /// available up front, so the Flex policy can still abandon a capacity failure
 /// before the first body byte.
@@ -30,17 +43,23 @@ public final class UpstreamResponse: FlexResponse, @unchecked Sendable {
     public let headers: [(String, String)]
     public let body: AsyncThrowingStream<Data, Error>
     private let onCancel: @Sendable () -> Void
+    let byteCounter: UpstreamByteCounter
+
+    /// Bytes read from upstream and not yet delivered to the consumer.
+    public var bufferedBytes: Int { byteCounter.count }
 
     public init(
         status: Int,
         headers: [(String, String)],
         body: AsyncThrowingStream<Data, Error>,
-        onCancel: @Sendable @escaping () -> Void = {}
+        onCancel: @Sendable @escaping () -> Void = {},
+        byteCounter: UpstreamByteCounter = UpstreamByteCounter()
     ) {
         self.status = status
         self.headers = headers
         self.body = body
         self.onCancel = onCancel
+        self.byteCounter = byteCounter
     }
 
     public func cancel() { onCancel() }
@@ -162,9 +181,10 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
             throw UpstreamError.forbiddenAddress(answers.first ?? host)
         }
 
-        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        let counter = UpstreamByteCounter()
+        let body = BackpressuredBody(counter: counter)
         let promise = group.next().makePromise(of: HTTPResponseHead.self)
-        let handler = UpstreamHTTPHandler(promise: promise, continuation: continuation)
+        let handler = UpstreamHTTPHandler(promise: promise, body: body)
 
         let channel = try await ClientBootstrap(group: group)
             .connectTimeout(.seconds(10))
@@ -183,27 +203,33 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
             }
             .connect(host: address, port: port)
             .get()
+        body.attach(channel: channel)
 
-        var head = HTTPRequestHead(version: .http1_1, method: HTTPMethod(rawValue: request.method), uri: request.path)
-        for (name, value) in request.headers { head.headers.add(name: name, value: value) }
-        if head.headers.first(name: "Host") == nil { head.headers.add(name: "Host", value: host) }
-        try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()
-        if !request.body.isEmpty {
-            var buffer = channel.allocator.buffer(capacity: request.body.count)
-            buffer.writeBytes(request.body)
-            try await channel.writeAndFlush(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
-        }
-        try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
+        do {
+            var head = HTTPRequestHead(version: .http1_1, method: HTTPMethod(rawValue: request.method), uri: request.path)
+            for (name, value) in request.headers { head.headers.add(name: name, value: value) }
+            if head.headers.first(name: "Host") == nil { head.headers.add(name: "Host", value: host) }
+            try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()
+            if !request.body.isEmpty {
+                var buffer = channel.allocator.buffer(capacity: request.body.count)
+                buffer.writeBytes(request.body)
+                try await channel.writeAndFlush(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
+            }
+            try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
 
-        let responseHead = try await withTaskCancellationHandler {
-            try await promise.futureResult.get()
-        } onCancel: {
+            let responseHead = try await withTaskCancellationHandler {
+                try await promise.futureResult.get()
+            } onCancel: {
+                channel.close(promise: nil)
+            }
+            let headers = responseHead.headers.map { ($0.name, $0.value) }
+            return UpstreamResponse(
+                status: Int(responseHead.status.code), headers: headers, body: body.makeStream(),
+                onCancel: { channel.close(promise: nil) }, byteCounter: counter)
+        } catch {
             channel.close(promise: nil)
+            throw error
         }
-        let headers = responseHead.headers.map { ($0.name, $0.value) }
-        return UpstreamResponse(
-            status: Int(responseHead.status.code), headers: headers, body: stream,
-            onCancel: { channel.close(promise: nil) })
     }
 
     /// Loopback and the machine's own interface addresses are refused: OpenRouter
@@ -238,18 +264,112 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
     }
 }
 
-/// Collects the response head once, forwards body chunks into the async stream,
-/// and fails the head promise if the connection dies before any response.
+/// Bridges the upstream channel to the response stream with a bounded buffer.
+/// Reads pause once `highWaterMark` bytes are queued and resume as the consumer
+/// drains, so a slow client cannot make the proxy buffer without bound.
+final class BackpressuredBody: @unchecked Sendable {
+    private static let highWaterMark = 64 * 1024
+
+    private let lock = NSLock()
+    private let counter: UpstreamByteCounter
+    private var queue: [Data] = []
+    private var waiter: CheckedContinuation<Data?, Error>?
+    private var finished = false
+    private var failure: Error?
+    private var paused = false
+    private var channel: Channel?
+
+    init(counter: UpstreamByteCounter) { self.counter = counter }
+
+    func makeStream() -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream(unfolding: { [self] in try await next() })
+    }
+
+    func attach(channel: Channel) { lock.withLock { self.channel = channel } }
+
+    /// Called on the event loop for each decoded body chunk.
+    func receive(_ data: Data) {
+        lock.lock()
+        if let waiter {
+            self.waiter = nil
+            lock.unlock()
+            waiter.resume(returning: data)
+            return
+        }
+        counter.add(data.count)
+        queue.append(data)
+        let shouldPause = !paused && counter.count >= Self.highWaterMark
+        if shouldPause { paused = true }
+        lock.unlock()
+        if shouldPause { _ = channel?.setOption(ChannelOptions.autoRead, value: false) }
+    }
+
+    func finish() {
+        lock.lock()
+        finished = true
+        if let waiter {
+            self.waiter = nil
+            lock.unlock()
+            waiter.resume(returning: nil)
+            return
+        }
+        lock.unlock()
+    }
+
+    func fail(_ error: Error) {
+        lock.lock()
+        failure = error
+        finished = true
+        if let waiter {
+            self.waiter = nil
+            lock.unlock()
+            waiter.resume(throwing: error)
+            return
+        }
+        lock.unlock()
+    }
+
+    private func next() async throws -> Data? {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if let failure {
+                lock.unlock()
+                continuation.resume(throwing: failure)
+                return
+            }
+            if !queue.isEmpty {
+                let data = queue.removeFirst()
+                counter.subtract(data.count)
+                let shouldResume = paused && counter.count < Self.highWaterMark
+                if shouldResume { paused = false }
+                lock.unlock()
+                if shouldResume { _ = channel?.setOption(ChannelOptions.autoRead, value: true) }
+                continuation.resume(returning: data)
+                return
+            }
+            if finished {
+                lock.unlock()
+                continuation.resume(returning: nil)
+                return
+            }
+            waiter = continuation
+            lock.unlock()
+        }
+    }
+}
+
+/// Collects the response head once, hands body chunks to the bounded body, and
+/// fails the head promise if the connection dies before any response.
 private final class UpstreamHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPClientResponsePart
 
     private let promise: EventLoopPromise<HTTPResponseHead>
-    private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+    private let body: BackpressuredBody
     private var responded = false
 
-    init(promise: EventLoopPromise<HTTPResponseHead>, continuation: AsyncThrowingStream<Data, Error>.Continuation) {
+    init(promise: EventLoopPromise<HTTPResponseHead>, body: BackpressuredBody) {
         self.promise = promise
-        self.continuation = continuation
+        self.body = body
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -258,21 +378,21 @@ private final class UpstreamHTTPHandler: ChannelInboundHandler, @unchecked Senda
             responded = true
             promise.succeed(head)
         case .body(let buffer):
-            continuation.yield(Data(buffer.readableBytesView))
+            body.receive(Data(buffer.readableBytesView))
         case .end:
-            continuation.finish()
+            body.finish()
             context.close(promise: nil)
         }
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         if !responded { responded = true; promise.fail(error) }
-        continuation.finish(throwing: error)
+        body.fail(error)
         context.close(promise: nil)
     }
 
     func channelInactive(context: ChannelHandlerContext) {
         if !responded { responded = true; promise.fail(UpstreamError.noAddress("upstream closed")) }
-        continuation.finish()
+        body.finish()
     }
 }

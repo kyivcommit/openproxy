@@ -600,8 +600,36 @@ struct ProxyServerTests {
         }
     }
 
-    @Test func nonLoopbackPeerRejected() throws {
-        let foreign = try SocketAddress(ipAddress: "10.0.0.1", port: 1234)
+    @Test func slowConsumerDoesNotBufferResponseUnboundedly() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-big-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let ca = CertAuthority(directory: directory)
+        try ca.loadOrCreate()
+        let upstream = try RecordingUpstream(ca: ca, body: Data(repeating: 0x41, count: 4 * 1024 * 1024))
+        do {
+            try await upstream.start()
+            let client = NIOUpstreamClient(
+                resolver: StaticResolver(addresses: ["127.0.0.1"]),
+                host: "openrouter.ai", port: upstream.port,
+                trustRoots: [upstream.caCertificate], allowLoopback: true)
+            let response = try await client.send(
+                UpstreamRequest(method: "GET", path: "/big", headers: [], body: Data()))
+            var iterator = response.body.makeAsyncIterator()
+            _ = try await iterator.next()  // read one chunk, then stop pulling
+            // An unbounded reader would have the whole 4 MiB in memory by now.
+            #expect(await staysFalse({ response.bufferedBytes > 512 * 1024 }, within: 0.4))
+            while try await iterator.next() != nil {}
+        } catch {
+            await upstream.stop()
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        await upstream.stop()
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @Test func nonLoopbackPeerRejected() throws {        let foreign = try SocketAddress(ipAddress: "10.0.0.1", port: 1234)
         let loopback = try SocketAddress(ipAddress: "127.0.0.1", port: 1234)
         #expect(!ProxyServer.isAllowedPeer(foreign, allowNonLoopback: false))
         #expect(ProxyServer.isAllowedPeer(loopback, allowNonLoopback: false))
