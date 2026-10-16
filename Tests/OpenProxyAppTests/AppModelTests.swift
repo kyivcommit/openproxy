@@ -317,11 +317,11 @@ struct AppModelTests {
 
     @Test func hostsEntryWithoutListenerProducesWarning() {
         // Spec 9: hosts routed with no listener blocks every client until Uninstall.
-        let down = InstallStatus(caTrusted: false, hostsEntry: true, portListening: false, nodeCAEnv: false)
+        let down = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: true, portListening: false, nodeCAEnv: false)
         #expect(down.unreachableWarning != nil)
-        let up = InstallStatus(caTrusted: false, hostsEntry: true, portListening: true, nodeCAEnv: false)
+        let up = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: true, portListening: true, nodeCAEnv: false)
         #expect(up.unreachableWarning == nil)
-        let notInstalled = InstallStatus(caTrusted: true, hostsEntry: false, portListening: false, nodeCAEnv: true)
+        let notInstalled = InstallStatus(caTrusted: true, caPresent: true, hostsEntry: false, portListening: false, nodeCAEnv: true)
         #expect(notInstalled.unreachableWarning == nil)
     }
 

@@ -94,7 +94,7 @@ struct MenuView: View {
     private var statusBlock: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Status").font(.headline)
-            statusRow("CA trusted", model.status.caTrusted)
+            caRow
             statusRow("Hosts entry", model.status.hostsEntry)
             statusRow("Port 443 listening", model.status.portListening)
             statusRow("Node CA env", model.status.nodeCAEnv)
@@ -102,10 +102,22 @@ struct MenuView: View {
         }
     }
 
-    private func statusRow(_ label: String, _ ok: Bool) -> some View {
+    /// Distinguishes "not installed" from "present but not trusted" (the real-install bug:
+    /// the certificate was in a keychain but its trust settings had not been applied).
+    private var caRow: some View {
+        if model.status.caTrusted {
+            statusRow("CA trusted", true)
+        } else if model.status.caPresent {
+            statusRow("CA present but not trusted", false, warning: true)
+        } else {
+            statusRow("CA not installed", false)
+        }
+    }
+
+    private func statusRow(_ label: String, _ ok: Bool, warning: Bool = false) -> some View {
         HStack {
             Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle")
-                .foregroundStyle(ok ? .green : .secondary)
+                .foregroundStyle(ok ? .green : (warning ? .orange : .secondary))
             Text(label)
         }
         .font(.caption)

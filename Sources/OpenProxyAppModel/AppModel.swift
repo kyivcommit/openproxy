@@ -102,7 +102,7 @@ public final class AppModel {
         self.quitDecision = quitDecision
         self.refreshInterval = refreshInterval
         self.currentSettings = settingsStore.settings
-        self.status = InstallStatus(caTrusted: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
+        self.status = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
         self.summary = StatsSummary()
     }
 

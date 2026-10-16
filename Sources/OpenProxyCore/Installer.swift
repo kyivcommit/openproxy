@@ -95,13 +95,17 @@ public struct OsascriptRunner: PrivilegedRunner {
 }
 
 public struct InstallStatus: Equatable, Sendable {
+    /// Really trusted (`security verify-cert -p basic`), not merely present in a keychain.
     public var caTrusted: Bool
+    /// A certificate with our name is in the login or System keychain, whether or not trusted.
+    public var caPresent: Bool
     public var hostsEntry: Bool
     public var portListening: Bool
     public var nodeCAEnv: Bool
 
-    public init(caTrusted: Bool, hostsEntry: Bool, portListening: Bool, nodeCAEnv: Bool) {
+    public init(caTrusted: Bool, caPresent: Bool, hostsEntry: Bool, portListening: Bool, nodeCAEnv: Bool) {
         self.caTrusted = caTrusted
+        self.caPresent = caPresent
         self.hostsEntry = hostsEntry
         self.portListening = portListening
         self.nodeCAEnv = nodeCAEnv
@@ -147,11 +151,11 @@ public final class Installer: @unchecked Sendable {
         let trustedCopy = try privateCopyOfCA()
         defer { try? FileManager.default.removeItem(at: trustedCopy.deletingLastPathComponent()) }
 
-        let add = await commandRunner.run(Self.addTrustCommand(copyPath: trustedCopy.path))
+        let add = await commandRunner.run(Self.addTrustCommand(certPath: trustedCopy.path))
         guard add.succeeded else {
             throw InstallError.runnerFailed(Self.trustFailureMessage(add))
         }
-        let verify = await commandRunner.run(Self.verifyTrustCommand(copyPath: trustedCopy.path))
+        let verify = await commandRunner.run(Self.verifyTrustCommand(certPath: trustedCopy.path))
         guard verify.succeeded else {
             throw InstallError.runnerFailed(
                 "The CA was added to the login keychain but could not be verified as trusted: "
@@ -173,12 +177,12 @@ public final class Installer: @unchecked Sendable {
     }
 
     /// User-domain trust (`-r trustRoot`, no `-d`) in the login keychain.
-    static func addTrustCommand(copyPath: String) -> String {
-        "security add-trusted-cert -r trustRoot -k \"$HOME/Library/Keychains/login.keychain-db\" \(quoted(copyPath))"
+    static func addTrustCommand(certPath: String) -> String {
+        "security add-trusted-cert -r trustRoot -k \"$HOME/Library/Keychains/login.keychain-db\" \(quoted(certPath))"
     }
 
-    static func verifyTrustCommand(copyPath: String) -> String {
-        "security verify-cert -c \(quoted(copyPath)) -p basic"
+    static func verifyTrustCommand(certPath: String) -> String {
+        "security verify-cert -c \(quoted(certPath)) -p basic"
     }
 
     private static func trustFailureMessage(_ result: CommandResult) -> String {
@@ -307,14 +311,20 @@ public final class Installer: @unchecked Sendable {
     }
 
     public func status() async -> InstallStatus {
-        let certPresent = await commandRunner.run(
+        // Trust means actually trusted, not merely present: `verify-cert -p basic` is the only
+        // check that catches a certificate that was imported but whose trust write was denied.
+        let trust = await commandRunner.run(Self.verifyTrustCommand(certPath: caPEMURL.path))
+        let loginFind = await commandRunner.run(
+            "security find-certificate -c \(Self.quoted(caCommonName)) \"$HOME/Library/Keychains/login.keychain-db\"")
+        let systemFind = await commandRunner.run(
             "security find-certificate -c \(Self.quoted(caCommonName)) /Library/Keychains/System.keychain")
         let port = await commandRunner.run("nc -z -G 1 127.0.0.1 443")
         let nodeEnv = await commandRunner.run("launchctl getenv NODE_EXTRA_CA_CERTS")
         return InstallStatus(
-            caTrusted: certPresent.status == 0,
+            caTrusted: trust.succeeded,
+            caPresent: loginFind.succeeded || systemFind.succeeded,
             hostsEntry: HostsFile.isPresent(in: Self.readHosts(hostsPath)),
-            portListening: port.status == 0,
+            portListening: port.succeeded,
             nodeCAEnv: !nodeEnv.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         )
     }

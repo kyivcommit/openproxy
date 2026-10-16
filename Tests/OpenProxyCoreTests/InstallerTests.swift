@@ -285,17 +285,34 @@ struct InstallerTests {
         #expect(await makeInstaller(runner: runner, hostsPath: withoutEntry).status().hostsEntry == false)
     }
 
-    @Test func statusProbesTheKeychainThroughTheCommandRunner() async throws {
+    @Test func statusTrustsOnlyWhenVerifyCertSucceeds() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
-        let present = FakeCommandRunner()
-        let absent = FakeCommandRunner(handler: { command in
-            command.contains("find-certificate") ? CommandResult(status: 1) : CommandResult(status: 0)
-        })
 
-        #expect(await makeInstaller(runner: runner, commandRunner: present, hostsPath: hostsPath).status().caTrusted)
-        #expect(await makeInstaller(runner: runner, commandRunner: absent, hostsPath: hostsPath).status().caTrusted == false)
+        let trusted = FakeCommandRunner()
+        let trustedStatus = await makeInstaller(
+            runner: runner, commandRunner: trusted, hostsPath: hostsPath).status()
+        #expect(trustedStatus.caTrusted)
+        #expect(trustedStatus.caPresent)
+        #expect(trusted.commands.contains { $0.contains("security verify-cert") })
+
+        // The observed real-install bug: cert imported but trust settings denied.
+        let presentButUntrusted = FakeCommandRunner(handler: { command in
+            command.contains("verify-cert")
+                ? CommandResult(status: 1, standardError: "CSSMERR_TP_NOT_TRUSTED")
+                : CommandResult(status: 0)
+        })
+        let untrustedStatus = await makeInstaller(
+            runner: runner, commandRunner: presentButUntrusted, hostsPath: hostsPath).status()
+        #expect(untrustedStatus.caTrusted == false)
+        #expect(untrustedStatus.caPresent)
+
+        let missing = FakeCommandRunner(handler: { _ in CommandResult(status: 1) })
+        let missingStatus = await makeInstaller(
+            runner: runner, commandRunner: missing, hostsPath: hostsPath).status()
+        #expect(missingStatus.caTrusted == false)
+        #expect(missingStatus.caPresent == false)
     }
 
     @Test func nodeCAEnvCommandTargetsLaunchctl() {
