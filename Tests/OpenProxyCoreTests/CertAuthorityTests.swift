@@ -25,6 +25,23 @@ struct CertAuthorityTests {
         #expect(FileManager.default.fileExists(atPath: authority.caCertificatePEMURL.path))
     }
 
+    @Test func loadTightensLooseKeyPermissions() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+
+        let key = directory.appending(path: "ca.key")
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: key.path)
+
+        let reloaded = CertAuthority(directory: directory)
+        try reloaded.loadOrCreate()
+
+        let mode = (try FileManager.default.attributesOfItem(atPath: key.path)[.posixPermissions] as? NSNumber)?.intValue
+        #expect(mode == 0o600)
+    }
+
     @Test func leafVerifiesAgainstCAForOpenrouter() async throws {
         let directory = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
