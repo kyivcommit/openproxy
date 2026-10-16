@@ -1,5 +1,4 @@
 import SwiftUI
-import AppKit
 import OpenProxyCore
 import OpenProxyAppModel
 
@@ -44,7 +43,7 @@ struct MenuView: View {
                 Button("Install") { Task { await model.install() } }
                 Button("Uninstall") { Task { await model.uninstall() } }
                 Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
+                Button("Quit") { Task { await model.quit() } }
             }
         }
         .padding(14)

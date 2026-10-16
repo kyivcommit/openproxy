@@ -44,6 +44,22 @@ private final class FakeLoginItem: LoginItemRegistering, @unchecked Sendable {
     }
 }
 
+/// Stands in for the NSAlert quit gate: records the chosen answer and any
+/// termination, so a test never really quits.
+@MainActor
+private final class FakeQuitDecision: QuitDecision {
+    var choice: QuitChoice = .quitAnyway
+    private(set) var decideCount = 0
+    private(set) var terminateCount = 0
+
+    func decide() -> QuitChoice {
+        decideCount += 1
+        return choice
+    }
+
+    func terminate() { terminateCount += 1 }
+}
+
 @MainActor
 private struct Harness {
     let directory: URL
@@ -53,6 +69,7 @@ private struct Harness {
     let installer: Installer
     let server: FakeServer
     let loginItem: FakeLoginItem
+    let quitDecision: FakeQuitDecision
 
     init(hostsText: String? = nil) throws {
         let directory = FileManager.default.temporaryDirectory
@@ -70,12 +87,14 @@ private struct Harness {
             hostsPath: hostsURL.path)
         self.server = FakeServer()
         self.loginItem = FakeLoginItem()
+        self.quitDecision = FakeQuitDecision()
     }
 
     func model(refreshInterval: Duration = .seconds(5)) -> AppModel {
         AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
-            server: server, loginItem: loginItem, refreshInterval: refreshInterval)
+            server: server, loginItem: loginItem, quitDecision: quitDecision,
+            refreshInterval: refreshInterval)
     }
 
     /// Bounded polling helper: returns false after `timeout` so a missing
@@ -156,7 +175,7 @@ struct AppModelTests {
         // before the SQLite store tries to open stats.sqlite inside it.
         let base = parent.appending(path: "openproxy")
 
-        _ = try AppGraph.makeModel(baseDirectory: base)
+        _ = try AppGraph.makeModel(baseDirectory: base, quitDecision: FakeQuitDecision())
 
         #expect(FileManager.default.fileExists(atPath: base.path))
         let attributes = try FileManager.default.attributesOfItem(atPath: base.path)
@@ -243,7 +262,8 @@ struct AppModelTests {
                 runner: FakeRunner(),
                 hostsPath: dir.appending(path: "hosts").path),
             server: FakeServer(),
-            loginItem: FakeLoginItem())
+            loginItem: FakeLoginItem(),
+            quitDecision: FakeQuitDecision())
 
         model.settings.sort = .price
 
@@ -297,5 +317,90 @@ struct AppModelTests {
         #expect(model.warnings.count == 1)
         #expect(model.warnings[0].lowercased().contains("start"))
         #expect(h.runner.scripts.isEmpty)
+    }
+
+    @Test func installStartsServerBeforeTouchingHosts() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.server.startCount == 1)
+        #expect(h.runner.scripts.count == 1)
+    }
+
+    @Test func installSkippedWhenServerCannotListen() async throws {
+        let h = try Harness()
+        h.server.startError = PortInUse()
+        let model = h.model()
+
+        await model.install()
+
+        // No privileged step ran and the hosts file is left routed as it was.
+        #expect(h.runner.scripts.isEmpty)
+        #expect(model.warnings.contains { $0.contains("Install was skipped") })
+    }
+
+    @Test func installDoesNotStartAnAlreadyRunningServer() async throws {
+        let h = try Harness()
+        let model = h.model()
+        await model.start()
+
+        await model.install()
+
+        #expect(h.server.startCount == 1)
+        #expect(h.runner.scripts.count == 1)
+    }
+
+    @Test func quitWithHostsEntryCanUninstallFirst() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        await model.refresh()
+        #expect(model.status.hostsEntry)
+        h.quitDecision.choice = .uninstallAndQuit
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
+        #expect(h.quitDecision.terminateCount == 1)
+        // Uninstall ran before quitting, so the hosts entry and CA are removed.
+        #expect(h.runner.scripts.contains { $0.contains("delete-certificate") })
+    }
+
+    @Test func quitAnywayLeavesHostsEntryAsIs() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        await model.refresh()
+        h.quitDecision.choice = .quitAnyway
+
+        await model.quit()
+
+        #expect(h.quitDecision.terminateCount == 1)
+        #expect(h.runner.scripts.isEmpty)
+    }
+
+    @Test func quitCancelStopsWithoutTerminating() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        await model.refresh()
+        h.quitDecision.choice = .cancel
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(h.runner.scripts.isEmpty)
+    }
+
+    @Test func quitWithoutHostsEntryTerminatesWithoutPrompt() async throws {
+        let h = try Harness()
+        let model = h.model()
+        await model.refresh()
+        #expect(model.status.hostsEntry == false)
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 0)
+        #expect(h.quitDecision.terminateCount == 1)
     }
 }

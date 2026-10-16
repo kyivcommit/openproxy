@@ -9,7 +9,7 @@ struct OpenProxyApp: App {
 
     init() {
         do {
-            let built = try AppGraph.makeModel()
+            let built = try AppGraph.makeModel(quitDecision: AlertQuitDecision())
             _model = State(initialValue: built)
             // Autostart + KeepAlive watchdog; best effort, only succeeds for a bundled signed app.
             // Failures and a non-enabled status surface as warnings in the menu.

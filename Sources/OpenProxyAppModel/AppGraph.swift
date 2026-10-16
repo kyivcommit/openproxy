@@ -11,7 +11,10 @@ public enum AppGraph {
     }
 
     @MainActor
-    public static func makeModel(baseDirectory: URL = AppGraph.defaultBaseDirectory) throws -> AppModel {
+    public static func makeModel(
+        baseDirectory: URL = AppGraph.defaultBaseDirectory,
+        quitDecision: QuitDecision
+    ) throws -> AppModel {
         // On a clean install this directory does not exist yet, and SQLite cannot
         // create stats.sqlite in a missing directory. Create it owner-only first.
         try ensureBaseDirectory(baseDirectory)
@@ -34,7 +37,7 @@ public enum AppGraph {
 
         return AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
-            server: server, loginItem: SMAppServiceLoginItem())
+            server: server, loginItem: SMAppServiceLoginItem(), quitDecision: quitDecision)
     }
 
     /// The CA key and stats live here, so the directory stays owner-only even if

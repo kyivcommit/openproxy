@@ -10,6 +10,22 @@ public protocol ProxyServerControlling: Sendable {
 
 extension ProxyServer: ProxyServerControlling {}
 
+/// What the user chose when quitting with `openrouter.ai` still routed here.
+public enum QuitChoice: Equatable, Sendable {
+    case uninstallAndQuit
+    case quitAnyway
+    case cancel
+}
+
+/// Shows the quit confirmation and performs the real termination. The production
+/// implementation uses `NSAlert` (app target); tests inject a fake so the menu
+/// logic is exercised without quitting the test runner.
+@MainActor
+public protocol QuitDecision: Sendable {
+    func decide() -> QuitChoice
+    func terminate()
+}
+
 extension InstallStatus {
     /// Spec 9: with the hosts entry installed but nothing listening on 443, every
     /// client's `openrouter.ai` is broken until the proxy runs or the user uninstalls.
@@ -57,12 +73,17 @@ public final class AppModel {
 
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
 
+    /// Whether `server.start()` already bound the port. Guards Install from a
+    /// second bind (and from installing hosts before anything listens).
+    private var serverRunning = false
+
     private var currentSettings: Settings
     private let settingsStore: SettingsStore
     private let stats: StatsStore
     private let installer: Installer
     private let server: ProxyServerControlling
     private let loginItem: LoginItemRegistering
+    private let quitDecision: QuitDecision
 
     public init(
         settingsStore: SettingsStore,
@@ -70,6 +91,7 @@ public final class AppModel {
         installer: Installer,
         server: ProxyServerControlling,
         loginItem: LoginItemRegistering,
+        quitDecision: QuitDecision,
         refreshInterval: Duration = .seconds(5)
     ) {
         self.settingsStore = settingsStore
@@ -77,6 +99,7 @@ public final class AppModel {
         self.installer = installer
         self.server = server
         self.loginItem = loginItem
+        self.quitDecision = quitDecision
         self.refreshInterval = refreshInterval
         self.currentSettings = settingsStore.settings
         self.status = InstallStatus(caTrusted: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
@@ -84,19 +107,36 @@ public final class AppModel {
     }
 
     public func start() async {
-        do {
-            try await server.start()
-        } catch {
-            // Spec 9: a busy port must not change the hosts entry, and the user must see why.
-            warn("Proxy server failed to start: \(error). The hosts entry was left unchanged.")
-        }
+        _ = await startServer(ifFailed: "The hosts entry was left unchanged.")
     }
 
     public func stop() async {
         await server.stop()
+        serverRunning = false
+    }
+
+    /// Starts the proxy unless it is already listening. Returns false (with a
+    /// warning) when it cannot bind, so callers never proceed as if it listens.
+    @discardableResult
+    private func startServer(ifFailed suffix: String) async -> Bool {
+        if serverRunning { return true }
+        do {
+            try await server.start()
+            serverRunning = true
+            return true
+        } catch {
+            warn("Proxy server failed to start: \(error). \(suffix)")
+            return false
+        }
     }
 
     public func install() async {
+        // Spec 9 / finding: installing the hosts entry before the proxy listens
+        // would black-hole openrouter.ai for every client, so start first.
+        guard await startServer(ifFailed: "Install was skipped; the hosts entry was left unchanged.") else {
+            await refresh()
+            return
+        }
         do {
             try await installer.install()
         } catch {
@@ -112,6 +152,22 @@ public final class AppModel {
             warn("Uninstall failed: \(error).")
         }
         await refresh()
+    }
+
+    /// Spec 9 / finding: quitting with the hosts entry installed leaves
+    /// `openrouter.ai` routed to a dead proxy, so confirm before terminating.
+    public func quit() async {
+        if status.hostsEntry {
+            switch quitDecision.decide() {
+            case .cancel:
+                return
+            case .quitAnyway:
+                break
+            case .uninstallAndQuit:
+                await uninstall()
+            }
+        }
+        quitDecision.terminate()
     }
 
     public func refresh() async {
