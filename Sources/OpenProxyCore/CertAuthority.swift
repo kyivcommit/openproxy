@@ -26,13 +26,20 @@ public final class CertAuthority: @unchecked Sendable {
     ]
 
     private let directory: URL
+    private let clock: @Sendable () -> Date
     private let lock = NSLock()
     private var caCertificate: Certificate?
     private var caPrivateKey: Certificate.PrivateKey?
     private var cachedLeaf: (certificate: Certificate, privateKey: Certificate.PrivateKey, notValidAfter: Date)?
 
-    public init(directory: URL) {
+    public convenience init(directory: URL) {
+        self.init(directory: directory, clock: Date.init)
+    }
+
+    /// `clock` is a test seam for exercising leaf renewal; production uses `Date.init`.
+    init(directory: URL, clock: @escaping @Sendable () -> Date) {
         self.directory = directory
+        self.clock = clock
     }
 
     /// PEM of the CA certificate; also the path written by `loadOrCreate`.
@@ -74,9 +81,10 @@ public final class CertAuthority: @unchecked Sendable {
 
     /// Returns the current leaf certificate and key, issuing a new one if none is cached or the
     /// cached one is within 30 days of expiry.
-    public func leaf(now: Date = Date()) throws -> (certificatePEM: String, privateKeyPEM: String) {
+    public func leaf(now: Date? = nil) throws -> (certificatePEM: String, privateKeyPEM: String) {
         try lock.withLock {
             guard let caCertificate, let caPrivateKey else { throw Error.notLoaded }
+            let now = now ?? clock()
 
             if let cached = cachedLeaf, now < cached.notValidAfter.addingTimeInterval(-Self.renewalWindow) {
                 return (try cached.certificate.serializeAsPEM().pemString, try cached.privateKey.serializeAsPEM().pemString)

@@ -167,6 +167,40 @@ class TrustDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
     }
 }
 
+/// Records the leaf the server presents, then accepts any certificate, so a test can
+/// observe which leaf a handshake got without depending on wall-clock validity.
+private final class LeafCaptureDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _leaves: [Data] = []
+
+    var leaves: [Data] { lock.withLock { _leaves } }
+
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        if let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = chain.first {
+            lock.withLock { _leaves.append(SecCertificateCopyData(leaf) as Data) }
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+}
+
+private final class MutableClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ now: Date) { self.value = now }
+
+    var now: Date { lock.withLock { value } }
+    func advance(_ seconds: TimeInterval) { lock.withLock { value = value.addingTimeInterval(seconds) } }
+}
+
 /// Trusts the CA and reports each body chunk as it arrives, so a test can observe
 /// streaming without `URLSession.bytes(for:)` (which skips the trust delegate here).
 private final class StreamingDelegate: TrustDelegate, URLSessionDataDelegate, @unchecked Sendable {
@@ -1040,6 +1074,49 @@ struct ProxyServerTests {
         #expect(serverConfig.minimumTLSVersion == .tlsv12)
         let client = NIOUpstreamClient(resolver: StaticResolver(addresses: []))
         #expect(client.minimumTLSVersion == .tlsv12)
+    }
+
+    /// A leaf issued once at `start()` would expire after 90 days of uptime; the server must
+    /// fetch the current leaf per handshake so a regenerated one is served without a restart.
+    @Test func tlsLeafIsRefreshedWithoutRestart() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "openproxy-leaf-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let clock = MutableClock(Date())
+        let ca = CertAuthority(directory: directory, clock: { clock.now })
+        try ca.loadOrCreate()
+        let server = ProxyServer(
+            config: ProxyConfig(bindHost: "127.0.0.1", port: 0),
+            ca: ca,
+            upstream: FakeUpstreamClient([FakeReply()]),
+            catalog: TierCatalog(fetcher: FakeEndpointsFetcher(hasFlex: false)),
+            stats: try StatsStore(path: ":memory:"),
+            settings: { Settings() })
+        do {
+            try await server.start()
+            let delegate = LeafCaptureDelegate()
+            let url = URL(string: "https://127.0.0.1:\(server.boundPort)/api/v1/models")!
+
+            func fetchLeaf() async -> Data? {
+                let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+                defer { session.invalidateAndCancel() }
+                _ = try? await session.data(from: url)
+                return delegate.leaves.last
+            }
+
+            let first = await fetchLeaf()
+            clock.advance(61 * 86_400)  // past the 30-day renewal window
+            let second = await fetchLeaf()
+
+            #expect(first != nil)
+            #expect(second != nil)
+            #expect(first != second, "the server must present a regenerated leaf without a restart")
+        } catch {
+            await server.stop()
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        await server.stop()
+        try? FileManager.default.removeItem(at: directory)
     }
 
     @Test func flexFailureRecordsRealAttemptsAndFallback() async throws {
