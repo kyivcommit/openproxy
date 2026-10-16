@@ -339,6 +339,27 @@ struct AppModelTests {
         #expect(notInstalled.unreachableWarning == nil)
     }
 
+    @Test func hostsEntryWithUntrustedCAProducesWarningIndependentOfListener() {
+        // Spec 9: hosts routed here with the CA absent or untrusted makes every client's TLS
+        // handshake fail, whether or not the proxy is listening.
+        let untrusted = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: true, portListening: true, nodeCAEnv: false)
+        #expect(untrusted.untrustedCAWarning != nil)
+        let presentButUntrusted = InstallStatus(caTrusted: false, caPresent: true, hostsEntry: true, portListening: true, nodeCAEnv: false)
+        #expect(presentButUntrusted.untrustedCAWarning != nil)
+        let trusted = InstallStatus(caTrusted: true, caPresent: true, hostsEntry: true, portListening: true, nodeCAEnv: false)
+        #expect(trusted.untrustedCAWarning == nil)
+        let noHosts = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: false, portListening: true, nodeCAEnv: false)
+        #expect(noHosts.untrustedCAWarning == nil)
+    }
+
+    @Test func modelExposesUntrustedCAWarningFromStatus() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        await model.refresh()
+        // The fake runner answers `verify-cert` with success, so trust reads as OK here.
+        #expect(model.untrustedCAWarning == nil)
+    }
+
     @Test func portInUseBecomesWarningAndLeavesHostsUntouched() async throws {
         let h = try Harness()
         h.server.startError = PortInUse()
