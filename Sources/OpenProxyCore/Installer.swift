@@ -350,6 +350,16 @@ public final class Installer: @unchecked Sendable {
         if !deleteCerts.succeeded {
             failures.append("login-keychain certificate: \(deleteCerts.failureDetail)")
         }
+        // Item 1: "Set for GUI apps" writes NODE_EXTRA_CA_CERTS into the launchd environment,
+        // so every GUI app launched until logout keeps trusting the (about to be removed) CA.
+        // Clear it, but only when it still points at our ca.pem. Best effort.
+        let nodeEnv = await commandRunner.run("launchctl getenv NODE_EXTRA_CA_CERTS")
+        if nodeEnv.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines) == caPEMURL.path {
+            let unset = await commandRunner.run("launchctl unsetenv NODE_EXTRA_CA_CERTS")
+            if !unset.succeeded {
+                failures.append("NODE_EXTRA_CA_CERTS: \(unset.failureDetail)")
+            }
+        }
         return failures.isEmpty ? nil : failures.joined(separator: "; ")
     }
 

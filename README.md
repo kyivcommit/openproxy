@@ -61,7 +61,7 @@ Restart any other long-running client the same way.
 
 ## Uninstall / emergency removal
 
-Press **Uninstall** in the menu. It removes the hosts line first (the safety-critical step), then the per-user trust and the certificate from your login keychain, and best-effort sweeps any certificate an older install left in the System keychain.
+Press **Uninstall** in the menu. It removes the hosts line first (the safety-critical step), then the per-user trust and the certificate from your login keychain, clears the `NODE_EXTRA_CA_CERTS` variable if **Set for GUI apps** had pointed it at our CA, and best-effort sweeps any certificate an older install left in the System keychain.
 
 If the app is gone or crashed, `openrouter.ai` stays unreachable until the hosts line is removed. Do it manually, then remove the trust and the certificate:
 
@@ -69,13 +69,17 @@ If the app is gone or crashed, `openrouter.ai` stays unreachable until the hosts
 # 1. unblock openrouter.ai
 sudo sed -i '' '/# openproxy/d' /etc/hosts && sudo dscacheutil -flushcache
 
-# 2. remove the per-user trust and the certificate from your login keychain
+# 2. if "Set for GUI apps" was used, drop the CA from the launchd environment
+launchctl getenv NODE_EXTRA_CA_CERTS | grep -Fq "$HOME/Library/Application Support/openproxy/ca.pem" \
+  && launchctl unsetenv NODE_EXTRA_CA_CERTS
+
+# 3. remove the per-user trust and the certificate from your login keychain
 security remove-trusted-cert "$HOME/Library/Application Support/openproxy/ca.pem"
 security find-certificate -a -Z -c "OpenProxy Local CA" ~/Library/Keychains/login.keychain-db \
   | awk '/SHA-1 hash:/ { print $NF }' \
   | while read -r hash; do security delete-certificate -Z "$hash" ~/Library/Keychains/login.keychain-db; done
 
-# 3. best-effort: a certificate left in the System keychain by an older install
+# 4. best-effort: a certificate left in the System keychain by an older install
 sudo security find-certificate -a -Z -c "OpenProxy Local CA" /Library/Keychains/System.keychain \
   | awk '/SHA-1 hash:/ { print $NF }' \
   | while read -r hash; do sudo security delete-certificate -Z "$hash" /Library/Keychains/System.keychain; done

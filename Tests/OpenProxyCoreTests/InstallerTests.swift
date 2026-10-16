@@ -387,6 +387,63 @@ struct InstallerTests {
         #expect(command.contains(fakeCAPath))
     }
 
+    // MARK: - Item 1: clear NODE_EXTRA_CA_CERTS when it points at our ca.pem
+
+    @Test func uninstallClearsNodeCAEnvWhenItPointsAtOurCA() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            command.contains("launchctl getenv")
+                ? CommandResult(status: 0, standardOutput: TestCA.pemURL.path + "\n")
+                : CommandResult(status: 0)
+        })
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+
+        #expect(commands.commands.contains { $0.contains("launchctl unsetenv NODE_EXTRA_CA_CERTS") })
+    }
+
+    @Test func uninstallLeavesNodeCAEnvWhenItIsSomeoneElses() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            command.contains("launchctl getenv")
+                ? CommandResult(status: 0, standardOutput: "/some/other/ca.pem\n")
+                : CommandResult(status: 0)
+        })
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+
+        #expect(!commands.commands.contains { $0.contains("launchctl unsetenv") })
+    }
+
+    @Test func uninstallReportsFailureToClearNodeCAEnv() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            if command.contains("launchctl getenv") {
+                return CommandResult(status: 0, standardOutput: TestCA.pemURL.path + "\n")
+            }
+            if command.contains("launchctl unsetenv") {
+                return CommandResult(status: 1, standardError: "launchctl: failed")
+            }
+            return CommandResult(status: 0)
+        })
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(thrown?.description.contains("NODE_EXTRA_CA_CERTS") == true)
+    }
+
+
     @Test func appleScriptEscapesInputAndRequestsAdmin() {
         let appleScript = OsascriptRunner.appleScript(forShellScript: "echo \"hi\" \\ bye")
         #expect(appleScript.hasPrefix("do shell script"))
