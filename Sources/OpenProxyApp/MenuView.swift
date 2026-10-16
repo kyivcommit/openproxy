@@ -37,6 +37,10 @@ struct MenuView: View {
                 Divider()
                 unreachableBlock(untrustedCA)
             }
+            if let notice = model.installNotice {
+                Divider()
+                installNoticeBlock(notice)
+            }
             if !model.warnings.isEmpty {
                 Divider()
                 warningBlock
@@ -102,7 +106,24 @@ struct MenuView: View {
             statusRow("Hosts entry", model.status.hostsEntry)
             statusRow("Port 443 listening", model.status.portListening)
             statusRow("Node CA env", model.status.nodeCAEnv)
+            nodeCAActions
             Text("Autostart: \(model.loginItemStatus.label)").font(.caption)
+        }
+    }
+
+    /// Finding: the Node row showed a cross with no action. These two buttons are the
+    /// offered fix; the app never edits a shell profile.
+    private var nodeCAActions: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Button("Copy Node CA line") { model.copyNodeCALine() }
+                Button("Set for GUI apps") { Task { await model.setNodeCAEnvForGUIApps() } }
+            }
+            .font(.caption)
+            Text("Terminal sessions need the export line in your shell profile; running clients must be restarted.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -138,11 +159,29 @@ struct MenuView: View {
         }
     }
 
+    /// A one-time, dismissible info line (not a warning): restart long-running clients
+    /// after Install so they load the new CA.
+    private func installNoticeBlock(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text("ℹ︎ \(message)")
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button {
+                model.dismissInstallNotice()
+            } label: {
+                Image(systemName: "xmark.circle")
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+    }
+
     private var warningBlock: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Warnings").font(.headline)
-            ForEach(model.warnings, id: \.self) { warning in
-                Text("⚠︎ \(warning)")
+            ForEach(model.warnings, id: \.key) { warning in
+                Text("⚠︎ \(warning.message)")
                     .font(.caption)
                     .foregroundStyle(.orange)
                     // Command stderr can be long; show it wrapped and selectable, never clipped.

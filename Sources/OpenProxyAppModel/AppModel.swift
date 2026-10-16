@@ -26,6 +26,31 @@ public protocol QuitDecision: Sendable {
     func terminate()
 }
 
+/// A warning's category. Keyed so a finished operation clears exactly the warnings it
+/// resolves (install/uninstall/start/quit) and leaves still-true ones (settings save,
+/// autostart, Node env) visible, instead of blanket-clearing on every success.
+public enum WarningKey: Hashable, Sendable {
+    case settingsSave
+    case legacyCA
+    case serverStart
+    case install
+    case uninstall
+    case quit
+    case autostart
+    case nodeEnv
+}
+
+public struct Warning: Equatable, Sendable, Identifiable {
+    public let key: WarningKey
+    public let message: String
+    public var id: WarningKey { key }
+
+    public init(key: WarningKey, message: String) {
+        self.key = key
+        self.message = message
+    }
+}
+
 extension InstallStatus {
     /// Spec 9: with the hosts entry installed but nothing listening on 443, every
     /// client's `openrouter.ai` is broken until the proxy runs or the user uninstalls.
@@ -62,15 +87,19 @@ public final class AppModel {
             } catch {
                 // The in-memory value still drives the UI and each request; only the
                 // disk copy is stale, so warn and keep the shown value.
-                warn("Could not save settings: \(error).")
+                warn(.settingsSave, "Could not save settings: \(error).")
             }
         }
     }
 
     public private(set) var status: InstallStatus
     public private(set) var summary: StatsSummary
-    public private(set) var warnings: [String] = []
+    public private(set) var warnings: [Warning] = []
     public private(set) var loginItemStatus: LoginItemStatus = .notRegistered
+
+    /// One-time advice shown after a successful Install: long-running clients must restart
+    /// to load the new CA. Not a warning; cleared by the user or the next Uninstall.
+    public private(set) var installNotice: String?
 
     /// Derived from `status`, so it stays visible for as long as the danger lasts
     /// (proxy quit/crashed with the hosts entry still routed) and clears itself.
@@ -96,6 +125,7 @@ public final class AppModel {
     private let server: ProxyServerControlling
     private let loginItem: LoginItemRegistering
     private let quitDecision: QuitDecision
+    private let pasteboard: PasteboardWriting
 
     public init(
         settingsStore: SettingsStore,
@@ -104,6 +134,7 @@ public final class AppModel {
         server: ProxyServerControlling,
         loginItem: LoginItemRegistering,
         quitDecision: QuitDecision,
+        pasteboard: PasteboardWriting = NSPasteboardWriter(),
         caWasRegenerated: Bool = false,
         refreshInterval: Duration = .seconds(5)
     ) {
@@ -113,12 +144,13 @@ public final class AppModel {
         self.server = server
         self.loginItem = loginItem
         self.quitDecision = quitDecision
+        self.pasteboard = pasteboard
         self.refreshInterval = refreshInterval
         self.currentSettings = settingsStore.settings
         self.status = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
         self.summary = StatsSummary()
         if caWasRegenerated {
-            warn("The local CA was regenerated because it predates this version; the trusted copy is stale. Run Uninstall, then Install again.")
+            warn(.legacyCA, "The local CA was regenerated because it predates this version; the trusted copy is stale. Run Uninstall, then Install again.")
         }
     }
 
@@ -141,7 +173,7 @@ public final class AppModel {
             serverRunning = true
             return true
         } catch {
-            warn("Proxy server failed to start: \(error). \(suffix)")
+            warn(.serverStart, "Proxy server failed to start: \(error). \(suffix)")
             return false
         }
     }
@@ -153,19 +185,28 @@ public final class AppModel {
             await refresh()
             return
         }
+        var installed = false
         do {
             try await installer.install()
+            installed = true
+            // The stale install/uninstall/start/quit warnings are no longer true.
+            clearWarnings(Self.operationWarningKeys)
         } catch {
-            warn("Install failed: \(error). The system was not fully changed.")
+            warn(.install, "Install failed: \(error). The system was not fully changed.")
         }
         await refresh()
+        if installed {
+            installNotice = Self.restartClientsNotice
+        }
     }
 
     public func uninstall() async {
         do {
             try await installer.uninstall()
+            clearWarnings(Self.operationWarningKeys)
+            installNotice = nil
         } catch {
-            warn("Uninstall failed: \(error).")
+            warn(.uninstall, "Uninstall failed: \(error).")
         }
         await refresh()
     }
@@ -185,7 +226,7 @@ public final class AppModel {
                 // failed uninstall would otherwise leave openrouter.ai pointing at a dead
                 // listener the moment the app exits.
                 if status.hostsEntry {
-                    warn("Quit was cancelled: openrouter.ai is still routed to this Mac, so quitting "
+                    warn(.quit, "Quit was cancelled: openrouter.ai is still routed to this Mac, so quitting "
                         + "would break every client. Fix the uninstall problem, then quit again.")
                     return
                 }
@@ -198,7 +239,38 @@ public final class AppModel {
         summary = stats.summary(since: Date(timeIntervalSinceNow: -86_400))
         status = await installer.status()
         loginItemStatus = loginItem.status
+        // The regenerated-CA warning stops being true once the current CA is trusted and
+        // its hosts entry is in place; until then it stays visible.
+        if status.caTrusted && status.hostsEntry {
+            clearWarnings([.legacyCA])
+        }
     }
+
+    /// Puts the `export NODE_EXTRA_CA_CERTS=…` line on the pasteboard for the user's shell
+    /// profile. The app never edits a profile itself.
+    public func copyNodeCALine() {
+        pasteboard.copy(Installer.nodeCAExportLine(caPEMPath: installer.caPEMPath))
+    }
+
+    /// Sets `NODE_EXTRA_CA_CERTS` for GUI apps launched from now on. Running processes keep
+    /// their old environment, which is why the menu tells the user to restart them.
+    public func setNodeCAEnvForGUIApps() async {
+        do {
+            try await installer.applyNodeCAEnv()
+        } catch {
+            warn(.nodeEnv, "Could not set NODE_EXTRA_CA_CERTS: \(error).")
+        }
+        await refresh()
+    }
+
+    public func dismissInstallNotice() {
+        installNotice = nil
+    }
+
+    /// Shown once after a successful Install (finding: clients that started before Install
+    /// keep their old trust store).
+    static let restartClientsNotice =
+        "Restart long-running clients (e.g. `opencode service restart`) so they trust the new CA."
 
     /// Called by the menu on appear/disappear: refresh once right away, then on
     /// `refreshInterval` while the menu stays open so a crashed proxy or new
@@ -223,18 +295,27 @@ public final class AppModel {
             try loginItem.register()
         } catch {
             loginItemStatus = loginItem.status
-            warn("Autostart registration failed: \(error).")
+            warn(.autostart, "Autostart registration failed: \(error).")
             return
         }
         loginItemStatus = loginItem.status
         if loginItemStatus != .enabled {
-            warn("Autostart is \(loginItemStatus.label).")
+            warn(.autostart, "Autostart is \(loginItemStatus.label).")
         }
     }
 
-    /// Appends a warning once; repeated failures of the same kind must not flood the menu.
-    private func warn(_ message: String) {
-        guard !warnings.contains(message) else { return }
-        warnings.append(message)
+    /// Records or replaces the warning for `key`; one message per category, so repeated
+    /// failures of the same kind do not flood the menu.
+    private func warn(_ key: WarningKey, _ message: String) {
+        warnings.removeAll { $0.key == key }
+        warnings.append(Warning(key: key, message: message))
     }
+
+    private func clearWarnings(_ keys: Set<WarningKey>) {
+        warnings.removeAll { keys.contains($0.key) }
+    }
+
+    /// The warnings a completed install/uninstall resolves. The legacy-CA warning clears
+    /// separately, only once the current CA is trusted and routed (see `refresh`).
+    private static let operationWarningKeys: Set<WarningKey> = [.install, .uninstall, .serverStart, .quit]
 }

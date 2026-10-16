@@ -42,13 +42,26 @@ private final class FakeRunner: PrivilegedRunner, @unchecked Sendable {
 
 /// An unprivileged command runner that records commands and succeeds by default, so the
 /// login-keychain trust phase in `Installer` never touches a real keychain in tests.
+/// `errorOnContains` makes one command fail, for the Node-env error path.
 private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
+    var errorOnContains: String?
     private(set) var commands: [String] = []
 
     func run(_ command: String) async -> CommandResult {
         commands.append(command)
+        if let errorOnContains, command.contains(errorOnContains) {
+            return CommandResult(status: 1, standardError: "denied")
+        }
         return CommandResult(status: 0)
     }
+}
+
+/// Records what would go on the clipboard, so tests never touch the real pasteboard.
+@MainActor
+private final class FakePasteboard: PasteboardWriting {
+    private(set) var copied: [String] = []
+
+    func copy(_ string: String) { copied.append(string) }
 }
 
 private struct PortInUse: Error {}
@@ -93,6 +106,7 @@ private struct Harness {
     let server: FakeServer
     let loginItem: FakeLoginItem
     let quitDecision: FakeQuitDecision
+    let pasteboard: FakePasteboard
 
     init(hostsText: String? = nil) throws {
         let directory = FileManager.default.temporaryDirectory
@@ -117,13 +131,14 @@ private struct Harness {
         self.server = FakeServer()
         self.loginItem = FakeLoginItem()
         self.quitDecision = FakeQuitDecision()
+        self.pasteboard = FakePasteboard()
     }
 
     func model(refreshInterval: Duration = .seconds(5)) -> AppModel {
         AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: loginItem, quitDecision: quitDecision,
-            refreshInterval: refreshInterval)
+            pasteboard: pasteboard, refreshInterval: refreshInterval)
     }
 
     /// Bounded polling helper: returns false after `timeout` so a missing
@@ -176,9 +191,9 @@ struct AppModelTests {
         await model.install()
 
         #expect(model.warnings.count == 1)
-        #expect(model.warnings[0].contains("Install"))
+        #expect(model.warnings[0].message.contains("Install"))
         // InstallError renders as its message, so the stderr/cancel reason stays readable.
-        #expect(model.warnings[0].contains("user cancelled"))
+        #expect(model.warnings[0].message.contains("user cancelled"))
         #expect(h.runner.scripts.count == 1)
     }
 
@@ -240,7 +255,7 @@ struct AppModelTests {
 
         #expect(h.loginItem.registerCount == 1)
         #expect(model.loginItemStatus == .notFound)
-        #expect(model.warnings.contains { $0.contains("Autostart") })
+        #expect(model.warnings.contains { $0.message.contains("Autostart") })
     }
 
     @Test func loginItemRequiringApprovalBecomesWarning() throws {
@@ -251,7 +266,7 @@ struct AppModelTests {
         model.registerLoginItem()
 
         #expect(model.loginItemStatus == .requiresApproval)
-        #expect(model.warnings.contains { $0.contains("Autostart") })
+        #expect(model.warnings.contains { $0.message.contains("Autostart") })
     }
 
     @Test func loginItemEnabledAddsNoWarning() throws {
@@ -302,7 +317,7 @@ struct AppModelTests {
         // The in-memory value (UI and per-request reader) stays consistent; only the disk write failed.
         #expect(model.settings.sort == .price)
         #expect(store.settings.sort == .price)
-        #expect(model.warnings.contains { $0.contains("settings") })
+        #expect(model.warnings.contains { $0.message.contains("settings") })
     }
 
     @Test func legacyCARegenerationBecomesWarning() throws {
@@ -314,7 +329,7 @@ struct AppModelTests {
             caWasRegenerated: true)
 
         #expect(h.model().warnings.isEmpty)
-        #expect(model.warnings.contains { $0.contains("Uninstall") })
+        #expect(model.warnings.contains { $0.message.contains("Uninstall") })
     }
 
     @Test func menuVisibilityDrivesPeriodicRefresh() async throws {
@@ -380,7 +395,7 @@ struct AppModelTests {
         await model.start()
 
         #expect(model.warnings.count == 1)
-        #expect(model.warnings[0].lowercased().contains("start"))
+        #expect(model.warnings[0].message.lowercased().contains("start"))
         #expect(h.runner.scripts.isEmpty)
     }
 
@@ -403,7 +418,7 @@ struct AppModelTests {
 
         // No privileged step ran and the hosts file is left routed as it was.
         #expect(h.runner.scripts.isEmpty)
-        #expect(model.warnings.contains { $0.contains("Install was skipped") })
+        #expect(model.warnings.contains { $0.message.contains("Install was skipped") })
     }
 
     @Test func installDoesNotStartAnAlreadyRunningServer() async throws {
@@ -484,6 +499,138 @@ struct AppModelTests {
         // and surface why instead.
         #expect(h.quitDecision.terminateCount == 0)
         #expect(model.status.hostsEntry)
-        #expect(model.warnings.contains { $0.contains("still routed") })
+        #expect(model.warnings.contains { $0.message.contains("still routed") })
+    }
+
+    // MARK: - Item 1: keyed warnings clear on success
+
+    @Test func successfulInstallClearsStaleOperationWarnings() async throws {
+        // The real-install bug: a failed Uninstall left "Uninstall failed: …" visible even
+        // after a later Install succeeded.
+        let h = try Harness()
+        let model = h.model()
+        h.runner.error = InstallError.runnerFailed("boom")
+        await model.uninstall()
+        #expect(model.warnings.contains { $0.key == .uninstall })
+
+        h.runner.error = nil
+        await model.install()
+
+        #expect(!model.warnings.contains { $0.key == .uninstall })
+        #expect(!model.warnings.contains { $0.key == .install })
+        #expect(!model.warnings.contains { $0.key == .serverStart })
+    }
+
+    @Test func successfulUninstallClearsStaleInstallWarning() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        h.runner.error = InstallError.runnerFailed("boom")
+        await model.install()
+        #expect(model.warnings.contains { $0.key == .install })
+
+        h.runner.error = nil
+        await model.uninstall()
+
+        #expect(model.warnings.isEmpty)
+    }
+
+    @Test func successfulInstallClearsLegacyCAWarningOnceTrustedAndRouted() async throws {
+        let h = try Harness()
+        let model = AppModel(
+            settingsStore: h.settingsStore, stats: h.stats, installer: h.installer,
+            server: h.server, loginItem: h.loginItem, quitDecision: h.quitDecision,
+            caWasRegenerated: true)
+        #expect(model.warnings.contains { $0.key == .legacyCA })
+
+        await model.install()
+
+        #expect(!model.warnings.contains { $0.key == .legacyCA })
+    }
+
+    @Test func legacyCAWarningStaysUntilTrustedAndRouted() async throws {
+        let h = try Harness()
+        let model = AppModel(
+            settingsStore: h.settingsStore, stats: h.stats, installer: h.installer,
+            server: h.server, loginItem: h.loginItem, quitDecision: h.quitDecision,
+            caWasRegenerated: true)
+
+        await model.refresh()
+
+        #expect(model.warnings.contains { $0.key == .legacyCA })
+    }
+
+    // MARK: - Item 2: Node CA env actions
+
+    @Test func copyNodeCALinePutsExportOnPasteboard() throws {
+        let h = try Harness()
+        let model = h.model()
+
+        model.copyNodeCALine()
+
+        #expect(h.pasteboard.copied == ["export NODE_EXTRA_CA_CERTS=\"\(h.installer.caPEMPath)\""])
+    }
+
+    @Test func setNodeCAEnvForGUIAppsRunsLaunchctl() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.setNodeCAEnvForGUIApps()
+
+        #expect(h.commandRunner.commands.contains {
+            $0.contains("launchctl setenv NODE_EXTRA_CA_CERTS")
+        })
+        #expect(model.warnings.isEmpty)
+    }
+
+    @Test func setNodeCAEnvFailureBecomesWarning() async throws {
+        let h = try Harness()
+        h.commandRunner.errorOnContains = "launchctl setenv"
+        let model = h.model()
+
+        await model.setNodeCAEnvForGUIApps()
+
+        #expect(model.warnings.contains { $0.key == .nodeEnv })
+    }
+
+    // MARK: - Item 3: one-time restart notice after Install
+
+    @Test func successfulInstallShowsRestartNotice() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.install()
+
+        #expect(model.installNotice?.contains("opencode service restart") == true)
+    }
+
+    @Test func failedInstallShowsNoRestartNotice() async throws {
+        let h = try Harness()
+        h.runner.error = InstallError.runnerFailed("user cancelled")
+        let model = h.model()
+
+        await model.install()
+
+        #expect(model.installNotice == nil)
+    }
+
+    @Test func dismissInstallNoticeClearsIt() async throws {
+        let h = try Harness()
+        let model = h.model()
+        await model.install()
+
+        model.dismissInstallNotice()
+
+        #expect(model.installNotice == nil)
+    }
+
+    @Test func uninstallClearsInstallNotice() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        await model.install()
+        #expect(model.installNotice != nil)
+
+        await model.uninstall()
+
+        #expect(model.installNotice == nil)
     }
 }
