@@ -9,7 +9,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>OpenProxy</string>
 	<key>CFBundleExecutable</key>
-	<string>OpenProxy</string>
+	<string>OpenProxyApp</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

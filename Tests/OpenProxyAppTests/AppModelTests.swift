@@ -135,6 +135,22 @@ struct AppModelTests {
         #expect(FileManager.default.fileExists(atPath: base.appending(path: "stats.sqlite").path))
     }
 
+    @Test func agentPlistUsesBundleRelativeProgramAndConditionalKeepAlive() throws {
+        // Guards the LaunchAgent contract: the program path must follow the signed
+        // bundle wherever it lives, and KeepAlive must not fight Quit.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // OpenProxyAppTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+        let data = try Data(contentsOf: root.appending(path: "Resources/dev.openproxy.app.plist"))
+        let dict = try #require(
+            try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+
+        #expect(dict["ProgramArguments"] == nil)
+        #expect(dict["BundleProgram"] as? String == "Contents/MacOS/OpenProxyApp")
+        #expect((dict["KeepAlive"] as? [String: Any])?["SuccessfulExit"] as? Bool == false)
+    }
+
     @Test func portInUseBecomesWarningAndLeavesHostsUntouched() async throws {
         let h = try Harness()
         h.server.startError = PortInUse()

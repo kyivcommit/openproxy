@@ -9,7 +9,7 @@ app="build/OpenProxy.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$app/Contents/Library/LaunchAgents"
 
-cp .build/release/OpenProxyApp "$app/Contents/MacOS/OpenProxy"
+cp .build/release/OpenProxyApp "$app/Contents/MacOS/OpenProxyApp"
 cp Resources/Info.plist "$app/Contents/Info.plist"
 cp Resources/dev.openproxy.app.plist "$app/Contents/Library/LaunchAgents/dev.openproxy.app.plist"
 
