@@ -38,6 +38,11 @@ public final class AppModel {
     public private(set) var warnings: [String] = []
     public private(set) var loginItemStatus: LoginItemStatus = .notRegistered
 
+    /// How often an open menu refreshes the summary and status.
+    public let refreshInterval: Duration
+
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
+
     private var currentSettings: Settings
     private let settingsStore: SettingsStore
     private let stats: StatsStore
@@ -50,13 +55,15 @@ public final class AppModel {
         stats: StatsStore,
         installer: Installer,
         server: ProxyServerControlling,
-        loginItem: LoginItemRegistering
+        loginItem: LoginItemRegistering,
+        refreshInterval: Duration = .seconds(5)
     ) {
         self.settingsStore = settingsStore
         self.stats = stats
         self.installer = installer
         self.server = server
         self.loginItem = loginItem
+        self.refreshInterval = refreshInterval
         self.currentSettings = settingsStore.settings
         self.status = InstallStatus(caTrusted: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
         self.summary = StatsSummary()
@@ -97,6 +104,22 @@ public final class AppModel {
         summary = stats.summary(since: Date(timeIntervalSinceNow: -86_400))
         status = await installer.status()
         loginItemStatus = loginItem.status
+    }
+
+    /// Called by the menu on appear/disappear: refresh once right away, then on
+    /// `refreshInterval` while the menu stays open so a crashed proxy or new
+    /// traffic shows up without reopening the menu.
+    public func menuVisibilityChanged(_ visible: Bool) {
+        refreshTask?.cancel()
+        refreshTask = nil
+        guard visible else { return }
+        refreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.refresh()
+                try? await Task.sleep(for: self.refreshInterval)
+            }
+        }
     }
 
     /// Registers the login item and reports both the thrown error and the

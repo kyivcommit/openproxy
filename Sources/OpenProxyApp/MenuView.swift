@@ -45,6 +45,8 @@ struct MenuView: View {
         }
         .padding(14)
         .frame(width: 340)
+        .onAppear { model.menuVisibilityChanged(true) }
+        .onDisappear { model.menuVisibilityChanged(false) }
     }
 
     private var flexSection: some View {

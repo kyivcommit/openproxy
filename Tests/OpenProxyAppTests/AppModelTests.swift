@@ -72,10 +72,22 @@ private struct Harness {
         self.loginItem = FakeLoginItem()
     }
 
-    func model() -> AppModel {
+    func model(refreshInterval: Duration = .seconds(5)) -> AppModel {
         AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
-            server: server, loginItem: loginItem)
+            server: server, loginItem: loginItem, refreshInterval: refreshInterval)
+    }
+
+    /// Bounded polling helper: returns false after `timeout` so a missing
+    /// background refresh fails the test instead of hanging it.
+    @MainActor
+    func waitUntil(_ timeout: Duration = .seconds(2), _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return condition()
     }
 }
 
@@ -239,6 +251,30 @@ struct AppModelTests {
         #expect(model.settings.sort == .price)
         #expect(store.settings.sort == .price)
         #expect(model.warnings.contains { $0.contains("settings") })
+    }
+
+    @Test func menuVisibilityDrivesPeriodicRefresh() async throws {
+        let h = try Harness()
+        // Default cadence is 5 s; the test uses a fast one instead of sleeping for it.
+        #expect(h.model().refreshInterval == .seconds(5))
+
+        let model = h.model(refreshInterval: .milliseconds(5))
+        h.stats.record(RequestRecord(
+            time: Date(), path: "/api/v1/chat/completions", sort: .balanced, tier: .auto,
+            status: 200, ttfbMs: 3, retries: 0))
+
+        model.menuVisibilityChanged(true)
+        #expect(await h.waitUntil { model.summary.total == 1 })
+
+        // Hidden again: no further refreshes, so a newly recorded row is not picked up.
+        model.menuVisibilityChanged(false)
+        try await Task.sleep(for: .milliseconds(50))
+        let settled = model.summary.total
+        h.stats.record(RequestRecord(
+            time: Date(), path: "/api/v1/chat/completions", sort: .balanced, tier: .auto,
+            status: 200, ttfbMs: 3, retries: 0))
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(model.summary.total == settled)
     }
 
     @Test func portInUseBecomesWarningAndLeavesHostsUntouched() async throws {
