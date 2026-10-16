@@ -74,7 +74,7 @@ private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
 
     var commands: [String] { lock.withLock { recorded } }
 
-    func run(_ command: String) async -> CommandResult {
+    func run(_ command: String, timeout: Duration) async -> CommandResult {
         lock.withLock { recorded.append(command) }
         return handler(command)
     }
@@ -494,6 +494,27 @@ struct InstallerTests {
         #expect(missingStatus.caPresent == false)
     }
 
+    @Test func statusTreatsATimedOutProbeAsFalseAndKeepsGoing() async throws {
+        // A probe that had to be killed is "unknown", not true: it must not read as trusted
+        // and must not stop the remaining probes from running.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            command.contains("find-certificate") || command.contains("verify-cert")
+                ? CommandResult(status: -1, timedOut: true)
+                : CommandResult(status: 0)
+        })
+
+        let status = await makeInstaller(
+            runner: runner, commandRunner: commands, hostsPath: hostsPath).status()
+
+        #expect(status.caTrusted == false)
+        #expect(status.caPresent == false)
+        #expect(status.hostsEntry == true)
+        #expect(status.portListening == true)
+    }
+
     @Test func nodeCAEnvCommandTargetsLaunchctl() {
         let command = Installer.nodeCAEnvCommand(caPEMURL: URL(fileURLWithPath: fakeCAPath))
         #expect(command.contains("launchctl setenv NODE_EXTRA_CA_CERTS"))
@@ -601,17 +622,55 @@ struct InstallerTests {
         // A child that fills the stderr pipe buffer (>64 KiB) before writing stdout
         // deadlocks a runner that reads stdout to EOF before stderr.
         let result = await ShellCommandRunner().run(
-            "yes err | head -c 100000 >&2; yes out | head -c 100000")
+            "yes err | head -c 100000 >&2; yes out | head -c 100000", timeout: .seconds(30))
         #expect(result.status == 0)
         #expect(result.standardError.count == 100000)
         #expect(result.standardOutput.count == 100000)
     }
 
     @Test func shellCommandRunnerCapturesSmallOutputAndStatus() async {
-        let result = await ShellCommandRunner().run("printf 'hello'; printf 'oops' >&2; exit 3")
+        let result = await ShellCommandRunner().run(
+            "printf 'hello'; printf 'oops' >&2; exit 3", timeout: .seconds(30))
         #expect(result.status == 3)
         #expect(result.standardOutput == "hello")
         #expect(result.standardError == "oops")
+    }
+
+    // MARK: - Item 2/4: a stuck command is killed at its timeout, never hung on
+
+    @Test func shellCommandRunnerTimesOutInsteadOfHanging() async {
+        let started = Date()
+        let result = await ShellCommandRunner().run("sleep 30", timeout: .seconds(1))
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(result.timedOut)
+        #expect(!result.succeeded)
+        #expect(result.status == -1)
+        #expect(elapsed < 5, "a 1 s timeout must not wait for the child")
+    }
+
+    @Test func shellCommandRunnerKeepsPartialOutputOnTimeout() async {
+        let result = await ShellCommandRunner().run("printf 'partial'; sleep 30", timeout: .seconds(1))
+        #expect(result.timedOut)
+        #expect(result.standardOutput == "partial")
+    }
+
+    @Test func shellCommandRunnerDoesNotHangOnRepeatedInstantExit() async {
+        // The observed race: a child that exits before its termination is observed left the
+        // old `waitUntilExit()` spinning forever. 300 concurrent instant exits stress that
+        // exact window; the deadline turns a regression into a failed test, not a hung suite.
+        let completed = await withDeadline(.seconds(30)) {
+            await withTaskGroup(of: Bool.self) { group in
+                for _ in 0..<300 {
+                    group.addTask {
+                        await ShellCommandRunner().run("/usr/bin/true", timeout: .seconds(10)).succeeded
+                    }
+                }
+                var allSucceeded = true
+                for await succeeded in group { allSucceeded = allSucceeded && succeeded }
+                return allSucceeded
+            }
+        }
+        #expect(completed == true)
     }
 
     // MARK: - Hosts edit: stop at the first error, never mask it with flushcache
@@ -911,5 +970,48 @@ private func runShell(_ script: String) throws {
     process.waitUntilExit()
     if process.terminationStatus != 0 {
         throw InstallError.commandFailed(command: script, status: process.terminationStatus)
+    }
+}
+
+/// Runs `body`, giving up after `duration` and returning nil. Detached tasks mean a hung
+/// body cannot keep the caller (and the whole suite) waiting on it.
+private func withDeadline<T: Sendable>(
+    _ duration: Duration,
+    _ body: @escaping @Sendable () async -> T
+) async -> T? {
+    let once = FirstResult<T>()
+    Task { once.resume(with: await body()) }
+    Task {
+        try? await Task.sleep(for: duration)
+        once.resume(with: nil)
+    }
+    return await once.value()
+}
+
+/// Resolves exactly once: the first of a value or a timeout wins.
+private final class FirstResult<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: T??
+    private var continuation: CheckedContinuation<T?, Never>?
+
+    func resume(with value: T?) {
+        lock.withLock {
+            guard result == nil else { return }
+            result = .some(value)
+            continuation?.resume(returning: value)
+            continuation = nil
+        }
+    }
+
+    func value() async -> T? {
+        await withCheckedContinuation { continuation in
+            lock.withLock {
+                if let result {
+                    continuation.resume(returning: result)
+                    return
+                }
+                self.continuation = continuation
+            }
+        }
     }
 }

@@ -9,20 +9,25 @@ public protocol PrivilegedRunner: Sendable {
 
 /// Runs an unprivileged shell command and returns its exit status and output. Injected
 /// so the user-domain trust steps and the status probes are unit-testable without
-/// touching a real login keychain.
+/// touching a real login keychain. `timeout` bounds the run so a stuck command can never
+/// hang the caller: on expiry the process is terminated, then killed.
 public protocol CommandRunning: Sendable {
-    func run(_ command: String) async -> CommandResult
+    func run(_ command: String, timeout: Duration) async -> CommandResult
 }
 
 public struct CommandResult: Equatable, Sendable {
     public var status: Int32
     public var standardOutput: String
     public var standardError: String
+    /// True when the command was killed for exceeding its timeout, so "unknown" reads
+    /// distinctly from a genuine non-zero exit.
+    public var timedOut: Bool
 
-    public init(status: Int32, standardOutput: String = "", standardError: String = "") {
+    public init(status: Int32, standardOutput: String = "", standardError: String = "", timedOut: Bool = false) {
         self.status = status
         self.standardOutput = standardOutput
         self.standardError = standardError
+        self.timedOut = timedOut
     }
 
     public var succeeded: Bool { status == 0 }
@@ -31,7 +36,55 @@ public struct CommandResult: Equatable, Sendable {
     public var failureDetail: String {
         let primary = standardError.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = primary.isEmpty ? standardOutput.trimmingCharacters(in: .whitespacesAndNewlines) : primary
-        return Installer.capped(text)
+        let detail = Installer.capped(text)
+        if timedOut {
+            return detail.isEmpty ? "Command timed out." : "Command timed out. \(detail)"
+        }
+        return detail
+    }
+}
+
+/// Bridges `Process.terminationHandler` to an async wait with a timeout. The handler
+/// may fire before we start waiting (an instant exit), so the exit is latched.
+private final class ProcessExitWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var exited = false
+    private var resumed = false
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    /// Called from the termination handler.
+    func markExited() {
+        lock.withLock {
+            exited = true
+            resumeLocked(timedOut: false)
+        }
+    }
+
+    /// Returns true when `timeout` elapsed before the process exited.
+    func wait(timeout: Duration) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            lock.withLock {
+                if exited {
+                    continuation.resume(returning: false)
+                    return
+                }
+                self.continuation = continuation
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + ProcessExitWaiter.seconds(timeout)) { [self] in
+                lock.withLock { resumeLocked(timedOut: true) }
+            }
+        }
+    }
+
+    private func resumeLocked(timedOut: Bool) {
+        guard !resumed, let continuation else { return }
+        resumed = true
+        self.continuation = nil
+        continuation.resume(returning: timedOut)
+    }
+
+    static func seconds(_ duration: Duration) -> Double {
+        Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
     }
 }
 
@@ -39,7 +92,7 @@ public struct CommandResult: Equatable, Sendable {
 public struct ShellCommandRunner: CommandRunning {
     public init() {}
 
-    public func run(_ command: String) async -> CommandResult {
+    public func run(_ command: String, timeout: Duration) async -> CommandResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", command]
@@ -47,6 +100,12 @@ public struct ShellCommandRunner: CommandRunning {
         let err = Pipe()
         process.standardOutput = out
         process.standardError = err
+        // Install the exit handler before `run()`: an instant exit must not race past it.
+        // `waitUntilExit()` spins a run loop on the calling thread and can miss the
+        // termination notification from a cooperative-pool thread, which is the hang this
+        // replaces; the handler latches the exit instead.
+        let exit = ProcessExitWaiter()
+        process.terminationHandler = { _ in exit.markExited() }
         do {
             try process.run()
         } catch {
@@ -56,31 +115,39 @@ public struct ShellCommandRunner: CommandRunning {
         // the child fills the 64 KiB stderr pipe buffer and blocks before writing stdout.
         // The blocking reads run on GCD threads, not the cooperative pool, so waiting on the
         // child cannot starve other concurrently running async work.
-        let (outData, errData) = await withCheckedContinuation {
-            (continuation: CheckedContinuation<(Data, Data), Never>) in
-            let collector = PipeCollector()
-            let group = DispatchGroup()
-            let outHandle = out.fileHandleForReading
-            let errHandle = err.fileHandleForReading
-            group.enter()
-            DispatchQueue.global().async {
-                collector.setStdout(outHandle.readDataToEndOfFile())
-                group.leave()
-            }
-            group.enter()
-            DispatchQueue.global().async {
-                collector.setStderr(errHandle.readDataToEndOfFile())
-                group.leave()
-            }
-            group.notify(queue: .global()) {
-                continuation.resume(returning: (collector.stdout, collector.stderr))
-            }
+        let collector = PipeCollector()
+        let drained = DispatchGroup()
+        let outHandle = out.fileHandleForReading
+        let errHandle = err.fileHandleForReading
+        drained.enter()
+        DispatchQueue.global().async {
+            collector.setStdout(outHandle.readDataToEndOfFile())
+            drained.leave()
         }
-        process.waitUntilExit()
+        drained.enter()
+        DispatchQueue.global().async {
+            collector.setStderr(errHandle.readDataToEndOfFile())
+            drained.leave()
+        }
+
+        let timedOut = await exit.wait(timeout: timeout)
+        if timedOut {
+            process.terminate()
+            // Give SIGTERM a moment, then force it: a status probe must never hang the menu.
+            try? await Task.sleep(for: .milliseconds(250))
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
+        // Only report once both pipes reached EOF (after a kill the child is gone, so they
+        // do). shortcut: a grandchild that inherited the pipes would delay EOF; no command
+        // this runner issues backgrounds a child, so the direct signal is enough.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            drained.notify(queue: .global()) { continuation.resume() }
+        }
         return CommandResult(
-            status: process.terminationStatus,
-            standardOutput: String(decoding: outData, as: UTF8.self),
-            standardError: String(decoding: errData, as: UTF8.self))
+            status: timedOut ? -1 : process.terminationStatus,
+            standardOutput: String(decoding: collector.stdout, as: UTF8.self),
+            standardError: String(decoding: collector.stderr, as: UTF8.self),
+            timedOut: timedOut)
     }
 }
 
@@ -100,7 +167,12 @@ private final class PipeCollector: @unchecked Sendable {
 /// The production privileged runner: `osascript -e 'do shell script … with administrator privileges'`
 /// produces the single system authorization prompt for the privileged phase.
 public struct OsascriptRunner: PrivilegedRunner {
-    public init() {}
+    /// Bounds the admin prompt: if it is never answered, the install must not hang.
+    public let timeout: Duration
+
+    public init(timeout: Duration = .seconds(300)) {
+        self.timeout = timeout
+    }
 
     public func run(script: String) async throws {
         let process = Process()
@@ -108,17 +180,36 @@ public struct OsascriptRunner: PrivilegedRunner {
         process.arguments = ["-e", Self.appleScript(forShellScript: script)]
         let errPipe = Pipe()
         process.standardError = errPipe
+        // Handler before `run()`: never block a cooperative thread on `waitUntilExit()`.
+        let exit = ProcessExitWaiter()
+        process.terminationHandler = { _ in exit.markExited() }
         do {
             try process.run()
         } catch {
             throw InstallError.runnerFailed(String(describing: error))
         }
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
+        // Drain stderr on a GCD thread while waiting: a blocking read on the cooperative
+        // pool would starve other async work, and the prompt can take a while.
+        let errHandle = errPipe.fileHandleForReading
+        async let errData = withCheckedContinuation { (continuation: CheckedContinuation<Data, Never>) in
+            DispatchQueue.global().async {
+                continuation.resume(returning: errHandle.readDataToEndOfFile())
+            }
+        }
+
+        let timedOut = await exit.wait(timeout: timeout)
+        if timedOut {
+            process.terminate()
+            try? await Task.sleep(for: .milliseconds(250))
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            throw InstallError.runnerFailed(
+                "Timed out after \(Int(ProcessExitWaiter.seconds(timeout)))s waiting for the administrator prompt.")
+        }
+        let stderr = await errData
         guard process.terminationStatus != 0 else { return }
         throw InstallError.runnerFailed(Self.failureMessage(
             terminationStatus: process.terminationStatus,
-            stderr: String(decoding: errData, as: UTF8.self)))
+            stderr: String(decoding: stderr, as: UTF8.self)))
     }
 
     /// Maps a failed `osascript` run to a clear message: a dismissed admin prompt (`User
@@ -194,6 +285,11 @@ extension InstallError: CustomStringConvertible {
 ///    (`security add-trusted-cert` shows macOS's authorization dialog), then verify it;
 /// 2. one admin script: the `/etc/hosts` entry and a DNS cache flush, nothing else.
 public final class Installer: @unchecked Sendable {
+    /// Status probes must finish promptly; a stuck probe must not stall the menu.
+    static let statusTimeout: Duration = .seconds(10)
+    /// Commands that can block on a system authorization dialog or a slow keychain sweep.
+    static let dialogTimeout: Duration = .seconds(300)
+
     private let caPEMURL: URL
     private let caCommonName: String
     private let runner: PrivilegedRunner
@@ -221,11 +317,13 @@ public final class Installer: @unchecked Sendable {
         let trustedCopy = try privateCopyOfCA()
         defer { try? FileManager.default.removeItem(at: trustedCopy.deletingLastPathComponent()) }
 
-        let add = await commandRunner.run(Self.addTrustCommand(certPath: trustedCopy.path))
+        let add = await commandRunner.run(
+            Self.addTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
         guard add.succeeded else {
             throw InstallError.runnerFailed(Self.trustFailureMessage(add))
         }
-        let verify = await commandRunner.run(Self.verifyTrustCommand(certPath: trustedCopy.path))
+        let verify = await commandRunner.run(
+            Self.verifyTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
         guard verify.succeeded else {
             throw InstallError.runnerFailed(
                 "The CA was added to the login keychain but could not be verified as trusted: "
@@ -373,23 +471,23 @@ public final class Installer: @unchecked Sendable {
     private func removeUserDomainTrust() async -> String? {
         var failures: [String] = []
         let removeTrust = await commandRunner.run(
-            "security remove-trusted-cert \(Self.quoted(caPEMURL.path))")
+            "security remove-trusted-cert \(Self.quoted(caPEMURL.path))", timeout: Self.dialogTimeout)
         if !removeTrust.succeeded && !Self.isAlreadyNotTrusted(removeTrust) {
             failures.append("per-user trust: \(removeTrust.failureDetail)")
         }
         let deleteCerts = await commandRunner.run(Self.deleteCertificatesScript(
             commonName: caCommonName,
             keychain: "\"$HOME/Library/Keychains/login.keychain-db\"",
-            removeTrustSettings: true))
+            removeTrustSettings: true), timeout: Self.dialogTimeout)
         if !deleteCerts.succeeded {
             failures.append("login-keychain certificate: \(deleteCerts.failureDetail)")
         }
         // Item 1: "Set for GUI apps" writes NODE_EXTRA_CA_CERTS into the launchd environment,
         // so every GUI app launched until logout keeps trusting the (about to be removed) CA.
         // Clear it, but only when it still points at our ca.pem. Best effort.
-        let nodeEnv = await commandRunner.run("launchctl getenv NODE_EXTRA_CA_CERTS")
+        let nodeEnv = await commandRunner.run("launchctl getenv NODE_EXTRA_CA_CERTS", timeout: Self.statusTimeout)
         if nodeEnv.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines) == caPEMURL.path {
-            let unset = await commandRunner.run("launchctl unsetenv NODE_EXTRA_CA_CERTS")
+            let unset = await commandRunner.run("launchctl unsetenv NODE_EXTRA_CA_CERTS", timeout: Self.statusTimeout)
             if !unset.succeeded {
                 failures.append("NODE_EXTRA_CA_CERTS: \(unset.failureDetail)")
             }
@@ -466,13 +564,16 @@ public final class Installer: @unchecked Sendable {
     public func status() async -> InstallStatus {
         // Trust means actually trusted, not merely present: `verify-cert -p basic` is the only
         // check that catches a certificate that was imported but whose trust write was denied.
-        let trust = await commandRunner.run(Self.verifyTrustCommand(certPath: caPEMURL.path))
+        let trust = await commandRunner.run(
+            Self.verifyTrustCommand(certPath: caPEMURL.path), timeout: Self.statusTimeout)
         let loginFind = await commandRunner.run(
-            "security find-certificate -c \(Self.quoted(caCommonName)) \"$HOME/Library/Keychains/login.keychain-db\"")
+            "security find-certificate -c \(Self.quoted(caCommonName)) \"$HOME/Library/Keychains/login.keychain-db\"",
+            timeout: Self.statusTimeout)
         let systemFind = await commandRunner.run(
-            "security find-certificate -c \(Self.quoted(caCommonName)) /Library/Keychains/System.keychain")
-        let port = await commandRunner.run("nc -z -G 1 127.0.0.1 443")
-        let nodeEnv = await commandRunner.run("launchctl getenv NODE_EXTRA_CA_CERTS")
+            "security find-certificate -c \(Self.quoted(caCommonName)) /Library/Keychains/System.keychain",
+            timeout: Self.statusTimeout)
+        let port = await commandRunner.run("nc -z -G 1 127.0.0.1 443", timeout: Self.statusTimeout)
+        let nodeEnv = await commandRunner.run("launchctl getenv NODE_EXTRA_CA_CERTS", timeout: Self.statusTimeout)
         return InstallStatus(
             caTrusted: trust.succeeded,
             caPresent: loginFind.succeeded || systemFind.succeeded,
@@ -494,7 +595,7 @@ public final class Installer: @unchecked Sendable {
     /// Points new processes at the CA for Node clients. Unprivileged, so toggling it never prompts.
     public func applyNodeCAEnv() async throws {
         let command = Self.nodeCAEnvCommand(caPEMURL: caPEMURL)
-        let result = await commandRunner.run(command)
+        let result = await commandRunner.run(command, timeout: Self.statusTimeout)
         guard result.succeeded else {
             throw InstallError.commandFailed(command: command, status: result.status)
         }
