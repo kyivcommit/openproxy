@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import ServiceManagement
 import OpenProxyAppModel
 
 @main
@@ -13,7 +12,8 @@ struct OpenProxyApp: App {
             let built = try AppGraph.makeModel()
             _model = State(initialValue: built)
             // Autostart + KeepAlive watchdog; best effort, only succeeds for a bundled signed app.
-            try? SMAppService.agent(plistName: "dev.openproxy.app.plist").register()
+            // Failures and a non-enabled status surface as warnings in the menu.
+            built.registerLoginItem()
             // Never installs and never touches hosts on launch; only the user's Install button does.
             Task { @MainActor in
                 await built.start()

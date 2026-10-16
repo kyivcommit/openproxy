@@ -32,7 +32,9 @@ public enum AppGraph {
             stats: stats,
             settings: { [settingsStore] in settingsStore.settings })
 
-        return AppModel(settingsStore: settingsStore, stats: stats, installer: installer, server: server)
+        return AppModel(
+            settingsStore: settingsStore, stats: stats, installer: installer,
+            server: server, loginItem: SMAppServiceLoginItem())
     }
 
     /// The CA key and stats live here, so the directory stays owner-only even if

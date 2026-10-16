@@ -93,6 +93,7 @@ struct MenuView: View {
             statusRow("Hosts entry", model.status.hostsEntry)
             statusRow("Port 443 listening", model.status.portListening)
             statusRow("Node CA env", model.status.nodeCAEnv)
+            Text("Autostart: \(model.loginItemStatus.label)").font(.caption)
         }
     }
 

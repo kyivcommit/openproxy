@@ -30,23 +30,27 @@ public final class AppModel {
     public private(set) var status: InstallStatus
     public private(set) var summary: StatsSummary
     public private(set) var warnings: [String] = []
+    public private(set) var loginItemStatus: LoginItemStatus = .notRegistered
 
     private var currentSettings: Settings
     private let settingsStore: SettingsStore
     private let stats: StatsStore
     private let installer: Installer
     private let server: ProxyServerControlling
+    private let loginItem: LoginItemRegistering
 
     public init(
         settingsStore: SettingsStore,
         stats: StatsStore,
         installer: Installer,
-        server: ProxyServerControlling
+        server: ProxyServerControlling,
+        loginItem: LoginItemRegistering
     ) {
         self.settingsStore = settingsStore
         self.stats = stats
         self.installer = installer
         self.server = server
+        self.loginItem = loginItem
         self.currentSettings = settingsStore.settings
         self.status = InstallStatus(caTrusted: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
         self.summary = StatsSummary()
@@ -86,5 +90,28 @@ public final class AppModel {
     public func refresh() async {
         summary = stats.summary(since: Date(timeIntervalSinceNow: -86_400))
         status = await installer.status()
+        loginItemStatus = loginItem.status
+    }
+
+    /// Registers the login item and reports both the thrown error and the
+    /// post-registration status, which the plain `try?` used to hide.
+    public func registerLoginItem() {
+        do {
+            try loginItem.register()
+        } catch {
+            loginItemStatus = loginItem.status
+            warn("Autostart registration failed: \(error).")
+            return
+        }
+        loginItemStatus = loginItem.status
+        if loginItemStatus != .enabled {
+            warn("Autostart is \(loginItemStatus.label).")
+        }
+    }
+
+    /// Appends a warning once; repeated failures of the same kind must not flood the menu.
+    private func warn(_ message: String) {
+        guard !warnings.contains(message) else { return }
+        warnings.append(message)
     }
 }

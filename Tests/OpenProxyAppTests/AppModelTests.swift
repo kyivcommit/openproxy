@@ -30,6 +30,19 @@ private final class FakeRunner: PrivilegedRunner, @unchecked Sendable {
 }
 
 private struct PortInUse: Error {}
+private enum LoginItemTestError: Error { case denied }
+
+/// Records autostart registration and lets a test force the reported status.
+private final class FakeLoginItem: LoginItemRegistering, @unchecked Sendable {
+    var registerError: Error?
+    var status: LoginItemStatus = .enabled
+    private(set) var registerCount = 0
+
+    func register() throws {
+        registerCount += 1
+        if let registerError { throw registerError }
+    }
+}
 
 @MainActor
 private struct Harness {
@@ -39,6 +52,7 @@ private struct Harness {
     let runner: FakeRunner
     let installer: Installer
     let server: FakeServer
+    let loginItem: FakeLoginItem
 
     init(hostsText: String? = nil) throws {
         let directory = FileManager.default.temporaryDirectory
@@ -55,10 +69,13 @@ private struct Harness {
             runner: runner,
             hostsPath: hostsURL.path)
         self.server = FakeServer()
+        self.loginItem = FakeLoginItem()
     }
 
     func model() -> AppModel {
-        AppModel(settingsStore: settingsStore, stats: stats, installer: installer, server: server)
+        AppModel(
+            settingsStore: settingsStore, stats: stats, installer: installer,
+            server: server, loginItem: loginItem)
     }
 }
 
@@ -149,6 +166,51 @@ struct AppModelTests {
         #expect(dict["ProgramArguments"] == nil)
         #expect(dict["BundleProgram"] as? String == "Contents/MacOS/OpenProxyApp")
         #expect((dict["KeepAlive"] as? [String: Any])?["SuccessfulExit"] as? Bool == false)
+    }
+
+    @Test func loginItemRegistrationFailureBecomesWarning() throws {
+        let h = try Harness()
+        h.loginItem.registerError = LoginItemTestError.denied
+        h.loginItem.status = .notFound
+        let model = h.model()
+
+        model.registerLoginItem()
+
+        #expect(h.loginItem.registerCount == 1)
+        #expect(model.loginItemStatus == .notFound)
+        #expect(model.warnings.contains { $0.contains("Autostart") })
+    }
+
+    @Test func loginItemRequiringApprovalBecomesWarning() throws {
+        let h = try Harness()
+        h.loginItem.status = .requiresApproval
+        let model = h.model()
+
+        model.registerLoginItem()
+
+        #expect(model.loginItemStatus == .requiresApproval)
+        #expect(model.warnings.contains { $0.contains("Autostart") })
+    }
+
+    @Test func loginItemEnabledAddsNoWarning() throws {
+        let h = try Harness()
+        h.loginItem.status = .enabled
+        let model = h.model()
+
+        model.registerLoginItem()
+
+        #expect(model.loginItemStatus == .enabled)
+        #expect(model.warnings.isEmpty)
+    }
+
+    @Test func refreshReportsLoginItemStatus() async throws {
+        let h = try Harness()
+        h.loginItem.status = .requiresApproval
+        let model = h.model()
+
+        await model.refresh()
+
+        #expect(model.loginItemStatus == .requiresApproval)
     }
 
     @Test func portInUseBecomesWarningAndLeavesHostsUntouched() async throws {
