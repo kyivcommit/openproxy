@@ -462,10 +462,22 @@ struct ProxyServerTests {
 
     @Test func nonRewritablePathPassesThroughByteIdentical() async throws {
         let settings = Settings(enabled: true, sort: .throughput)
-        try await withServer(settings: settings, replies: [FakeReply()]) { harness in
+        try await withWireServer(settings: settings) { wire in
             let body = Data(#"{"model":"openai/gpt-5","input":"hi"}"#.utf8)
-            _ = try await harness.request("POST", "/api/v1/embeddings", body: body)
-            #expect(harness.upstream.requests[0].body == body)
+            let response = try await wire.request(
+                "POST", "/api/v1/embeddings", body: body,
+                headers: ["Content-Type": "application/json", "X-Trace": "abc"])
+            #expect(response.status == 200)
+            // Assert on what actually reached the wire through the real NIO client.
+            let received = try #require(wire.upstream.received.first)
+            #expect(received.method == "POST")
+            #expect(received.uri == "/api/v1/embeddings")
+            #expect(received.body == body)
+            #expect(received.header("content-length") == String(body.count))
+            #expect(received.header("transfer-encoding") == nil)
+            #expect(received.header("content-type") == "application/json")
+            #expect(received.header("x-trace") == "abc")
+            #expect(received.header("host") == "openrouter.ai:\(wire.upstream.port)")
         }
     }
 
