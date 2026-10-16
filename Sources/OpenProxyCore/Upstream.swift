@@ -205,30 +205,32 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
             .get()
         body.attach(channel: channel)
 
-        do {
-            var head = HTTPRequestHead(version: .http1_1, method: HTTPMethod(rawValue: request.method), uri: request.path)
-            for (name, value) in request.headers { head.headers.add(name: name, value: value) }
-            if head.headers.first(name: "Host") == nil { head.headers.add(name: "Host", value: host) }
-            try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()
-            if !request.body.isEmpty {
-                var buffer = channel.allocator.buffer(capacity: request.body.count)
-                buffer.writeBytes(request.body)
-                try await channel.writeAndFlush(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
-            }
-            try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
+        return try await withTaskCancellationHandler {
+            do {
+                var head = HTTPRequestHead(version: .http1_1, method: HTTPMethod(rawValue: request.method), uri: request.path)
+                for (name, value) in request.headers { head.headers.add(name: name, value: value) }
+                if head.headers.first(name: "Host") == nil { head.headers.add(name: "Host", value: host) }
+                try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()
+                if !request.body.isEmpty {
+                    var buffer = channel.allocator.buffer(capacity: request.body.count)
+                    buffer.writeBytes(request.body)
+                    try await channel.writeAndFlush(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
+                }
+                try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
 
-            let responseHead = try await withTaskCancellationHandler {
-                try await promise.futureResult.get()
-            } onCancel: {
+                let responseHead = try await promise.futureResult.get()
+                let headers = responseHead.headers.map { ($0.name, $0.value) }
+                return UpstreamResponse(
+                    status: Int(responseHead.status.code), headers: headers, body: body.makeStream(),
+                    onCancel: { channel.close(promise: nil) }, byteCounter: counter)
+            } catch {
                 channel.close(promise: nil)
+                throw error
             }
-            let headers = responseHead.headers.map { ($0.name, $0.value) }
-            return UpstreamResponse(
-                status: Int(responseHead.status.code), headers: headers, body: body.makeStream(),
-                onCancel: { channel.close(promise: nil) }, byteCounter: counter)
-        } catch {
+        } onCancel: {
+            // Cancel during connect/write/head-wait: drop the connection so the
+            // in-flight future fails promptly instead of running to completion.
             channel.close(promise: nil)
-            throw error
         }
     }
 

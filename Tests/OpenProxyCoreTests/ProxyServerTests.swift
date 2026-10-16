@@ -82,6 +82,21 @@ struct StaticResolver: HostResolver {
     func resolve(_ host: String) async throws -> [String] { addresses }
 }
 
+/// An upstream whose `send` blocks until cancelled, standing in for a slow
+/// connect / write / head wait; records how many sends were attempted.
+final class SlowCancelClient: UpstreamClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _count = 0
+
+    func send(_ request: UpstreamRequest) async throws -> UpstreamResponse {
+        lock.withLock { _count += 1 }
+        try await Task.sleep(nanoseconds: 10_000_000_000)
+        return UpstreamResponse(status: 200, headers: [], body: AsyncThrowingStream { $0.finish() })
+    }
+
+    var count: Int { lock.withLock { _count } }
+}
+
 // MARK: - Test client
 
 /// Trusts the test CA without hostname pinning (the client dials 127.0.0.1 while
@@ -236,6 +251,36 @@ private func withServer(
     harness.session.invalidateAndCancel()
     await harness.server.stop()
     try? FileManager.default.removeItem(at: harness.directory)
+}
+
+/// Starts a ProxyServer with an arbitrary (non-fake) upstream, for tests that
+/// need to control cancellation or slow behaviour in `send`.
+private func withCustomUpstream(
+    settings: Settings,
+    upstream: UpstreamClient,
+    _ body: (ProxyServer, Int) async throws -> Void
+) async throws {
+    let directory = FileManager.default.temporaryDirectory.appending(path: "openproxy-cust-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let ca = CertAuthority(directory: directory)
+    try ca.loadOrCreate()
+    let server = ProxyServer(
+        config: ProxyConfig(bindHost: "127.0.0.1", port: 0),
+        ca: ca,
+        upstream: upstream,
+        catalog: TierCatalog(fetcher: FakeEndpointsFetcher(hasFlex: true)),
+        stats: try StatsStore(path: ":memory:"),
+        settings: { settings })
+    try await server.start()
+    do {
+        try await body(server, server.boundPort)
+    } catch {
+        await server.stop()
+        try? FileManager.default.removeItem(at: directory)
+        throw error
+    }
+    await server.stop()
+    try? FileManager.default.removeItem(at: directory)
 }
 
 // MARK: - Helpers
@@ -665,6 +710,30 @@ struct ProxyServerTests {
             #expect(await waitUntil({ monitor.closed }, timeout: 2))
             #expect(monitor.received.range(of: Data("0\r\n\r\n".utf8)) == nil)
             try? await channel.close().get()
+        }
+    }
+
+    @Test func clientDisconnectBeforeHeadDoesNotRetryOrFallback() async throws {
+        let settings = Settings(
+            enabled: true, sort: .balanced, tier: .flex,
+            flex: FlexPolicy(fallback: true, attempts: 3))
+        let upstream = SlowCancelClient()
+        try await withCustomUpstream(settings: settings, upstream: upstream) { _, port in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let channel = try await openRawTLSChannel(port: port, group: group)
+            let body = Data(#"{"model":"openai/gpt-5","stream":true}"#.utf8)
+            var buffer = channel.allocator.buffer(capacity: 256)
+            buffer.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer x\r\n"
+                    + "Content-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n")
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(buffer).get()
+
+            #expect(await waitUntil({ upstream.count >= 1 }, timeout: 2))
+            try await channel.close().get()
+            // A client disconnect must cancel, not trigger a retry or a fallback send.
+            #expect(await staysFalse({ upstream.count > 1 }, within: 0.4))
         }
     }
 

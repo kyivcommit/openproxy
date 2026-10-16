@@ -161,6 +161,9 @@ public final class ProxyServer: @unchecked Sendable {
                         declaresBody: declaresBody, body: rewrite.body))
             }
         } catch {
+            // A cancelled request is a client disconnect, not an upstream failure:
+            // do not fabricate a 502 or record one.
+            if Task.isCancelled || error is CancellationError { return }
             await writeError(status: 502, message: "upstream unavailable", channel: channel)
             record(started: started, path: path, rewrite: rewrite, settings: settings,
                    status: 502, retries: retries, usedFallback: usedFallback)
@@ -204,6 +207,10 @@ public final class ProxyServer: @unchecked Sendable {
             do {
                 return try await sendTask.value
             } catch {
+                // A client disconnect cancels this task; that is not a retryable
+                // upstream timeout, so surface it as cancellation and stop the
+                // Flex policy from retrying or falling back.
+                if Task.isCancelled { throw CancellationError() }
                 if sendTask.isCancelled { throw FlexTimeout(cancelUpstream: { sendTask.cancel() }) }
                 throw error
             }
