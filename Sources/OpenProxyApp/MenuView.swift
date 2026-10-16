@@ -30,6 +30,10 @@ struct MenuView: View {
             statsBlock
             Divider()
             statusBlock
+            if let unreachable = model.unreachableWarning {
+                Divider()
+                unreachableBlock(unreachable)
+            }
             if !model.warnings.isEmpty {
                 Divider()
                 warningBlock
@@ -45,6 +49,8 @@ struct MenuView: View {
         }
         .padding(14)
         .frame(width: 340)
+        .onAppear { model.menuVisibilityChanged(true) }
+        .onDisappear { model.menuVisibilityChanged(false) }
     }
 
     private var flexSection: some View {
@@ -93,6 +99,7 @@ struct MenuView: View {
             statusRow("Hosts entry", model.status.hostsEntry)
             statusRow("Port 443 listening", model.status.portListening)
             statusRow("Node CA env", model.status.nodeCAEnv)
+            Text("Autostart: \(model.loginItemStatus.label)").font(.caption)
         }
     }
 
@@ -103,6 +110,13 @@ struct MenuView: View {
             Text(label)
         }
         .font(.caption)
+    }
+
+    private func unreachableBlock(_ message: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("⚠︎ \(message)").font(.caption).foregroundStyle(.orange)
+            Button("Uninstall") { Task { await model.uninstall() } }
+        }
     }
 
     private var warningBlock: some View {

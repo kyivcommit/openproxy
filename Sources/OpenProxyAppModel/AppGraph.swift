@@ -12,6 +12,10 @@ public enum AppGraph {
 
     @MainActor
     public static func makeModel(baseDirectory: URL = AppGraph.defaultBaseDirectory) throws -> AppModel {
+        // On a clean install this directory does not exist yet, and SQLite cannot
+        // create stats.sqlite in a missing directory. Create it owner-only first.
+        try ensureBaseDirectory(baseDirectory)
+
         let settingsStore = SettingsStore(url: baseDirectory.appending(path: "settings.json"))
         let stats = try StatsStore(path: baseDirectory.appending(path: "stats.sqlite").path)
 
@@ -28,7 +32,17 @@ public enum AppGraph {
             stats: stats,
             settings: { [settingsStore] in settingsStore.settings })
 
-        return AppModel(settingsStore: settingsStore, stats: stats, installer: installer, server: server)
+        return AppModel(
+            settingsStore: settingsStore, stats: stats, installer: installer,
+            server: server, loginItem: SMAppServiceLoginItem())
+    }
+
+    /// The CA key and stats live here, so the directory stays owner-only even if
+    /// it already existed with looser permissions.
+    static func ensureBaseDirectory(_ url: URL) throws {
+        let manager = FileManager.default
+        try manager.createDirectory(at: url, withIntermediateDirectories: true)
+        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     }
 }
 

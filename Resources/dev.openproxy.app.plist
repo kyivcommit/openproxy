@@ -4,14 +4,15 @@
 <dict>
 	<key>Label</key>
 	<string>dev.openproxy.app</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>/Applications/OpenProxy.app/Contents/MacOS/OpenProxy</string>
-	</array>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/OpenProxyApp</string>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
 	<key>AssociatedBundleIdentifiers</key>
 	<array>
 		<string>dev.openproxy.app</string>
