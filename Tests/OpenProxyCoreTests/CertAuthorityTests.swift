@@ -11,6 +11,23 @@ import SwiftASN1
 let opensslPath: String? = ["/opt/homebrew/bin/openssl", "/usr/local/bin/openssl", "/usr/bin/openssl"]
     .first { FileManager.default.isExecutableFile(atPath: $0) }
 
+/// Only full OpenSSL implements `-x509_strict`; macOS `/usr/bin/openssl` is LibreSSL, which
+/// does not, so check the reported version instead of assuming. `nil` skips the strict test.
+let strictOpensslPath: String? = ["/opt/homebrew/bin/openssl", "/usr/local/bin/openssl", "/usr/bin/openssl"]
+    .first { path in
+        guard FileManager.default.isExecutableFile(atPath: path) else { return false }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["version"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        guard (try? process.run()) != nil else { return false }
+        process.waitUntilExit()
+        return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .hasPrefix("OpenSSL")
+    }
+
 @Suite("CertAuthority")
 struct CertAuthorityTests {
     @Test func keyFileMode600() throws {
@@ -196,6 +213,60 @@ struct CertAuthorityTests {
         process.waitUntilExit()
         let log = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         #expect(process.terminationStatus == 0, "openssl verify failed: \(log)")
+    }
+
+    @Test func caCarriesSubjectKeyIdentifierOfItsPublicKey() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+
+        let ca = try Certificate(pemEncoded: String(contentsOf: authority.caCertificatePEMURL))
+        let ski = try #require(try ca.extensions.subjectKeyIdentifier)
+        #expect(ski.keyIdentifier == SubjectKeyIdentifier(hash: ca.publicKey).keyIdentifier)
+    }
+
+    @Test func leafCarriesSKIAndAKIMatchingTheCA() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+        let leaf = try authority.leaf()
+
+        let ca = try Certificate(pemEncoded: String(contentsOf: authority.caCertificatePEMURL))
+        let leafCertificate = try Certificate(pemEncoded: leaf.certificatePEM)
+        let caSKI = try #require(try ca.extensions.subjectKeyIdentifier)
+        let leafSKI = try #require(try leafCertificate.extensions.subjectKeyIdentifier)
+        #expect(leafSKI.keyIdentifier == SubjectKeyIdentifier(hash: leafCertificate.publicKey).keyIdentifier)
+        let aki = try #require(try leafCertificate.extensions.authorityKeyIdentifier)
+        #expect(aki.keyIdentifier == caSKI.keyIdentifier)
+    }
+
+    @Test(.enabled(if: strictOpensslPath != nil))
+    func opensslStrictVerificationAcceptsLeaf() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+        let leaf = try authority.leaf()
+        let leafURL = directory.appending(path: "leaf.pem")
+        try leaf.certificatePEM.write(to: leafURL, atomically: true, encoding: .utf8)
+
+        // `-x509_strict` is what Python 3.13+/OpenSSL `VERIFY_X509_STRICT` enforces; a leaf
+        // without an Authority Key Identifier fails here with "Missing Authority Key Identifier".
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: strictOpensslPath!)
+        process.arguments = ["verify", "-x509_strict", "-CAfile", authority.caCertificatePEMURL.path, leafURL.path]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let log = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #expect(process.terminationStatus == 0, "openssl -x509_strict verify failed: \(log)")
     }
 
     // MARK: - Helpers

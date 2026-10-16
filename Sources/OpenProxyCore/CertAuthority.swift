@@ -114,6 +114,7 @@ public final class CertAuthority: @unchecked Sendable {
             extensions: Certificate.Extensions {
                 Critical(BasicConstraints.isCertificateAuthority(maxPathLength: 0))
                 Critical(KeyUsage(keyCertSign: true, cRLSign: true))
+                SubjectKeyIdentifier(hash: Certificate.PublicKey(key.publicKey))
                 Critical(NameConstraints(
                     permittedDNSDomains: [hostname],
                     excludedIPRanges: excludedIPRanges))
@@ -142,6 +143,9 @@ public final class CertAuthority: @unchecked Sendable {
             extensions: Certificate.Extensions {
                 BasicConstraints.notCertificateAuthority
                 KeyUsage(digitalSignature: true)
+                SubjectKeyIdentifier(hash: Certificate.PublicKey(key.publicKey))
+                AuthorityKeyIdentifier(
+                    keyIdentifier: SubjectKeyIdentifier(hash: ca.publicKey).keyIdentifier)
                 SubjectAlternativeNames([.dnsName(hostname)])
                 try ExtendedKeyUsage([.serverAuth])
             },
