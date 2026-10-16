@@ -391,6 +391,45 @@ private let chatPath = "/api/v1/chat/completions"
 
 @Suite("ProxyServer")
 struct ProxyServerTests {
+    @Test func nonStreamingResponseFactsAreRecorded() async throws {
+        let factsBody = Data(
+            #"{"service_tier":"flex","provider":"Anthropic","usage":{"prompt_tokens":12,"completion_tokens":7,"cost":0.0021}}"#.utf8)
+        let reply = FakeReply(status: 200, headers: [("content-type", "application/json")], body: factsBody)
+        try await withServer(replies: [reply]) { harness in
+            let response = try await harness.request(
+                "POST", chatPath, body: Data(#"{"model":"openai/gpt-5"}"#.utf8))
+            #expect(response.status == 200)
+            #expect(await waitUntil({ harness.stats.summary(since: .distantPast).total == 1 }, timeout: 2))
+            let summary = harness.stats.summary(since: .distantPast)
+            #expect(summary.byActualTier["flex"] == 1)
+            #expect(summary.byProvider["Anthropic"] == 1)
+            #expect(abs(summary.totalCostUSD - 0.0021) < 1e-9)
+        }
+    }
+
+    @Test func streamingResponseFactsAreRecordedAcrossChunkBoundaries() async throws {
+        let reply = FakeReply(
+            status: 200, headers: [("content-type", "text/event-stream")],
+            stream: { _ in
+                AsyncThrowingStream { continuation in
+                    // Lines are split mid-JSON to exercise the rolling window.
+                    continuation.yield(Data("data: {\"service_tier\":\"fl".utf8))
+                    continuation.yield(Data("ex\",\"provider\":\"Anthropic\"}\n\n".utf8))
+                    continuation.yield(Data("data: {\"usage\":{\"cost\":0.001}}\n\n".utf8))
+                    continuation.finish()
+                }
+            })
+        try await withServer(replies: [reply]) { harness in
+            _ = try await harness.request(
+                "POST", chatPath, body: Data(#"{"model":"openai/gpt-5","stream":true}"#.utf8))
+            #expect(await waitUntil({ harness.stats.summary(since: .distantPast).total == 1 }, timeout: 2))
+            let summary = harness.stats.summary(since: .distantPast)
+            #expect(summary.byActualTier["flex"] == 1)
+            #expect(summary.byProvider["Anthropic"] == 1)
+            #expect(abs(summary.totalCostUSD - 0.001) < 1e-9)
+        }
+    }
+
     @Test func rewriteAppliedBeforeForwarding() async throws {
         let settings = Settings(enabled: true, sort: .throughput)
         try await withServer(settings: settings, replies: [FakeReply()]) { harness in

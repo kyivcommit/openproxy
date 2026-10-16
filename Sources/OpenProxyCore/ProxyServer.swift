@@ -168,10 +168,12 @@ public final class ProxyServer: @unchecked Sendable {
         let ttfbMs = Int(Date().timeIntervalSince(started) * 1000)
         writeResponseHead(response, channel: channel)
         var finalStatus = response.status
+        let tap = ResponseTap(streaming: Self.isStreaming(body))
         do {
             try await withTaskCancellationHandler {
                 for try await chunk in response.body {
                     try Task.checkCancellation()
+                    tap.consume(chunk)
                     if !chunk.isEmpty { try await writeBody(chunk, channel: channel) }
                 }
             } onCancel: {
@@ -186,7 +188,8 @@ public final class ProxyServer: @unchecked Sendable {
             channel.close(promise: nil)
         }
         record(started: started, path: path, rewrite: rewrite, settings: settings,
-               status: finalStatus, retries: retries, usedFallback: usedFallback, ttfbMs: ttfbMs)
+               status: finalStatus, retries: retries, usedFallback: usedFallback, ttfbMs: ttfbMs,
+               facts: tap.finish())
     }
 
     /// Runs one upstream send with a first-byte timeout, surfacing a `FlexTimeout`
@@ -264,13 +267,16 @@ public final class ProxyServer: @unchecked Sendable {
 
     private func record(
         started: Date, path: String, rewrite: RewriteResult, settings: Settings,
-        status: Int, retries: Int, usedFallback: Bool, ttfbMs: Int = 0
+        status: Int, retries: Int, usedFallback: Bool, ttfbMs: Int = 0,
+        facts: ResponseFacts = ResponseFacts()
     ) {
         stats.record(RequestRecord(
             time: started, path: path, model: rewrite.model, sort: settings.sort, tier: settings.tier,
-            actualTier: nil, provider: nil, status: status, ttfbMs: ttfbMs, retries: retries,
-            usedFallback: usedFallback,
-            skippedReason: rewrite.skipped["service_tier"] ?? rewrite.skipped.values.first))
+            actualTier: facts.actualTier, provider: facts.provider, status: status, ttfbMs: ttfbMs,
+            retries: retries, usedFallback: usedFallback,
+            skippedReason: rewrite.skipped["service_tier"] ?? rewrite.skipped.values.first,
+            promptTokens: facts.promptTokens, completionTokens: facts.completionTokens,
+            costUSD: facts.costUSD))
     }
 
     static func isStreaming(_ body: Data) -> Bool {
