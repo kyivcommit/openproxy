@@ -199,8 +199,9 @@ public final class ProxyServer: @unchecked Sendable {
             try await withTaskCancellationHandler {
                 for try await chunk in response.body {
                     try Task.checkCancellation()
-                    tap.consume(chunk)
+                    // Forward before tapping: parsing SSE JSON must not delay the client.
                     if !chunk.isEmpty { try await writeBody(chunk, channel: channel) }
+                    tap.consume(chunk)
                 }
             } onCancel: {
                 // Client went away mid-stream: close the upstream connection.
