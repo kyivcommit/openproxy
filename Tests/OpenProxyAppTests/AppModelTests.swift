@@ -298,4 +298,37 @@ struct AppModelTests {
         #expect(model.warnings[0].lowercased().contains("start"))
         #expect(h.runner.scripts.isEmpty)
     }
+
+    @Test func installStartsServerBeforeTouchingHosts() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.server.startCount == 1)
+        #expect(h.runner.scripts.count == 1)
+    }
+
+    @Test func installSkippedWhenServerCannotListen() async throws {
+        let h = try Harness()
+        h.server.startError = PortInUse()
+        let model = h.model()
+
+        await model.install()
+
+        // No privileged step ran and the hosts file is left routed as it was.
+        #expect(h.runner.scripts.isEmpty)
+        #expect(model.warnings.contains { $0.contains("Install was skipped") })
+    }
+
+    @Test func installDoesNotStartAnAlreadyRunningServer() async throws {
+        let h = try Harness()
+        let model = h.model()
+        await model.start()
+
+        await model.install()
+
+        #expect(h.server.startCount == 1)
+        #expect(h.runner.scripts.count == 1)
+    }
 }

@@ -57,6 +57,10 @@ public final class AppModel {
 
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
 
+    /// Whether `server.start()` already bound the port. Guards Install from a
+    /// second bind (and from installing hosts before anything listens).
+    private var serverRunning = false
+
     private var currentSettings: Settings
     private let settingsStore: SettingsStore
     private let stats: StatsStore
@@ -84,19 +88,36 @@ public final class AppModel {
     }
 
     public func start() async {
-        do {
-            try await server.start()
-        } catch {
-            // Spec 9: a busy port must not change the hosts entry, and the user must see why.
-            warn("Proxy server failed to start: \(error). The hosts entry was left unchanged.")
-        }
+        _ = await startServer(ifFailed: "The hosts entry was left unchanged.")
     }
 
     public func stop() async {
         await server.stop()
+        serverRunning = false
+    }
+
+    /// Starts the proxy unless it is already listening. Returns false (with a
+    /// warning) when it cannot bind, so callers never proceed as if it listens.
+    @discardableResult
+    private func startServer(ifFailed suffix: String) async -> Bool {
+        if serverRunning { return true }
+        do {
+            try await server.start()
+            serverRunning = true
+            return true
+        } catch {
+            warn("Proxy server failed to start: \(error). \(suffix)")
+            return false
+        }
     }
 
     public func install() async {
+        // Spec 9 / finding: installing the hosts entry before the proxy listens
+        // would black-hole openrouter.ai for every client, so start first.
+        guard await startServer(ifFailed: "Install was skipped; the hosts entry was left unchanged.") else {
+            await refresh()
+            return
+        }
         do {
             try await installer.install()
         } catch {
