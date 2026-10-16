@@ -929,7 +929,10 @@ struct ProxyServerTests {
             // Request 1 is in flight, request 2 fills the single queue slot, and
             // request 3 exceeds the cap: the proxy closes rather than buffering it.
             #expect(await waitUntil({ monitor.closed }, timeout: 2))
-            #expect(harness.upstream.requests.count == 1)
+            // The overload close cancels request 1, but its upstream send runs on a
+            // separate task and may not have been recorded yet, so wait for it
+            // instead of sampling the instant the client sees the close.
+            #expect(await waitUntil({ harness.upstream.requests.count == 1 }, timeout: 2))
             try? await channel.close().get()
         }
     }
@@ -952,7 +955,8 @@ struct ProxyServerTests {
                 on: channel)
             // The queued 64-byte body exceeds the 16-byte cap: close, don't buffer.
             #expect(await waitUntil({ monitor.closed }, timeout: 2))
-            #expect(harness.upstream.requests.count == 1)
+            // As above: the in-flight request's send races the close, so wait for it.
+            #expect(await waitUntil({ harness.upstream.requests.count == 1 }, timeout: 2))
             try? await channel.close().get()
         }
     }
