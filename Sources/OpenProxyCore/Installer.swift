@@ -153,3 +153,9 @@ public final class Installer: @unchecked Sendable {
         return (process.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 }
+
+extension Installer {
+    public convenience init(ca: CertAuthority, runner: PrivilegedRunner, hostsPath: String = "/etc/hosts") {
+        self.init(caPEMURL: ca.caCertificatePEMURL, runner: runner, hostsPath: hostsPath)
+    }
+}
