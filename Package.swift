@@ -28,8 +28,10 @@ let package = Package(
             ],
             linkerSettings: [.linkedLibrary("sqlite3")]
         ),
-        .executableTarget(name: "OpenProxyApp", dependencies: ["OpenProxyCore"]),
+        .target(name: "OpenProxyAppModel", dependencies: ["OpenProxyCore"]),
+        .executableTarget(name: "OpenProxyApp", dependencies: ["OpenProxyAppModel"]),
         .testTarget(name: "OpenProxyCoreTests", dependencies: ["OpenProxyCore"], resources: [.copy("Fixtures")]),
+        .testTarget(name: "OpenProxyAppTests", dependencies: ["OpenProxyAppModel", "OpenProxyCore"]),
     ],
     swiftLanguageModes: [.v6]
 )
