@@ -3,10 +3,10 @@
 A macOS menu bar app that transparently sits between your coding agents (opencode, pi, aider, …) and `openrouter.ai`. It adds a **provider sort** and **service tier** policy to every chat request, so you configure routing once for all clients instead of in each one.
 
 - **Transparent for keychain-based clients:** curl, Apple Python and opencode need no configuration changes; Rust is expected to (not re-verified with per-user trust). Node, Bun and Homebrew Python need the CA supplied once — see [Client trust](#client-trust).
-- **Sort:** Balanced, Throughput (`:nitro`), Price (`:floor`), Exacto (`:exacto`) — applied by OpenRouter itself via the model-id variant.
+- **Sort:** Balanced, Throughput (`:nitro`), Price (`:floor`), Exacto (`:exacto`) — applied by OpenRouter itself via the model-id variant — and **Smart price**, which ranks the endpoints here and pins them with `provider.order` (see [Smart price](#smart-price)).
 - **Service tier:** Auto, Default, Priority, Flex. Flex has retry, timeout and "fall back without flex" settings.
-- **Never overrides the client:** if a request already sets `service_tier`, `speed`, `provider.order|sort|only`, a `:variant` or an `@preset/…` model, nothing is changed.
-- **Stats** (requests, provider, actual tier, cost) are kept locally in SQLite and shown in the menu.
+- **Never overrides the client:** if a request already sets `service_tier`, `speed`, `provider.order|sort|only` (or, for Smart price, `provider.quantizations`), a `:variant` or an `@preset/…` model, nothing is changed.
+- **Stats** (requests, provider, actual tier, the Smart-price endpoint chosen, cost) are kept locally in SQLite and shown in the menu.
 
 macOS 14+ only.
 
@@ -15,6 +15,19 @@ macOS 14+ only.
 1. Install adds a local CA (name-constrained to `openrouter.ai`) as a **per-user** trusted root in your **login keychain**, and a line `127.0.0.1 openrouter.ai # openproxy` to `/etc/hosts`.
 2. The app listens on `0.0.0.0:443` (no root needed on macOS), accepts loopback peers only, terminates TLS with a leaf for `openrouter.ai`, rewrites the JSON body, and forwards to the real OpenRouter. The upstream address is resolved over DoH so it never loops back to itself.
 3. Responses (including SSE) are streamed through without buffering.
+
+## Smart price
+
+OpenRouter's own `:floor` (the **Price** sort) ranks endpoints by **input** price alone and does not filter quantization. For `deepseek/deepseek-v4.1-flash` it picks an fp4 endpoint even though an fp8 one is cheaper on output. **Smart price** ranks the model's endpoints itself and pins the winner with `provider.order`:
+
+1. Fetch the model's endpoint list (`GET /api/v1/models/{id}/endpoints`, no key needed). It is cached per model for **Refresh endpoint data every N min** (1–60, default 10): a cached list is served at once and refreshed in the background when it is older than the TTL.
+2. Keep the endpoints whose `quantization` is not in `{fp4, mxfp4, nvfp4, int4, fp6, int8}` (`unknown`, `bf16`, `fp16`, `fp32`, `fp8` stay) and whose `uptime_last_30m` is null or at least 90.
+3. Group by the Tier setting: Auto/Default → standard endpoints; Priority → priority first, then standard; Flex → flex endpoints only.
+4. Sort by `pricing.prompt + pricing.completion` (USD per million tokens); ties go to the higher uptime, then the name.
+5. Inject `provider: {order: [<top 5 endpoint tags>], quantizations: ["bf16","fp16","fp32","fp8","unknown"], allow_fallbacks: true}` and add **no** model suffix. The previously chosen endpoint keeps its place unless a new one is at least 10% cheaper, which keeps prompt caching warm.
+6. Skip the whole thing when the client sent `provider.order|sort|only|quantizations` or the model id has a `:variant`/`@preset/`. On any failure the request is forwarded unchanged, and the reason (`no_endpoint_data` or `no_eligible_endpoint`) is recorded in the stats.
+
+The `order` values are the endpoint tags from the `/endpoints` response (`provider[/variant][/region][/tier]`, e.g. `deepinfra/fp8/flex`), which is exactly what OpenRouter's provider `order` accepts. The endpoint Smart price chose is recorded with each request in the stats.
 
 ## Install
 
