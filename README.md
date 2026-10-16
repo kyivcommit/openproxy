@@ -23,7 +23,7 @@ Build: `scripts/build-app.sh` → `build/OpenProxy.app` (ad-hoc signed). Open it
 1. A trust dialog for the CA. Trust is **per-user**: the CA certificate is imported into your **login keychain**, not the System keychain.
 2. The admin password prompt for the `/etc/hosts` change and the DNS cache flush.
 
-Dismissing either prompt stops the install: the hosts entry is written only after the CA is verified as trusted, so clients are never routed to a proxy they cannot trust. The hosts file is left untouched; if the trust prompt was dismissed after the certificate was imported, an untrusted certificate may remain in your login keychain — press **Uninstall** to remove it.
+Dismissing either prompt stops the install: the hosts entry is written only after the CA is verified as trusted, so clients are never routed to a proxy they cannot trust. The hosts file is left untouched; if the trust prompt was dismissed after the certificate was imported, an untrusted certificate may remain in your login keychain — press **Uninstall** to remove it. On success, Install also sets `NODE_EXTRA_CA_CERTS` for processes started afterwards (see [Client trust](#client-trust)); if that step fails it only shows a warning and the install still stands.
 
 If macOS cannot show the trust dialog, trust the CA manually in Keychain Access: **login** keychain → `OpenProxy Local CA` → *Get Info* → *Always Trust*. The certificate lives in the login keychain; the private key stays in `~/Library/Application Support/openproxy/ca.key` (mode 600).
 
@@ -45,11 +45,13 @@ Measured on macOS 27 with per-user trust: curl, Apple Python 3 and opencode (fre
 
 In Node, `--use-system-ca` alone does not pick up the login-keychain CA; use `NODE_EXTRA_CA_CERTS` or the `--use-system-ca --use-bundled-ca` pair. Python 3.13+ strict verification now works with this CA because it carries the Subject and Authority Key Identifier extensions.
 
-The menu's **Copy Node CA line** button copies the export line, and **Set for GUI apps** runs `launchctl setenv NODE_EXTRA_CA_CERTS <ca.pem>` for GUI apps launched from then on. The app never edits any shell profile. For Node-based clients (for example pi):
+**Install** already sets `NODE_EXTRA_CA_CERTS` to this app's `ca.pem` (`launchctl setenv`), so Node clients started after Install trust the CA with no shell configuration. The value only reaches processes started afterwards: **restart your terminal app and any running agents** so they pick it up. If a client is launched by a path that does not inherit the launchd environment, set the variable yourself:
 
 ```sh
 export NODE_EXTRA_CA_CERTS="$HOME/Library/Application Support/openproxy/ca.pem"
 ```
+
+The app never edits a shell profile.
 
 ### Long-running clients
 
@@ -63,7 +65,7 @@ Restart any other long-running client the same way.
 
 ## Uninstall / emergency removal
 
-Press **Uninstall** in the menu. It removes the hosts line first (the safety-critical step), then the per-user trust and the certificate from your login keychain, clears the `NODE_EXTRA_CA_CERTS` variable if **Set for GUI apps** had pointed it at our CA, and best-effort sweeps any certificate an older install left in the System keychain.
+Press **Uninstall** in the menu. It removes the hosts line first (the safety-critical step), then the per-user trust and the certificate from your login keychain, clears the `NODE_EXTRA_CA_CERTS` variable Install set (only when it still points at our `ca.pem`), and best-effort sweeps any certificate an older install left in the System keychain.
 
 If the app is gone or crashed, `openrouter.ai` stays unreachable until the hosts line is removed. Do it manually, then remove the trust and the certificate:
 
@@ -71,7 +73,7 @@ If the app is gone or crashed, `openrouter.ai` stays unreachable until the hosts
 # 1. unblock openrouter.ai
 sudo sed -i '' '/# openproxy/d' /etc/hosts && sudo dscacheutil -flushcache
 
-# 2. if "Set for GUI apps" was used, drop the CA from the launchd environment
+# 2. drop the CA from the launchd environment (Install set it)
 launchctl getenv NODE_EXTRA_CA_CERTS | grep -Fq "$HOME/Library/Application Support/openproxy/ca.pem" \
   && launchctl unsetenv NODE_EXTRA_CA_CERTS
 
