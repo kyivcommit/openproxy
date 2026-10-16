@@ -42,13 +42,24 @@ private final class FakeRunner: PrivilegedRunner, @unchecked Sendable {
 
 /// An unprivileged command runner that records commands and succeeds by default, so the
 /// login-keychain trust phase in `Installer` never touches a real keychain in tests.
-/// `errorOnContains` makes one command fail, for the Node-env error path.
+/// `errorOnContains` makes one command fail, for the Node-env error path; `delay` slows
+/// each command so the refresh-coalescing test can observe overlapping probes.
 private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
     var errorOnContains: String?
-    private(set) var commands: [String] = []
+    var delay: Duration?
+    private let lock = NSLock()
+    private var recorded: [String] = []
+    private var current = 0
+    private var peak = 0
 
-    func run(_ command: String) async -> CommandResult {
-        commands.append(command)
+    var commands: [String] { lock.withLock { recorded } }
+    var maxConcurrent: Int { lock.withLock { peak } }
+
+    func run(_ command: String, timeout: Duration) async -> CommandResult {
+        lock.withLock { current += 1; peak = max(peak, current) }
+        defer { lock.withLock { current -= 1 } }
+        if let delay { try? await Task.sleep(for: delay) }
+        lock.withLock { recorded.append(command) }
         if let errorOnContains, command.contains(errorOnContains) {
             return CommandResult(status: 1, standardError: "denied")
         }
@@ -210,6 +221,35 @@ struct AppModelTests {
         #expect(before == 0)
         #expect(model.summary.total == 1)
         #expect(model.status.hostsEntry == true)
+    }
+
+    @Test func concurrentRefreshesNeverProbeStatusTogether() async throws {
+        // The observed hang: two refresh() rounds ran `installer.status()` at once, leaving
+        // two cooperative-pool threads stuck in the child-process wait. Coalescing must
+        // serialise the probes.
+        let h = try Harness()
+        h.commandRunner.delay = .milliseconds(20)
+        let model = h.model()
+
+        async let first: Void = model.refresh()
+        async let second: Void = model.refresh()
+        _ = await (first, second)
+
+        #expect(h.commandRunner.maxConcurrent == 1)
+    }
+
+    @Test func refreshTriggeredByUninstallIsNotStarvedByAnInFlightRefresh() async throws {
+        // A refresh already in flight (the 5 s loop) must not leave the Uninstall refresh
+        // reporting the pre-uninstall hosts state.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.commandRunner.delay = .milliseconds(20)
+        let model = h.model()
+
+        async let loop: Void = model.refresh()
+        async let uninstall: Void = model.uninstall()
+        _ = await (loop, uninstall)
+
+        #expect(model.status.hostsEntry == false)
     }
 
     @Test func graphCreatesSupportDirectoryWithOwnerOnlyPermissions() throws {

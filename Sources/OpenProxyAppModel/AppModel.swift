@@ -113,6 +113,11 @@ public final class AppModel {
     public let refreshInterval: Duration
 
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    /// Refresh requests waiting for the next round of status probes. Coalescing means at
+    /// most one `installer.status()` runs at a time; requesters that arrive mid-round get a
+    /// fresh round, so an Install/Uninstall refresh is neither concurrent nor starved.
+    @ObservationIgnored private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
+    @ObservationIgnored private var refreshRunning = false
 
     /// Whether `server.start()` already bound the port. Guards Install from a
     /// second bind (and from installing hosts before anything listens).
@@ -242,15 +247,37 @@ public final class AppModel {
         quitDecision.terminate()
     }
 
+    /// Refreshes the summary and status. Only one round of status probes runs at a time:
+    /// concurrent callers queue behind the in-flight round and are served by the next one,
+    /// so the 5 s loop and an Install/Uninstall refresh neither run two `status()` probes
+    /// together (two stuck child-process waits in the observed hang) nor starve each other.
     public func refresh() async {
-        summary = stats.summary(since: Date(timeIntervalSinceNow: -86_400))
-        status = await installer.status()
-        loginItemStatus = loginItem.status
-        // The regenerated-CA warning stops being true once the current CA is trusted and
-        // its hosts entry is in place; until then it stays visible.
-        if status.caTrusted && status.hostsEntry {
-            clearWarnings([.legacyCA])
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            refreshWaiters.append(continuation)
+            guard !refreshRunning else { return }
+            refreshRunning = true
+            Task { @MainActor in await self.drainRefreshes() }
         }
+    }
+
+    private func drainRefreshes() async {
+        while !refreshWaiters.isEmpty {
+            // Snapshot before probing: a caller that arrives during this round (an Uninstall
+            // that just changed the hosts file) is served by a fresh next round instead of
+            // the in-flight snapshot taken before its change.
+            let waiters = refreshWaiters
+            refreshWaiters.removeAll()
+            summary = stats.summary(since: Date(timeIntervalSinceNow: -86_400))
+            status = await installer.status()
+            loginItemStatus = loginItem.status
+            // The regenerated-CA warning stops being true once the current CA is trusted and
+            // its hosts entry is in place; until then it stays visible.
+            if status.caTrusted && status.hostsEntry {
+                clearWarnings([.legacyCA])
+            }
+            waiters.forEach { $0.resume() }
+        }
+        refreshRunning = false
     }
 
     /// Puts the `export NODE_EXTRA_CA_CERTS=…` line on the pasteboard for the user's shell
