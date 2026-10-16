@@ -80,6 +80,25 @@ private final class SuspendingFetcher: EndpointsFetcher, @unchecked Sendable {
     }
 }
 
+/// A fetcher that throws an error built from the Authorization it saw, to prove the catalog
+/// never surfaces that error (and so never the key) to its caller.
+private final class ThrowingFetcher: EndpointsFetcher, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _auths: [String?] = []
+
+    var authorizations: [String?] { lock.withLock { _auths } }
+
+    func fetch(modelId: String, authorization: String?) async throws -> Data {
+        lock.withLock { _auths.append(authorization) }
+        throw LeakyError(received: authorization)
+    }
+
+    private struct LeakyError: Error, CustomStringConvertible {
+        var received: String?
+        var description: String { "endpoints fetch failed with Authorization=\(received ?? "none")" }
+    }
+}
+
 /// Polls until `condition` holds (or a second passes); newer = the background revalidation landed.
 private func waitUntil(_ condition: @Sendable () -> Bool) async {
     for _ in 0..<200 {
@@ -259,6 +278,68 @@ struct EndpointCatalogTests {
 
         #expect(endpoints?.isEmpty == false)
         #expect(fetcher.authorizations == [nil])
+    }
+
+    @Test func remembersAndRefetchesKeylessEntryWithTheKey() async throws {
+        let clock = Clock(Date(timeIntervalSince1970: 0))
+        let keyless = Data(#"{"data":{"endpoints":[{"tag":"a"}]}}"#.utf8)
+        let keyed = Data(#"{"data":{"endpoints":[{"tag":"a","throughput_last_30m":{"p50":10}}]}}"#.utf8)
+        let fetcher = RecordingFetcher(result: .success(keyless))
+        let catalog = EndpointCatalog(fetcher: fetcher, ttl: { 600 }, now: { clock.now })
+
+        // Keyless first: the list is cached with no speed data.
+        #expect(await catalog.endpoints(model: "m", authorization: nil)?.first?.throughput == nil)
+        #expect(fetcher.authorizations == [nil])
+
+        // The next request carries a key: the stale keyless list is served, then refreshed with the key.
+        fetcher.setResult(.success(keyed))
+        #expect(await catalog.endpoints(model: "m", authorization: "Bearer k")?.first?.throughput == nil)
+        await waitUntil { fetcher.callCount == 2 }
+        #expect(fetcher.authorizations == [nil, "Bearer k"])
+        // A keyless lookup now sees the keyed (speed-bearing) list without another fetch.
+        #expect(await catalog.endpoints(model: "m", authorization: nil)?.first?.throughput == 10)
+        #expect(fetcher.callCount == 2)
+    }
+
+    @Test func reusesRememberedAuthorizationForKeylessRefresh() async throws {
+        let clock = Clock(Date(timeIntervalSince1970: 0))
+        let fetcher = RecordingFetcher(result: .success(try Self.fixtureData()))
+        let catalog = EndpointCatalog(fetcher: fetcher, ttl: { 600 }, now: { clock.now })
+
+        _ = await catalog.endpoints(model: "m", authorization: "Bearer k")
+        clock.now = Date(timeIntervalSince1970: 601) // stale: this lookup refreshes
+        _ = await catalog.endpoints(model: "m", authorization: nil)
+        await waitUntil { fetcher.callCount == 2 }
+        #expect(fetcher.authorizations == ["Bearer k", "Bearer k"])
+    }
+
+    @Test func refetchesKeylessEntryWithKeyOnlyOncePerTTL() async throws {
+        let clock = Clock(Date(timeIntervalSince1970: 0))
+        let fetcher = RecordingFetcher(result: .success(try Self.fixtureData()))
+        let catalog = EndpointCatalog(fetcher: fetcher, ttl: { 600 }, now: { clock.now })
+
+        _ = await catalog.endpoints(model: "m", authorization: nil)
+        _ = await catalog.endpoints(model: "m", authorization: "Bearer k")
+        await waitUntil { fetcher.callCount == 2 }
+        // Further keyed lookups inside the TTL do not refetch again.
+        _ = await catalog.endpoints(model: "m", authorization: "Bearer k")
+        _ = await catalog.endpoints(model: "m", authorization: "Bearer k")
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        #expect(fetcher.callCount == 2)
+    }
+
+    @Test func authorizationNeverSurfacesInAnErrorDescription() async {
+        // A fetcher that echoes the header it saw, standing in for any downstream that might
+        // put the value in an error: the catalog must swallow it, never rethrow or expose it.
+        let secret = "Bearer sk-secret-key"
+        let fetcher = ThrowingFetcher()
+        let catalog = EndpointCatalog(fetcher: fetcher)
+
+        let result = await catalog.endpoints(model: "m", authorization: secret)
+
+        #expect(result == nil) // fail-open
+        #expect(fetcher.authorizations == [secret])
+        #expect(!String(describing: result).contains(secret))
     }
 
     @Test func nilWhenAuthorizationMissing() async {

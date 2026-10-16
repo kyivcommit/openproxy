@@ -70,6 +70,19 @@ private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
 private struct PortInUse: Error {}
 private enum LoginItemTestError: Error { case denied }
 
+/// An upstream client that fails every send, for the endpoints-fetcher error path.
+private final class FailingUpstreamClient: UpstreamClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _requests: [UpstreamRequest] = []
+
+    var requests: [UpstreamRequest] { lock.withLock { _requests } }
+
+    func send(_ request: UpstreamRequest) async throws -> UpstreamResponse {
+        lock.withLock { _requests.append(request) }
+        return UpstreamResponse(status: 500, headers: [], body: AsyncThrowingStream { $0.finish() })
+    }
+}
+
 /// Records autostart registration and lets a test force the reported status.
 private final class FakeLoginItem: LoginItemRegistering, @unchecked Sendable {
     var registerError: Error?
@@ -256,6 +269,28 @@ struct AppModelTests {
         _ = await (loop, uninstall)
 
         #expect(model.status.hostsEntry == false)
+    }
+
+    @Test func endpointsFetcherKeepsTheKeyOutOfItsErrorsAndOffKeylessCalls() async throws {
+        let client = FailingUpstreamClient()
+        let fetcher = UpstreamEndpointsFetcher(client: client)
+        let secret = "Bearer sk-secret-key"
+
+        // Keyed fetch: the header goes to the endpoints request only, and never into the error.
+        do {
+            _ = try await fetcher.fetch(modelId: "deepseek/deepseek-v4.1-flash", authorization: secret)
+            Issue.record("the failing upstream should make the fetch throw")
+        } catch {
+            #expect(!String(describing: error).contains(secret))
+        }
+        let keyed = try #require(client.requests.first)
+        #expect(keyed.path == "/api/v1/models/deepseek/deepseek-v4.1-flash/endpoints")
+        #expect(keyed.headers.contains { $0.0 == "Authorization" && $0.1 == secret })
+
+        // Keyless fetch: no Authorization header at all.
+        _ = try? await fetcher.fetch(modelId: "m", authorization: nil)
+        let keyless = try #require(client.requests.last)
+        #expect(!keyless.headers.contains { $0.0.lowercased() == "authorization" })
     }
 
     @Test func graphCreatesSupportDirectoryWithOwnerOnlyPermissions() throws {

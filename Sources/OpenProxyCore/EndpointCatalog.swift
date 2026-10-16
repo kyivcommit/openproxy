@@ -51,6 +51,8 @@ public actor EndpointCatalog {
     private struct Entry {
         var endpoints: [Endpoint]
         var fetchedAt: Date
+        /// Whether the fetch carried a client key, i.e. whether the list has speed metrics.
+        var fetchedWithAuthorization: Bool
     }
 
     private let fetcher: EndpointsFetcher
@@ -60,6 +62,12 @@ public actor EndpointCatalog {
     private var cache: [String: Entry] = [:]
     private var inFlight: [String: Task<[Endpoint]?, Never>] = [:]
     private var generation: [String: Int] = [:]
+    /// The most recent client Authorization header seen, kept in memory only: never logged or
+    /// persisted, and passed to the fetcher (which sends it only to openrouter.ai) so a later
+    /// refresh can pull the speed metrics that need a key. Only the latest value is kept.
+    private var latestAuthorization: String?
+    /// When each model's keyless list was last refetched with a key, to cap that at once per TTL.
+    private var speedRefreshedAt: [String: Date] = [:]
 
     public init(
         fetcher: EndpointsFetcher,
@@ -72,11 +80,22 @@ public actor EndpointCatalog {
     }
 
     /// The model's endpoints, or nil when there is no data at all and the fetch failed.
-    /// `authorization` is optional: the endpoints call needs no key.
+    /// `authorization` is optional: the endpoints call needs no key, but when the client sent
+    /// one it is remembered so the next refresh can fetch the keyed speed metrics.
     public func endpoints(model: String, authorization: String?) async -> [Endpoint]? {
         let bare = Self.bareModel(model)
+        if let authorization = Self.nonEmpty(authorization) { latestAuthorization = authorization }
+        let authorization = Self.nonEmpty(authorization) ?? latestAuthorization
+
         let cached = cache[bare]
         if let cached, now().timeIntervalSince(cached.fetchedAt) < ttl() {
+            // A list fetched without a key is "stale for speed": now that a key is known,
+            // refetch it in the background, at most once per TTL window per model.
+            if !cached.fetchedWithAuthorization, authorization != nil,
+               inFlight[bare] == nil, speedRefreshDue(bare) {
+                speedRefreshedAt[bare] = now()
+                _ = startFetch(bare, authorization: authorization)
+            }
             return cached.endpoints
         }
 
@@ -86,6 +105,21 @@ public actor EndpointCatalog {
             return await task.value
         }
 
+        let task = startFetch(bare, authorization: authorization)
+        // Stale-while-revalidate: hand back the old list at once and let the refresh land later.
+        if let cached { return cached.endpoints }
+        return await task.value
+    }
+
+    /// The key stays in memory for the process lifetime, so a client that drops the header for
+    /// one request does not lose speed data on the next refresh.
+    private func speedRefreshDue(_ bare: String) -> Bool {
+        guard let last = speedRefreshedAt[bare] else { return true }
+        return now().timeIntervalSince(last) >= ttl()
+    }
+
+    /// Starts one fetch and schedules its commit; the caller serves stale data or awaits the task.
+    private func startFetch(_ bare: String, authorization: String?) -> Task<[Endpoint]?, Never> {
         let startedAt = now()
         let generation = (self.generation[bare] ?? 0) + 1
         self.generation[bare] = generation
@@ -101,12 +135,11 @@ public actor EndpointCatalog {
         // revalidation half of stale-while-revalidate.
         Task { [weak self] in
             let result = await task.value
-            await self?.commit(bare, generation: generation, startedAt: startedAt, endpoints: result)
+            await self?.commit(
+                bare, generation: generation, startedAt: startedAt,
+                fetchedWithAuthorization: authorization != nil, endpoints: result)
         }
-
-        // Stale-while-revalidate: hand back the old list at once and let the refresh land later.
-        if let cached { return cached.endpoints }
-        return await task.value
+        return task
     }
 
     /// nil when there is no usable Authorization header or the lookup fails (fail-open: no tier injection).
@@ -120,12 +153,22 @@ public actor EndpointCatalog {
     }
 
     private func commit(
-        _ bare: String, generation: Int, startedAt: Date, endpoints: [Endpoint]?
+        _ bare: String, generation: Int, startedAt: Date,
+        fetchedWithAuthorization: Bool, endpoints: [Endpoint]?
     ) {
         // A newer fetch for this model may have started while we awaited; only the latest result may land.
         guard self.generation[bare] == generation else { return }
         inFlight[bare] = nil
-        if let endpoints { cache[bare] = Entry(endpoints: endpoints, fetchedAt: startedAt) }
+        if let endpoints {
+            cache[bare] = Entry(
+                endpoints: endpoints, fetchedAt: startedAt,
+                fetchedWithAuthorization: fetchedWithAuthorization)
+        }
+    }
+
+    private static func nonEmpty(_ authorization: String?) -> String? {
+        guard let authorization, !authorization.isEmpty else { return nil }
+        return authorization
     }
 
     /// Reads `data.endpoints[]`; nil when the payload has no `data.endpoints` array.
