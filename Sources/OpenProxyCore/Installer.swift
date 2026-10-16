@@ -77,10 +77,12 @@ public final class Installer: @unchecked Sendable {
     }
 
     public func install() async throws {
-        let newHosts = HostsFile.adding(to: Self.readHosts(hostsPath))
+        // `set -e` aborts at the first failed step, so the trailing flushcache can no longer
+        // mask an earlier security/hosts failure; the script reports success only if all ran.
         let script = """
+        set -e
         security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \(Self.quoted(caPEMURL.path))
-        printf '%s' \(Self.quoted(newHosts)) > \(Self.quoted(hostsPath))
+        \(Self.hostsEditScript(hostsPath: hostsPath, adding: true))
         dscacheutil -flushcache
         """
         do {
@@ -91,9 +93,9 @@ public final class Installer: @unchecked Sendable {
     }
 
     public func uninstall() async throws {
-        let newHosts = HostsFile.removing(from: Self.readHosts(hostsPath))
         let script = """
-        printf '%s' \(Self.quoted(newHosts)) > \(Self.quoted(hostsPath))
+        set -e
+        \(Self.hostsEditScript(hostsPath: hostsPath, adding: false))
         security delete-certificate -c \(Self.quoted(caCommonName)) /Library/Keychains/System.keychain
         dscacheutil -flushcache
         """
@@ -102,6 +104,33 @@ public final class Installer: @unchecked Sendable {
         } catch {
             throw InstallError.runnerFailed(String(describing: error))
         }
+    }
+
+    /// The privileged `/etc/hosts` edit. It re-reads the file as root instead of trusting an
+    /// unprivileged snapshot, edits only the managed line, and swaps in a temp file in the
+    /// same directory so the replace is atomic. A failed read aborts (with `set -e`) before
+    /// anything is written, so the real file is never truncated or filled with empty text.
+    static func hostsEditScript(hostsPath: String, adding: Bool) -> String {
+        let edit: String
+        if adding {
+            edit = """
+            cat "$hosts" > "$tmp"
+            if ! grep -Eq \(quoted(HostsFile.managedLinePattern)) "$tmp"; then
+                printf '%s\\n' \(quoted(HostsFile.entry)) >> "$tmp"
+            fi
+            """
+        } else {
+            edit = "sed -E \(quoted("/" + HostsFile.managedLinePattern + "/d")) \"$hosts\" > \"$tmp\""
+        }
+        return """
+        hosts=\(quoted(hostsPath))
+        tmp=$(mktemp "${hosts}.openproxy.XXXXXX")
+        trap 'rm -f "$tmp"' EXIT
+        \(edit)
+        chmod "$(stat -f '%Lp' "$hosts")" "$tmp"
+        chown "$(stat -f '%Su:%Sg' "$hosts")" "$tmp"
+        mv "$tmp" "$hosts"
+        """
     }
 
     public func status() async -> InstallStatus {
@@ -127,6 +156,8 @@ public final class Installer: @unchecked Sendable {
         "launchctl setenv NODE_EXTRA_CA_CERTS \(quoted(caPEMURL.path))"
     }
 
+    /// Read-only view for `status()` only. Never used to build a write: a read error must not
+    /// become empty hosts text.
     private static func readHosts(_ path: String) -> String {
         (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
     }

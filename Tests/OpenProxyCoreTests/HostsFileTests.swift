@@ -68,6 +68,24 @@ struct HostsFileTests {
         #expect(HostsFile.isPresent(in: "127.0.0.1 openrouter.ai # openproxy\n"))
     }
 
+    @Test func isPresentRejectsUnrelatedMarkerComment() {
+        // Finding (c): only the exact managed line counts; a stray marker comment must never
+        // be treated as ours (and so must never be deleted by `removing`).
+        #expect(!HostsFile.isPresent(in: "# openproxy\n"))
+        #expect(!HostsFile.isPresent(in: "# openproxy is our marker\n"))
+        #expect(!HostsFile.isPresent(in: "127.0.0.1 openrouter.ai # openproxy-backup\n"))
+        #expect(!HostsFile.isPresent(in: "10.0.0.1 openrouter.ai # openproxy\n"))
+    }
+
+    @Test func isPresentMatchesWhitespaceTolerantManagedLine() {
+        #expect(HostsFile.isPresent(in: "  127.0.0.1\topenrouter.ai   #  openproxy  \n"))
+    }
+
+    @Test func removingKeepsUnrelatedMarkerComment() {
+        let text = "# openproxy is our marker\n127.0.0.1 localhost\n"
+        #expect(HostsFile.removing(from: text) == text)
+    }
+
     @Test func addThenRemoveRoundTrips() {
         let text = "127.0.0.1 localhost\n"
         #expect(HostsFile.removing(from: HostsFile.adding(to: text)) == text)
