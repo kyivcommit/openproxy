@@ -6,6 +6,20 @@ import Testing
 private let hostsEntry = "127.0.0.1 openrouter.ai # openproxy"
 private let fakeCAPath = "/tmp/openproxy-test/ca.pem"
 
+/// A real on-disk CA, so install()'s fingerprint check has a certificate to read.
+private enum TestCA {
+    static let directory: URL = {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-installer-ca-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let ca = CertAuthority(directory: dir)
+        try? ca.loadOrCreate()
+        return dir
+    }()
+
+    static var pemURL: URL { directory.appending(path: "ca.pem") }
+}
+
 private final class RecordingRunner: PrivilegedRunner, @unchecked Sendable {
     private let lock = NSLock()
     private var recorded: [String] = []
@@ -22,7 +36,7 @@ private final class RecordingRunner: PrivilegedRunner, @unchecked Sendable {
 @Suite("Installer")
 struct InstallerTests {
     private func makeInstaller(runner: PrivilegedRunner, hostsPath: String) -> Installer {
-        Installer(caPEMURL: URL(fileURLWithPath: fakeCAPath), runner: runner, hostsPath: hostsPath)
+        Installer(caPEMURL: TestCA.pemURL, runner: runner, hostsPath: hostsPath)
     }
 
     private func makeHostsFile(_ content: String) throws -> String {
@@ -41,7 +55,7 @@ struct InstallerTests {
         #expect(runner.scripts.count == 1)
         let script = try #require(runner.scripts.first)
         #expect(script.contains("security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain"))
-        #expect(script.contains(fakeCAPath))
+        #expect(script.contains(TestCA.pemURL.path))
         #expect(script.contains(hostsEntry))
         #expect(script.contains(hostsPath))
         #expect(script.contains("dscacheutil -flushcache"))
@@ -261,9 +275,10 @@ struct InstallerTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let hostsPath = dir.appending(path: "my hosts").path
         try Data("127.0.0.1 localhost\n".utf8).write(to: URL(fileURLWithPath: hostsPath))
+        let caPath = dir.appending(path: "my ca.pem").path
+        try FileManager.default.copyItem(at: TestCA.pemURL, to: URL(fileURLWithPath: caPath))
         defer { try? FileManager.default.removeItem(at: dir) }
         let runner = RecordingRunner()
-        let caPath = "/tmp/a b'c/ca.pem"
 
         try await Installer(
             caPEMURL: URL(fileURLWithPath: caPath), runner: runner, hostsPath: hostsPath
@@ -272,6 +287,51 @@ struct InstallerTests {
         let script = try #require(runner.scripts.first)
         #expect(script.contains(shellQuoted(caPath)))
         #expect(script.contains(shellQuoted(hostsPath)))
+    }
+
+    // MARK: - Finding: validate the CA PEM before trusting it from a user-writable path
+
+    @Test func sha256FingerprintMatchesOpenssl() throws {
+        let pem = try String(contentsOf: TestCA.pemURL, encoding: .utf8)
+        let fingerprint = try #require(Installer.sha256Fingerprint(ofPEM: pem))
+        #expect(fingerprint.count == 64)
+        #expect(fingerprint == fingerprint.lowercased())
+        #expect(Installer.sha256Fingerprint(ofPEM: "not a certificate") == nil)
+
+        guard let openssl = opensslPath else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: openssl)
+        process.arguments = ["x509", "-in", TestCA.pemURL.path, "-noout", "-fingerprint", "-sha256"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let opensslFingerprint = text.split(separator: "=").last.map(String.init)?
+            .replacingOccurrences(of: ":", with: "").lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(opensslFingerprint == fingerprint)
+    }
+
+    @Test func installVerifiesCAFingerprintBeforeTrusting() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let pem = try String(contentsOf: TestCA.pemURL, encoding: .utf8)
+        let fingerprint = try #require(Installer.sha256Fingerprint(ofPEM: pem))
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).install()
+
+        let script = try #require(runner.scripts.first)
+        #expect(script.contains("openssl x509"))
+        #expect(script.contains("-fingerprint -sha256"))
+        #expect(script.contains(fingerprint))  // the unprivileged app's digest is embedded
+        // Trust is added from the root-owned temp copy, never the user-writable path directly.
+        #expect(script.contains(#"security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$tmpca""#))
+        let verify = try #require(script.range(of: "openssl x509"))
+        let trust = try #require(script.range(of: "security add-trusted-cert"))
+        #expect(verify.lowerBound < trust.lowerBound)
     }
 }
 

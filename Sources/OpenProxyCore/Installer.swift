@@ -1,4 +1,5 @@
 import Foundation
+import Crypto
 
 /// Runs a shell script with administrator privileges. Injected so tests can record
 /// the script without triggering the real macOS authorization dialog.
@@ -77,12 +78,29 @@ public final class Installer: @unchecked Sendable {
     }
 
     public func install() async throws {
+        // The unprivileged app computes the expected digest; the privileged script re-derives it
+        // from a root-owned copy before trusting it, so a swapped `ca.pem` (TOCTOU) can never be
+        // trusted. An unreadable/malformed CA yields no expected value and the script fails closed.
+        let expected = (try? String(contentsOf: caPEMURL, encoding: .utf8))
+            .flatMap(Self.sha256Fingerprint(ofPEM:)) ?? ""
         // `set -e` aborts at the first failed step, so the trailing flushcache can no longer
         // mask an earlier security/hosts failure; the script reports success only if all ran.
         let script = """
         set -e
-        security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \(Self.quoted(caPEMURL.path))
+        ca=\(Self.quoted(caPEMURL.path))
+        expected=\(Self.quoted(expected))
+        tmpca=$(mktemp /tmp/openproxy-ca.XXXXXX)
+        trap 'rm -f "$tmpca"' EXIT
+        cp "$ca" "$tmpca"
+        chmod 400 "$tmpca"
+        actual=$(openssl x509 -in "$tmpca" -noout -fingerprint -sha256 | sed 's/.*=//' | tr -d ':' | tr 'A-Z' 'a-z')
+        if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+            echo "openproxy: CA certificate missing or changed; refusing to install" >&2
+            exit 1
+        fi
+        security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$tmpca"
         \(Self.hostsEditScript(hostsPath: hostsPath, adding: true))
+        trap 'rm -f "$tmpca" "$tmp"' EXIT
         dscacheutil -flushcache
         """
         do {
@@ -90,6 +108,16 @@ public final class Installer: @unchecked Sendable {
         } catch {
             throw InstallError.runnerFailed(String(describing: error))
         }
+    }
+
+    /// Lower-case hex SHA-256 of the certificate DER, as `openssl x509 -fingerprint -sha256`
+    /// prints it without separators. Returns nil when the text is not a single PEM certificate.
+    static func sha256Fingerprint(ofPEM pem: String) -> String? {
+        let base64 = pem.split(whereSeparator: \.isNewline)
+            .filter { !$0.hasPrefix("-----") }
+            .joined()
+        guard let der = Data(base64Encoded: base64) else { return nil }
+        return SHA256.hash(data: der).map { String(format: "%02x", $0) }.joined()
     }
 
     public func uninstall() async throws {
