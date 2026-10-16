@@ -176,9 +176,9 @@ struct AppModelTests {
         await model.install()
 
         #expect(model.warnings.count == 1)
-        #expect(model.warnings[0].contains("Install"))
+        #expect(model.warnings[0].message.contains("Install"))
         // InstallError renders as its message, so the stderr/cancel reason stays readable.
-        #expect(model.warnings[0].contains("user cancelled"))
+        #expect(model.warnings[0].message.contains("user cancelled"))
         #expect(h.runner.scripts.count == 1)
     }
 
@@ -240,7 +240,7 @@ struct AppModelTests {
 
         #expect(h.loginItem.registerCount == 1)
         #expect(model.loginItemStatus == .notFound)
-        #expect(model.warnings.contains { $0.contains("Autostart") })
+        #expect(model.warnings.contains { $0.message.contains("Autostart") })
     }
 
     @Test func loginItemRequiringApprovalBecomesWarning() throws {
@@ -251,7 +251,7 @@ struct AppModelTests {
         model.registerLoginItem()
 
         #expect(model.loginItemStatus == .requiresApproval)
-        #expect(model.warnings.contains { $0.contains("Autostart") })
+        #expect(model.warnings.contains { $0.message.contains("Autostart") })
     }
 
     @Test func loginItemEnabledAddsNoWarning() throws {
@@ -302,7 +302,7 @@ struct AppModelTests {
         // The in-memory value (UI and per-request reader) stays consistent; only the disk write failed.
         #expect(model.settings.sort == .price)
         #expect(store.settings.sort == .price)
-        #expect(model.warnings.contains { $0.contains("settings") })
+        #expect(model.warnings.contains { $0.message.contains("settings") })
     }
 
     @Test func legacyCARegenerationBecomesWarning() throws {
@@ -314,7 +314,7 @@ struct AppModelTests {
             caWasRegenerated: true)
 
         #expect(h.model().warnings.isEmpty)
-        #expect(model.warnings.contains { $0.contains("Uninstall") })
+        #expect(model.warnings.contains { $0.message.contains("Uninstall") })
     }
 
     @Test func menuVisibilityDrivesPeriodicRefresh() async throws {
@@ -380,7 +380,7 @@ struct AppModelTests {
         await model.start()
 
         #expect(model.warnings.count == 1)
-        #expect(model.warnings[0].lowercased().contains("start"))
+        #expect(model.warnings[0].message.lowercased().contains("start"))
         #expect(h.runner.scripts.isEmpty)
     }
 
@@ -403,7 +403,7 @@ struct AppModelTests {
 
         // No privileged step ran and the hosts file is left routed as it was.
         #expect(h.runner.scripts.isEmpty)
-        #expect(model.warnings.contains { $0.contains("Install was skipped") })
+        #expect(model.warnings.contains { $0.message.contains("Install was skipped") })
     }
 
     @Test func installDoesNotStartAnAlreadyRunningServer() async throws {
@@ -484,6 +484,64 @@ struct AppModelTests {
         // and surface why instead.
         #expect(h.quitDecision.terminateCount == 0)
         #expect(model.status.hostsEntry)
-        #expect(model.warnings.contains { $0.contains("still routed") })
+        #expect(model.warnings.contains { $0.message.contains("still routed") })
     }
+
+    // MARK: - Item 1: keyed warnings clear on success
+
+    @Test func successfulInstallClearsStaleOperationWarnings() async throws {
+        // The real-install bug: a failed Uninstall left "Uninstall failed: …" visible even
+        // after a later Install succeeded.
+        let h = try Harness()
+        let model = h.model()
+        h.runner.error = InstallError.runnerFailed("boom")
+        await model.uninstall()
+        #expect(model.warnings.contains { $0.key == .uninstall })
+
+        h.runner.error = nil
+        await model.install()
+
+        #expect(!model.warnings.contains { $0.key == .uninstall })
+        #expect(!model.warnings.contains { $0.key == .install })
+        #expect(!model.warnings.contains { $0.key == .serverStart })
+    }
+
+    @Test func successfulUninstallClearsStaleInstallWarning() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        h.runner.error = InstallError.runnerFailed("boom")
+        await model.install()
+        #expect(model.warnings.contains { $0.key == .install })
+
+        h.runner.error = nil
+        await model.uninstall()
+
+        #expect(model.warnings.isEmpty)
+    }
+
+    @Test func successfulInstallClearsLegacyCAWarningOnceTrustedAndRouted() async throws {
+        let h = try Harness()
+        let model = AppModel(
+            settingsStore: h.settingsStore, stats: h.stats, installer: h.installer,
+            server: h.server, loginItem: h.loginItem, quitDecision: h.quitDecision,
+            caWasRegenerated: true)
+        #expect(model.warnings.contains { $0.key == .legacyCA })
+
+        await model.install()
+
+        #expect(!model.warnings.contains { $0.key == .legacyCA })
+    }
+
+    @Test func legacyCAWarningStaysUntilTrustedAndRouted() async throws {
+        let h = try Harness()
+        let model = AppModel(
+            settingsStore: h.settingsStore, stats: h.stats, installer: h.installer,
+            server: h.server, loginItem: h.loginItem, quitDecision: h.quitDecision,
+            caWasRegenerated: true)
+
+        await model.refresh()
+
+        #expect(model.warnings.contains { $0.key == .legacyCA })
+    }
+
 }

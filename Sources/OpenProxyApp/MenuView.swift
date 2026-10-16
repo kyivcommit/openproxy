@@ -141,8 +141,8 @@ struct MenuView: View {
     private var warningBlock: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Warnings").font(.headline)
-            ForEach(model.warnings, id: \.self) { warning in
-                Text("⚠︎ \(warning)")
+            ForEach(model.warnings, id: \.key) { warning in
+                Text("⚠︎ \(warning.message)")
                     .font(.caption)
                     .foregroundStyle(.orange)
                     // Command stderr can be long; show it wrapped and selectable, never clipped.
