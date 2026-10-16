@@ -200,7 +200,9 @@ private func startHarness(
     settings: Settings,
     replies: [FakeReply],
     fetcher: FakeEndpointsFetcher = FakeEndpointsFetcher(hasFlex: true),
-    maxBodyBytes: Int = 32 * 1024 * 1024
+    maxBodyBytes: Int = 32 * 1024 * 1024,
+    maxQueuedRequests: Int = 8,
+    maxQueuedBytes: Int = 64 * 1024 * 1024
 ) async throws -> Harness {
     let directory = FileManager.default.temporaryDirectory.appending(path: "openproxy-proxy-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -211,7 +213,9 @@ private func startHarness(
     let upstream = FakeUpstreamClient(replies)
     let stats = try StatsStore(path: ":memory:")
     let server = ProxyServer(
-        config: ProxyConfig(bindHost: "127.0.0.1", port: 0, maxBodyBytes: maxBodyBytes),
+        config: ProxyConfig(
+            bindHost: "127.0.0.1", port: 0, maxBodyBytes: maxBodyBytes,
+            maxQueuedRequests: maxQueuedRequests, maxQueuedBytes: maxQueuedBytes),
         ca: ca,
         upstream: upstream,
         catalog: TierCatalog(fetcher: fetcher),
@@ -239,10 +243,13 @@ private func withServer(
     replies: [FakeReply],
     fetcher: FakeEndpointsFetcher = FakeEndpointsFetcher(hasFlex: true),
     maxBodyBytes: Int = 32 * 1024 * 1024,
+    maxQueuedRequests: Int = 8,
+    maxQueuedBytes: Int = 64 * 1024 * 1024,
     _ body: (Harness) async throws -> Void
 ) async throws {
     let harness = try await startHarness(
-        settings: settings, replies: replies, fetcher: fetcher, maxBodyBytes: maxBodyBytes)
+        settings: settings, replies: replies, fetcher: fetcher, maxBodyBytes: maxBodyBytes,
+        maxQueuedRequests: maxQueuedRequests, maxQueuedBytes: maxQueuedBytes)
     do {
         try await body(harness)
     } catch {
@@ -672,6 +679,70 @@ struct ProxyServerTests {
             try await channel.close().get()
             #expect(await waitUntil({ harness.upstream.cancels.contains { $0.cancelled } }, timeout: 1))
             #expect(harness.upstream.requests.count == 1)
+        }
+    }
+
+    /// A first response whose body stays open until `gate` is signaled, so the
+    /// request stays "in flight" while later pipelined requests queue up.
+    private func gatedFirstReply(_ gate: Signal) -> FakeReply {
+        FakeReply(
+            status: 200, headers: [("content-type", "application/json")],
+            stream: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield(Data("first".utf8))
+                    let task = Task {
+                        await gate.wait()
+                        continuation.finish()
+                    }
+                    continuation.onTermination = { _ in task.cancel() }
+                }
+            })
+    }
+
+    @Test func pipelinedRequestsBeyondQueueCountAreClosed() async throws {
+        let gate = Signal()
+        try await withServer(
+            replies: [gatedFirstReply(gate), FakeReply(), FakeReply()], maxQueuedRequests: 1
+        ) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let (channel, monitor) = try await openRawTLSChannel(
+                port: harness.port, group: group, monitor: true)
+            try await writePipelinedRequests(
+                [
+                    (path: chatPath, body: Data(#"{"model":"a"}"#.utf8)),
+                    (path: chatPath, body: Data(#"{"model":"b"}"#.utf8)),
+                    (path: chatPath, body: Data(#"{"model":"c"}"#.utf8)),
+                ],
+                on: channel)
+            // Request 1 is in flight, request 2 fills the single queue slot, and
+            // request 3 exceeds the cap: the proxy closes rather than buffering it.
+            #expect(await waitUntil({ monitor.closed }, timeout: 2))
+            #expect(harness.upstream.requests.count == 1)
+            try? await channel.close().get()
+        }
+    }
+
+    @Test func pipelinedRequestsBeyondQueueBytesAreClosed() async throws {
+        let gate = Signal()
+        let largeBody = Data(repeating: 0x41, count: 64)
+        try await withServer(
+            replies: [gatedFirstReply(gate), FakeReply()], maxQueuedBytes: 16
+        ) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let (channel, monitor) = try await openRawTLSChannel(
+                port: harness.port, group: group, monitor: true)
+            try await writePipelinedRequests(
+                [
+                    (path: chatPath, body: Data(#"{"model":"a"}"#.utf8)),
+                    (path: chatPath, body: largeBody),
+                ],
+                on: channel)
+            // The queued 64-byte body exceeds the 16-byte cap: close, don't buffer.
+            #expect(await waitUntil({ monitor.closed }, timeout: 2))
+            #expect(harness.upstream.requests.count == 1)
+            try? await channel.close().get()
         }
     }
 

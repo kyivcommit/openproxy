@@ -10,17 +10,25 @@ public struct ProxyConfig: Sendable {
     public var allowNonLoopbackPeers = false
     /// Largest request body buffered for rewriting; larger requests get a 413.
     public var maxBodyBytes = 32 * 1024 * 1024
+    /// Most pipelined requests buffered behind the one in flight; beyond this
+    /// (or `maxQueuedBytes`) the connection is closed.
+    public var maxQueuedRequests = 8
+    /// Most request-body bytes buffered across queued pipelined requests.
+    public var maxQueuedBytes = 64 * 1024 * 1024
 
     public init() {}
 
     public init(
         bindHost: String, port: Int, allowNonLoopbackPeers: Bool = false,
-        maxBodyBytes: Int = 32 * 1024 * 1024
+        maxBodyBytes: Int = 32 * 1024 * 1024,
+        maxQueuedRequests: Int = 8, maxQueuedBytes: Int = 64 * 1024 * 1024
     ) {
         self.bindHost = bindHost
         self.port = port
         self.allowNonLoopbackPeers = allowNonLoopbackPeers
         self.maxBodyBytes = maxBodyBytes
+        self.maxQueuedRequests = maxQueuedRequests
+        self.maxQueuedBytes = maxQueuedBytes
     }
 }
 
@@ -39,6 +47,8 @@ public final class ProxyServer: @unchecked Sendable {
     public private(set) var boundPort = 0
 
     var maxBodyBytes: Int { config.maxBodyBytes }
+    var maxQueuedRequests: Int { config.maxQueuedRequests }
+    var maxQueuedBytes: Int { config.maxQueuedBytes }
 
     public init(
         config: ProxyConfig = ProxyConfig(),
@@ -334,6 +344,7 @@ private final class ProxyConnectionHandler: ChannelInboundHandler, @unchecked Se
     private var head: HTTPRequestHead?
     private var body = ByteBuffer()
     private var pending: [Request] = []
+    private var queuedBytes = 0
     private var current: Task<Void, Never>?
     private var exceededBodyLimit = false
 
@@ -373,6 +384,16 @@ private final class ProxyConnectionHandler: ChannelInboundHandler, @unchecked Se
         case .end:
             guard let head = self.head, let server = self.server else { return }
             guard !exceededBodyLimit else { return }
+            // Pipelined requests queue behind the one in flight; cap both their
+            // count and total bytes so a slow upstream cannot make this grow
+            // without bound. A 429 written now would arrive out of order with the
+            // serialized responses, so the connection is closed instead.
+            let bytes = body.readableBytes
+            if pending.count >= server.maxQueuedRequests || queuedBytes + bytes > server.maxQueuedBytes {
+                overloaded(context: context)
+                return
+            }
+            queuedBytes += bytes
             pending.append(Request(head: head, body: Data(body.readableBytesView)))
             pump(channel: context.channel, server: server)
         }
@@ -386,11 +407,19 @@ private final class ProxyConnectionHandler: ChannelInboundHandler, @unchecked Se
         }
     }
 
+    private func overloaded(context: ChannelHandlerContext) {
+        // A 429 cannot be written while the in-flight response is still open (NIO
+        // forbids a second head before the first ends), so the connection is closed
+        // instead: the client sees the truncated response and must back off.
+        context.close(promise: nil)
+    }
+
     /// Starts the next queued request only when nothing else is in flight, so
     /// responses stay ordered and a client close cancels the one running.
     private func pump(channel: Channel, server: ProxyServer) {
         guard current == nil, !pending.isEmpty else { return }
         let request = pending.removeFirst()
+        queuedBytes -= request.body.count
         current = Task { [weak self] in
             await server.handle(head: request.head, body: request.body, channel: channel)
             await self?.finished(channel: channel, server: server)
@@ -411,6 +440,7 @@ private final class ProxyConnectionHandler: ChannelInboundHandler, @unchecked Se
         current?.cancel()
         current = nil
         pending.removeAll()
+        queuedBytes = 0
     }
 
     func channelInactive(context: ChannelHandlerContext) {
