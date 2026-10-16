@@ -137,19 +137,26 @@ struct FlexControllerTests {
     @Test func timeoutWithFallbackOffThrows() async throws {
         let policy = FlexPolicy(fallback: false, attempts: 1)
         let sender = ScriptedSender([.timeout])
-        await #expect(throws: FlexTimeout.self) {
+        let failure = await #expect(throws: FlexFailure.self) {
             try await run(sender, policy: policy)
         }
+        #expect(failure?.attempts == 1)
+        #expect(failure?.usedFallback == false)
+        #expect(failure?.underlying is FlexTimeout)
         #expect(sender.timeoutsCancelled == 1)
     }
 
     @Test func fallbackTimeoutCancelsUpstreamAndRethrows() async throws {
-        let policy = FlexPolicy(fallback: true, attempts: 1)
-        let sender = ScriptedSender([.timeout, .timeout])
-        await #expect(throws: FlexTimeout.self) {
+        let policy = FlexPolicy(fallback: true, attempts: 2)
+        let sender = ScriptedSender([.timeout, .timeout, .timeout])
+        let failure = await #expect(throws: FlexFailure.self) {
             try await run(sender, policy: policy)
         }
-        #expect(sender.timeoutsCancelled == 2)  // flex attempt + timed-out plain fallback
+        // Two flex attempts plus the fallback attempt, all recorded for the stats.
+        #expect(failure?.attempts == 3)
+        #expect(failure?.usedFallback == true)
+        #expect(failure?.underlying is FlexTimeout)
+        #expect(sender.timeoutsCancelled == 3)  // both flex attempts + the plain fallback
     }
 
     @Test func cancellationAfterSendStopsBeforeRetry() async throws {

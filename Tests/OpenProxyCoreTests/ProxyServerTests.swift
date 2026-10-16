@@ -77,16 +77,31 @@ private final class FakeEndpointsFetcher: EndpointsFetcher, @unchecked Sendable 
     var calls: [String] { lock.withLock { _calls } }
 }
 
-private struct StaticResolver: HostResolver {
+struct StaticResolver: HostResolver {
     let addresses: [String]
     func resolve(_ host: String) async throws -> [String] { addresses }
+}
+
+/// An upstream whose `send` blocks until cancelled, standing in for a slow
+/// connect / write / head wait; records how many sends were attempted.
+final class SlowCancelClient: UpstreamClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _count = 0
+
+    func send(_ request: UpstreamRequest) async throws -> UpstreamResponse {
+        lock.withLock { _count += 1 }
+        try await Task.sleep(nanoseconds: 10_000_000_000)
+        return UpstreamResponse(status: 200, headers: [], body: AsyncThrowingStream { $0.finish() })
+    }
+
+    var count: Int { lock.withLock { _count } }
 }
 
 // MARK: - Test client
 
 /// Trusts the test CA without hostname pinning (the client dials 127.0.0.1 while
 /// the leaf is issued for openrouter.ai).
-private class TrustDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
+class TrustDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
     let anchors: [SecCertificate]
 
     init(caPEM: String) {
@@ -184,7 +199,8 @@ private struct Harness: @unchecked Sendable {
 private func startHarness(
     settings: Settings,
     replies: [FakeReply],
-    fetcher: FakeEndpointsFetcher = FakeEndpointsFetcher(hasFlex: true)
+    fetcher: FakeEndpointsFetcher = FakeEndpointsFetcher(hasFlex: true),
+    maxBodyBytes: Int = 32 * 1024 * 1024
 ) async throws -> Harness {
     let directory = FileManager.default.temporaryDirectory.appending(path: "openproxy-proxy-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -195,7 +211,7 @@ private func startHarness(
     let upstream = FakeUpstreamClient(replies)
     let stats = try StatsStore(path: ":memory:")
     let server = ProxyServer(
-        config: ProxyConfig(bindHost: "127.0.0.1", port: 0),
+        config: ProxyConfig(bindHost: "127.0.0.1", port: 0, maxBodyBytes: maxBodyBytes),
         ca: ca,
         upstream: upstream,
         catalog: TierCatalog(fetcher: fetcher),
@@ -222,9 +238,11 @@ private func withServer(
     settings: Settings = Settings(),
     replies: [FakeReply],
     fetcher: FakeEndpointsFetcher = FakeEndpointsFetcher(hasFlex: true),
+    maxBodyBytes: Int = 32 * 1024 * 1024,
     _ body: (Harness) async throws -> Void
 ) async throws {
-    let harness = try await startHarness(settings: settings, replies: replies, fetcher: fetcher)
+    let harness = try await startHarness(
+        settings: settings, replies: replies, fetcher: fetcher, maxBodyBytes: maxBodyBytes)
     do {
         try await body(harness)
     } catch {
@@ -238,9 +256,114 @@ private func withServer(
     try? FileManager.default.removeItem(at: harness.directory)
 }
 
+/// Starts a ProxyServer with an arbitrary (non-fake) upstream, for tests that
+/// need to control cancellation or slow behaviour in `send`.
+private func withCustomUpstream(
+    settings: Settings,
+    upstream: UpstreamClient,
+    stats: StatsStore,
+    _ body: (ProxyServer, Int) async throws -> Void
+) async throws {
+    let directory = FileManager.default.temporaryDirectory.appending(path: "openproxy-cust-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let ca = CertAuthority(directory: directory)
+    try ca.loadOrCreate()
+    let server = ProxyServer(
+        config: ProxyConfig(bindHost: "127.0.0.1", port: 0),
+        ca: ca,
+        upstream: upstream,
+        catalog: TierCatalog(fetcher: FakeEndpointsFetcher(hasFlex: true)),
+        stats: stats,
+        settings: { settings })
+    try await server.start()
+    do {
+        try await body(server, server.boundPort)
+    } catch {
+        await server.stop()
+        try? FileManager.default.removeItem(at: directory)
+        throw error
+    }
+    await server.stop()
+    try? FileManager.default.removeItem(at: directory)
+}
+
 // MARK: - Helpers
 
 private struct TimeoutError: Error {}
+
+private struct TestFailure: Error {}
+
+private func openRawTLSChannel(port: Int, group: EventLoopGroup) async throws -> Channel {
+    var tls = TLSConfiguration.makeClientConfiguration()
+    tls.certificateVerification = .none
+    let context = try NIOSSLContext(configuration: tls)
+    return try await ClientBootstrap(group: group)
+        .channelInitializer { channel in
+            do {
+                try channel.pipeline.syncOperations.addHandler(
+                    NIOSSLClientHandler(context: context, serverHostname: "openrouter.ai"))
+                return channel.eventLoop.makeSucceededVoidFuture()
+            } catch {
+                return channel.eventLoop.makeFailedFuture(error)
+            }
+        }
+        .connect(host: "127.0.0.1", port: port).get()
+}
+
+/// Same as `openRawTLSChannel` but appends a monitor that records every byte the
+/// server sends, so a test can read the raw response stream.
+private func openRawTLSChannel(
+    port: Int, group: EventLoopGroup, monitor: Bool
+) async throws -> (Channel, ByteMonitor) {
+    var tls = TLSConfiguration.makeClientConfiguration()
+    tls.certificateVerification = .none
+    let context = try NIOSSLContext(configuration: tls)
+    let monitor = ByteMonitor()
+    let channel = try await ClientBootstrap(group: group)
+        .channelInitializer { channel in
+            do {
+                try channel.pipeline.syncOperations.addHandler(
+                    NIOSSLClientHandler(context: context, serverHostname: "openrouter.ai"))
+                try channel.pipeline.syncOperations.addHandler(monitor)
+                return channel.eventLoop.makeSucceededVoidFuture()
+            } catch {
+                return channel.eventLoop.makeFailedFuture(error)
+            }
+        }
+        .connect(host: "127.0.0.1", port: port).get()
+    return (channel, monitor)
+}
+
+final class ByteMonitor: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    private let lock = NSLock()
+    private var _received = Data()
+    private var _closed = false
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        lock.withLock { _received.append(Data(unwrapInboundIn(data).readableBytesView)) }
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        lock.withLock { _closed = true }
+    }
+
+    var received: Data { lock.withLock { _received } }
+    var closed: Bool { lock.withLock { _closed } }
+}
+
+private func writePipelinedRequests(
+    _ requests: [(path: String, body: Data)], on channel: Channel
+) async throws {
+    var buffer = channel.allocator.buffer(capacity: 512)
+    for request in requests {
+        buffer.writeString(
+            "POST \(request.path) HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                + "Content-Length: \(request.body.count)\r\n\r\n")
+        buffer.writeBytes(request.body)
+    }
+    try await channel.writeAndFlush(buffer).get()
+}
 
 private func waitUntil(_ condition: @Sendable () -> Bool, timeout: TimeInterval) async -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
@@ -249,6 +372,17 @@ private func waitUntil(_ condition: @Sendable () -> Bool, timeout: TimeInterval)
         try? await Task.sleep(nanoseconds: 10_000_000)
     }
     return condition()
+}
+
+/// Polls a condition that must stay false for the window (e.g. "no second request
+/// was started"). A bounded wait is the only way to assert a non-event.
+private func staysFalse(_ condition: @Sendable () -> Bool, within timeout: TimeInterval) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return false }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    return !condition()
 }
 
 private func json(_ data: Data) -> [String: Any] {
@@ -261,6 +395,45 @@ private let chatPath = "/api/v1/chat/completions"
 
 @Suite("ProxyServer")
 struct ProxyServerTests {
+    @Test func nonStreamingResponseFactsAreRecorded() async throws {
+        let factsBody = Data(
+            #"{"service_tier":"flex","provider":"Anthropic","usage":{"prompt_tokens":12,"completion_tokens":7,"cost":0.0021}}"#.utf8)
+        let reply = FakeReply(status: 200, headers: [("content-type", "application/json")], body: factsBody)
+        try await withServer(replies: [reply]) { harness in
+            let response = try await harness.request(
+                "POST", chatPath, body: Data(#"{"model":"openai/gpt-5"}"#.utf8))
+            #expect(response.status == 200)
+            #expect(await waitUntil({ harness.stats.summary(since: .distantPast).total == 1 }, timeout: 2))
+            let summary = harness.stats.summary(since: .distantPast)
+            #expect(summary.byActualTier["flex"] == 1)
+            #expect(summary.byProvider["Anthropic"] == 1)
+            #expect(abs(summary.totalCostUSD - 0.0021) < 1e-9)
+        }
+    }
+
+    @Test func streamingResponseFactsAreRecordedAcrossChunkBoundaries() async throws {
+        let reply = FakeReply(
+            status: 200, headers: [("content-type", "text/event-stream")],
+            stream: { _ in
+                AsyncThrowingStream { continuation in
+                    // Lines are split mid-JSON to exercise the rolling window.
+                    continuation.yield(Data("data: {\"service_tier\":\"fl".utf8))
+                    continuation.yield(Data("ex\",\"provider\":\"Anthropic\"}\n\n".utf8))
+                    continuation.yield(Data("data: {\"usage\":{\"cost\":0.001}}\n\n".utf8))
+                    continuation.finish()
+                }
+            })
+        try await withServer(replies: [reply]) { harness in
+            _ = try await harness.request(
+                "POST", chatPath, body: Data(#"{"model":"openai/gpt-5","stream":true}"#.utf8))
+            #expect(await waitUntil({ harness.stats.summary(since: .distantPast).total == 1 }, timeout: 2))
+            let summary = harness.stats.summary(since: .distantPast)
+            #expect(summary.byActualTier["flex"] == 1)
+            #expect(summary.byProvider["Anthropic"] == 1)
+            #expect(abs(summary.totalCostUSD - 0.001) < 1e-9)
+        }
+    }
+
     @Test func rewriteAppliedBeforeForwarding() async throws {
         let settings = Settings(enabled: true, sort: .throughput)
         try await withServer(settings: settings, replies: [FakeReply()]) { harness in
@@ -272,12 +445,39 @@ struct ProxyServerTests {
         }
     }
 
+    @Test func rewrittenBodyReframesContentLengthForRealUpstream() async throws {
+        let settings = Settings(enabled: true, sort: .throughput)
+        try await withWireServer(settings: settings) { wire in
+            let body = Data(#"{"model":"openai/gpt-5"}"#.utf8)
+            let response = try await wire.request("POST", chatPath, body: body)
+            #expect(response.status == 200)
+            let received = try #require(wire.upstream.received.first)
+            let rewritten = received.body
+            #expect(json(rewritten)["model"] as? String == "openai/gpt-5:nitro")
+            #expect(rewritten.count != body.count)  // the rewrite changed the length
+            #expect(received.header("content-length") == String(rewritten.count))
+            #expect(received.header("transfer-encoding") == nil)
+        }
+    }
+
     @Test func nonRewritablePathPassesThroughByteIdentical() async throws {
         let settings = Settings(enabled: true, sort: .throughput)
-        try await withServer(settings: settings, replies: [FakeReply()]) { harness in
+        try await withWireServer(settings: settings) { wire in
             let body = Data(#"{"model":"openai/gpt-5","input":"hi"}"#.utf8)
-            _ = try await harness.request("POST", "/api/v1/embeddings", body: body)
-            #expect(harness.upstream.requests[0].body == body)
+            let response = try await wire.request(
+                "POST", "/api/v1/embeddings", body: body,
+                headers: ["Content-Type": "application/json", "X-Trace": "abc"])
+            #expect(response.status == 200)
+            // Assert on what actually reached the wire through the real NIO client.
+            let received = try #require(wire.upstream.received.first)
+            #expect(received.method == "POST")
+            #expect(received.uri == "/api/v1/embeddings")
+            #expect(received.body == body)
+            #expect(received.header("content-length") == String(body.count))
+            #expect(received.header("transfer-encoding") == nil)
+            #expect(received.header("content-type") == "application/json")
+            #expect(received.header("x-trace") == "abc")
+            #expect(received.header("host") == "openrouter.ai:\(wire.upstream.port)")
         }
     }
 
@@ -410,6 +610,71 @@ struct ProxyServerTests {
         }
     }
 
+    @Test func expect100ContinueIsAnsweredAndStrippedUpstream() async throws {
+        let body = Data(#"{"model":"x"}"#.utf8)
+        try await withServer(replies: [FakeReply(status: 200, body: Data("ok".utf8))]) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let (channel, monitor) = try await openRawTLSChannel(port: harness.port, group: group, monitor: true)
+
+            var head = channel.allocator.buffer(capacity: 256)
+            head.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                    + "Expect: 100-continue\r\nContent-Length: \(body.count)\r\n\r\n")
+            try await channel.writeAndFlush(head).get()
+
+            // The client waits for 100 before sending the body; the proxy must release it.
+            #expect(await waitUntil({ monitor.received.range(of: Data("100 Continue".utf8)) != nil }, timeout: 2))
+            var bodyBuffer = channel.allocator.buffer(capacity: body.count)
+            bodyBuffer.writeBytes(body)
+            try await channel.writeAndFlush(bodyBuffer).get()
+
+            #expect(await waitUntil({ monitor.received.range(of: Data("200 OK".utf8)) != nil }, timeout: 2))
+            let received = try #require(harness.upstream.requests.first)
+            #expect(received.body == body)
+            #expect(!received.headers.contains { $0.0.lowercased() == "expect" })
+            try await channel.close().get()
+        }
+    }
+
+    @Test func pipelinedRequestsAreSerializedPerConnection() async throws {
+        let gate = Signal()
+        let first = FakeReply(
+            status: 200, headers: [("content-type", "application/json")],
+            stream: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield(Data("first".utf8))
+                    let task = Task {
+                        await gate.wait()
+                        continuation.finish()
+                    }
+                    continuation.onTermination = { _ in task.cancel() }
+                }
+            })
+        let second = FakeReply(
+            status: 200, headers: [("content-type", "application/json")], body: Data("second".utf8))
+        try await withServer(replies: [first, second]) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let channel = try await openRawTLSChannel(port: harness.port, group: group)
+            try await writePipelinedRequests(
+                [
+                    (path: chatPath, body: Data(#"{"model":"a"}"#.utf8)),
+                    (path: chatPath, body: Data(#"{"model":"b"}"#.utf8)),
+                ],
+                on: channel)
+
+            #expect(await waitUntil({ harness.upstream.requests.count >= 1 }, timeout: 2))
+            // The second pipelined request must not reach upstream while the first response is open.
+            #expect(await staysFalse({ harness.upstream.requests.count >= 2 }, within: 0.4))
+
+            // Closing the socket cancels the in-flight request; the queued one never runs.
+            try await channel.close().get()
+            #expect(await waitUntil({ harness.upstream.cancels.contains { $0.cancelled } }, timeout: 1))
+            #expect(harness.upstream.requests.count == 1)
+        }
+    }
+
     @Test func flexRetriesCapacityFailureThenSucceeds() async throws {
         let settings = Settings(enabled: true, sort: .balanced, tier: .flex)
         let replies = [FakeReply(status: 503), FakeReply(status: 200, body: Data(#"{"ok":true}"#.utf8))]
@@ -443,13 +708,288 @@ struct ProxyServerTests {
         }
     }
 
-    @Test func nonLoopbackPeerRejected() throws {
-        let foreign = try SocketAddress(ipAddress: "10.0.0.1", port: 1234)
+    @Test func slowConsumerDoesNotBufferResponseUnboundedly() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-big-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let ca = CertAuthority(directory: directory)
+        try ca.loadOrCreate()
+        let upstream = try RecordingUpstream(ca: ca, body: Data(repeating: 0x41, count: 4 * 1024 * 1024))
+        do {
+            try await upstream.start()
+            let client = NIOUpstreamClient(
+                resolver: StaticResolver(addresses: ["127.0.0.1"]),
+                host: "openrouter.ai", port: upstream.port,
+                trustRoots: [upstream.caCertificate], allowLoopback: true)
+            let response = try await client.send(
+                UpstreamRequest(method: "GET", path: "/big", headers: [], body: Data()))
+            var iterator = response.body.makeAsyncIterator()
+            _ = try await iterator.next()  // read one chunk, then stop pulling
+            // An unbounded reader would have the whole 4 MiB in memory by now.
+            #expect(await staysFalse({ response.bufferedBytes > 512 * 1024 }, within: 0.4))
+            while try await iterator.next() != nil {}
+        } catch {
+            await upstream.stop()
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        await upstream.stop()
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @Test func upstreamBodyErrorClosesDownstream() async throws {
+        let reply = FakeReply(
+            status: 200, headers: [("content-type", "text/event-stream")],
+            stream: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield(Data("partial".utf8))
+                    continuation.finish(throwing: TestFailure())
+                }
+            })
+        try await withServer(replies: [reply]) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let (channel, monitor) = try await openRawTLSChannel(
+                port: harness.port, group: group, monitor: true)
+            let body = Data(#"{"model":"x","stream":true}"#.utf8)
+            var buffer = channel.allocator.buffer(capacity: 256)
+            buffer.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                    + "Content-Length: \(body.count)\r\n\r\n")
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(buffer).get()
+
+            #expect(await waitUntil({ monitor.received.range(of: Data("partial".utf8)) != nil }, timeout: 2))
+            // A failed upstream body must not end with a clean terminator: the
+            // proxy closes the connection so the client sees a truncated response.
+            #expect(await waitUntil({ monitor.closed }, timeout: 2))
+            #expect(monitor.received.range(of: Data("0\r\n\r\n".utf8)) == nil)
+            try? await channel.close().get()
+        }
+    }
+
+    @Test func clientDisconnectBeforeHeadDoesNotRetryOrFallback() async throws {
+        let settings = Settings(
+            enabled: true, sort: .balanced, tier: .flex,
+            flex: FlexPolicy(fallback: true, attempts: 3))
+        let upstream = SlowCancelClient()
+        try await withCustomUpstream(
+            settings: settings, upstream: upstream, stats: try StatsStore(path: ":memory:")
+        ) { _, port in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let channel = try await openRawTLSChannel(port: port, group: group)
+            let body = Data(#"{"model":"openai/gpt-5","stream":true}"#.utf8)
+            var buffer = channel.allocator.buffer(capacity: 256)
+            buffer.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer x\r\n"
+                    + "Content-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n")
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(buffer).get()
+
+            #expect(await waitUntil({ upstream.count >= 1 }, timeout: 2))
+            try await channel.close().get()
+            // A client disconnect must cancel, not trigger a retry or a fallback send.
+            #expect(await staysFalse({ upstream.count > 1 }, within: 0.4))
+        }
+    }
+
+    @Test func requestHopByHopHeadersAreStripped() async throws {
+        try await withServer(replies: [FakeReply()]) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let channel = try await openRawTLSChannel(port: harness.port, group: group)
+            let body = Data(#"{"model":"openai/gpt-5"}"#.utf8)
+            var buffer = channel.allocator.buffer(capacity: 512)
+            buffer.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    + "Connection: keep-alive, x-custom\r\nX-Custom: secret\r\n"
+                    + "Proxy-Authorization: Basic abc\r\nTE: trailers\r\nUpgrade: h2c\r\n"
+                    + "X-Keep: yes\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n")
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(buffer).get()
+
+            #expect(await waitUntil({ !harness.upstream.requests.isEmpty }, timeout: 2))
+            let names = Set(harness.upstream.requests[0].headers.map { $0.0.lowercased() })
+            for gone in ["connection", "x-custom", "proxy-authorization", "te", "upgrade"] {
+                #expect(!names.contains(gone))
+            }
+            #expect(names.contains("x-keep"))
+            try? await channel.close().get()
+        }
+    }
+
+    @Test func responseConnectionNominatedHeadersAreStripped() async throws {
+        let reply = FakeReply(
+            status: 200,
+            headers: [
+                ("content-type", "application/json"),
+                ("connection", "close, x-resp"),
+                ("x-resp", "up"),
+                ("proxy-authenticate", "Basic realm=x"),
+                ("keep-alive", "timeout=5"),
+            ],
+            body: Data("{}".utf8))
+        try await withServer(replies: [reply]) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let (channel, monitor) = try await openRawTLSChannel(
+                port: harness.port, group: group, monitor: true)
+            let body = Data(#"{"model":"openai/gpt-5"}"#.utf8)
+            var buffer = channel.allocator.buffer(capacity: 256)
+            buffer.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                    + "Content-Length: \(body.count)\r\n\r\n")
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(buffer).get()
+
+            #expect(await waitUntil({ monitor.received.range(of: Data("200 OK".utf8)) != nil }, timeout: 2))
+            let head = String(decoding: monitor.received, as: UTF8.self).lowercased()
+            #expect(head.contains("content-type"))
+            #expect(!head.contains("x-resp"))
+            #expect(!head.contains("proxy-authenticate"))
+            #expect(!head.contains("keep-alive"))
+            try? await channel.close().get()
+        }
+    }
+
+    @Test func oversizedRequestBodyIsRejectedWith413() async throws {
+        try await withServer(replies: [FakeReply()], maxBodyBytes: 64) { harness in
+            let response = try await harness.request(
+                "POST", chatPath, body: Data(repeating: 0x41, count: 1024))
+            #expect(response.status == 413)
+            #expect(harness.upstream.requests.isEmpty)
+        }
+    }
+
+    @Test func catalogNotConsultedUnlessRewritableEnabledAndTiered() async throws {
+        let fetcher = FakeEndpointsFetcher(hasFlex: true)
+        let body = Data(#"{"model":"openai/gpt-5"}"#.utf8)
+        let auth = ["Authorization": "Bearer x"]
+
+        // Non-rewritable path: no lookup even for a tier that needs availability.
+        try await withServer(
+            settings: Settings(enabled: true, tier: .flex), replies: [FakeReply()], fetcher: fetcher
+        ) { harness in
+            _ = try await harness.request("POST", "/api/v1/embeddings", body: body, headers: auth)
+        }
+        #expect(fetcher.calls.isEmpty)
+
+        // Disabled: no lookup.
+        try await withServer(
+            settings: Settings(enabled: false, tier: .flex), replies: [FakeReply()], fetcher: fetcher
+        ) { harness in
+            _ = try await harness.request("POST", chatPath, body: body, headers: auth)
+        }
+        #expect(fetcher.calls.isEmpty)
+
+        // auto tier needs no availability.
+        try await withServer(
+            settings: Settings(enabled: true, tier: .auto), replies: [FakeReply()], fetcher: fetcher
+        ) { harness in
+            _ = try await harness.request("POST", chatPath, body: body, headers: auth)
+        }
+        #expect(fetcher.calls.isEmpty)
+
+        // Flex on a rewritable enabled path does look up.
+        try await withServer(
+            settings: Settings(enabled: true, tier: .flex), replies: [FakeReply()], fetcher: fetcher
+        ) { harness in
+            _ = try await harness.request("POST", chatPath, body: body, headers: auth)
+        }
+        #expect(fetcher.calls == ["openai/gpt-5"])
+    }
+
+    @Test func upstreamHostHeaderIsTheConfiguredAuthority() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-host-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let ca = CertAuthority(directory: directory)
+        try ca.loadOrCreate()
+        let upstream = try RecordingUpstream(ca: ca)
+        do {
+            try await upstream.start()
+            let client = NIOUpstreamClient(
+                resolver: StaticResolver(addresses: ["127.0.0.1"]),
+                host: "openrouter.ai", port: upstream.port,
+                trustRoots: [upstream.caCertificate], allowLoopback: true)
+            _ = try await client.send(UpstreamRequest(
+                method: "GET", path: "/api/v1/models",
+                headers: [("Host", "evil.example.com")], body: Data()))
+            let received = try #require(upstream.received.first)
+            #expect(received.header("host") == "openrouter.ai:\(upstream.port)")
+        } catch {
+            await upstream.stop()
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        await upstream.stop()
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @Test func tlsMinimumVersionIs12OnServerAndClient() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-tls-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let ca = CertAuthority(directory: directory)
+        try ca.loadOrCreate()
+
+        let serverConfig = try ProxyServer.serverTLSConfiguration(ca.leaf())
+        #expect(serverConfig.minimumTLSVersion == .tlsv12)
+        let client = NIOUpstreamClient(resolver: StaticResolver(addresses: []))
+        #expect(client.minimumTLSVersion == .tlsv12)
+    }
+
+    @Test func flexFailureRecordsRealAttemptsAndFallback() async throws {
+        let settings = Settings(
+            enabled: true, sort: .balanced, tier: .flex,
+            flex: FlexPolicy(
+                fallback: true, attempts: 2, firstByteTimeout: 0.05, nonStreamingTimeout: 0.05))
+        let upstream = SlowCancelClient()
+        let stats = try StatsStore(path: ":memory:")
+        try await withCustomUpstream(settings: settings, upstream: upstream, stats: stats) { _, port in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let (channel, monitor) = try await openRawTLSChannel(
+                port: port, group: group, monitor: true)
+            let body = Data(#"{"model":"openai/gpt-5","stream":true}"#.utf8)
+            var buffer = channel.allocator.buffer(capacity: 256)
+            buffer.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer x\r\n"
+                    + "Content-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n")
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(buffer).get()
+
+            #expect(await waitUntil({ monitor.received.range(of: Data("502".utf8)) != nil }, timeout: 3))
+            #expect(upstream.count == 3)  // 2 flex attempts + 1 fallback
+            #expect(await waitUntil({ stats.summary(since: .distantPast).total == 1 }, timeout: 2))
+            // usedFallback was previously always false on the error path.
+            #expect(stats.summary(since: .distantPast).fallbackCount == 1)
+            try? await channel.close().get()
+        }
+    }
+
+    @Test func nonLoopbackPeerRejected() throws {        let foreign = try SocketAddress(ipAddress: "10.0.0.1", port: 1234)
         let loopback = try SocketAddress(ipAddress: "127.0.0.1", port: 1234)
         #expect(!ProxyServer.isAllowedPeer(foreign, allowNonLoopback: false))
         #expect(ProxyServer.isAllowedPeer(loopback, allowNonLoopback: false))
         #expect(ProxyServer.isAllowedPeer(foreign, allowNonLoopback: true))
         #expect(!ProxyServer.isAllowedPeer(nil, allowNonLoopback: false))
+    }
+
+    @Test(arguments: [
+        "0.0.0.0", "127.0.0.1", "127.5.0.1", "169.254.1.1", "224.0.0.1",
+        "255.255.255.255", "240.0.0.1", "::", "::1", "fe80::1", "fe80::1%en0",
+        "::ffff:127.0.0.1", "ff02::1", "not-an-ip", "999.1.1.1",
+    ])
+    func forbiddenAddressRejected(address: String) {
+        #expect(NIOUpstreamClient.isForbiddenAddress(address))
+    }
+
+    @Test(arguments: ["1.2.3.4", "8.8.8.8", "2606:4700:4700::1111", "2001:4860:4860::8888"])
+    func publicAddressAllowed(address: String) {
+        #expect(!NIOUpstreamClient.isForbiddenAddress(address))
     }
 
     @Test func nioUpstreamClientRejectsLoopbackResolverAnswer() async {

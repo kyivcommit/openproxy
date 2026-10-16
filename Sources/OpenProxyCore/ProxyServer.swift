@@ -8,24 +8,25 @@ public struct ProxyConfig: Sendable {
     public var bindHost = "0.0.0.0"
     public var port = 443
     public var allowNonLoopbackPeers = false
+    /// Largest request body buffered for rewriting; larger requests get a 413.
+    public var maxBodyBytes = 32 * 1024 * 1024
 
     public init() {}
 
-    public init(bindHost: String, port: Int, allowNonLoopbackPeers: Bool = false) {
+    public init(
+        bindHost: String, port: Int, allowNonLoopbackPeers: Bool = false,
+        maxBodyBytes: Int = 32 * 1024 * 1024
+    ) {
         self.bindHost = bindHost
         self.port = port
         self.allowNonLoopbackPeers = allowNonLoopbackPeers
+        self.maxBodyBytes = maxBodyBytes
     }
 }
 
 /// The TLS interceptor: terminates the client's TLS, applies the Sort/Tier policy,
 /// forwards to the real OpenRouter, and streams the response back untouched.
 public final class ProxyServer: @unchecked Sendable {
-    private static let hopByHopHeaders: Set<String> = [
-        "connection", "keep-alive", "transfer-encoding", "upgrade",
-        "proxy-connection", "proxy-authenticate", "te", "trailer",
-    ]
-
     private let config: ProxyConfig
     private let ca: CertAuthority
     private let upstream: UpstreamClient
@@ -36,6 +37,8 @@ public final class ProxyServer: @unchecked Sendable {
     private var channel: Channel?
 
     public private(set) var boundPort = 0
+
+    var maxBodyBytes: Int { config.maxBodyBytes }
 
     public init(
         config: ProxyConfig = ProxyConfig(),
@@ -112,8 +115,13 @@ public final class ProxyServer: @unchecked Sendable {
         // The policy applies only to POSTs to the rewritable paths; everything else
         // passes through byte-for-byte and never triggers a TierCatalog lookup.
         let isRewritable = requestHead.method == .POST
+        // Only consult the catalog when the policy could actually inject a tier.
+        let needsAvailability = isRewritable
+            && settings.enabled
+            && Rewriter.rewritablePaths.contains(path)
+            && (settings.tier == .priority || settings.tier == .flex)
         var availability: TierAvailability?
-        if isRewritable, let model {
+        if needsAvailability, let model {
             // Missing Authorization makes the catalog return nil without a fetch.
             availability = await catalog.availability(model: model, authorization: authorization)
         }
@@ -121,9 +129,20 @@ public final class ProxyServer: @unchecked Sendable {
             ? Rewriter.rewrite(path: path, body: body, settings: settings, availability: availability)
             : RewriteResult(body: body, model: model)
 
-        let headers: [(String, String)] = requestHead.headers.map { ($0.name, $0.value) }
         let method = requestHead.method.rawValue
-
+        // Framing is ours: the client's Content-Length describes its body, not the
+        // rewritten one, and we always forward a fixed-length (buffered) body.
+        let declaresBody = requestHead.headers.contains {
+            let name = $0.name.lowercased()
+            return name == "content-length" || name == "transfer-encoding"
+        }
+        let baseHeaders = HeaderFilter.stripHopByHop(requestHead.headers.map { ($0.name, $0.value) })
+            .filter { header in
+                let name = header.0.lowercased()
+                // `expect` is consumed here (we answered 100 ourselves); forwarding
+                // it would make the upstream wait for a continuation that never comes.
+                return name != "content-length" && name != "expect"
+            }
         let response: UpstreamResponse
         var retries = 0
         var usedFallback = false
@@ -135,7 +154,9 @@ public final class ProxyServer: @unchecked Sendable {
                     flexBody: rewrite.body, plainBody: plain
                 ) { [self] body, timeout in
                     try await sendUpstream(
-                        UpstreamRequest(method: method, path: requestHead.uri, headers: headers, body: body),
+                        Self.upstreamRequest(
+                            method: method, uri: requestHead.uri, baseHeaders: baseHeaders,
+                            declaresBody: declaresBody, body: body),
                         timeout: timeout)
                 }
                 response = outcome.response
@@ -143,21 +164,32 @@ public final class ProxyServer: @unchecked Sendable {
                 usedFallback = outcome.usedFallback
             } else {
                 response = try await upstream.send(
-                    UpstreamRequest(method: method, path: requestHead.uri, headers: headers, body: rewrite.body))
+                    Self.upstreamRequest(
+                        method: method, uri: requestHead.uri, baseHeaders: baseHeaders,
+                        declaresBody: declaresBody, body: rewrite.body))
             }
         } catch {
+            // A cancelled request is a client disconnect, not an upstream failure:
+            // do not fabricate a 502 or record one.
+            if Task.isCancelled || error is CancellationError { return }
+            let failure = error as? FlexFailure
             await writeError(status: 502, message: "upstream unavailable", channel: channel)
             record(started: started, path: path, rewrite: rewrite, settings: settings,
-                   status: 502, retries: retries, usedFallback: usedFallback)
+                   status: 502, retries: max(0, (failure?.attempts ?? 0) - 1),
+                   usedFallback: failure?.usedFallback ?? false,
+                   ttfbMs: Int(Date().timeIntervalSince(started) * 1000))
             return
         }
 
         let ttfbMs = Int(Date().timeIntervalSince(started) * 1000)
         writeResponseHead(response, channel: channel)
+        var finalStatus = response.status
+        let tap = ResponseTap(streaming: Self.isStreaming(body))
         do {
             try await withTaskCancellationHandler {
                 for try await chunk in response.body {
                     try Task.checkCancellation()
+                    tap.consume(chunk)
                     if !chunk.isEmpty { try await writeBody(chunk, channel: channel) }
                 }
             } onCancel: {
@@ -166,10 +198,14 @@ public final class ProxyServer: @unchecked Sendable {
             }
             try? await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
         } catch {
-            // The client is gone or the upstream died mid-stream; nothing left to send.
+            // The upstream body failed after the head: no clean terminator is
+            // possible, so close the connection and record the failure.
+            if !(error is CancellationError) && !Task.isCancelled { finalStatus = 502 }
+            channel.close(promise: nil)
         }
         record(started: started, path: path, rewrite: rewrite, settings: settings,
-               status: response.status, retries: retries, usedFallback: usedFallback, ttfbMs: ttfbMs)
+               status: finalStatus, retries: retries, usedFallback: usedFallback, ttfbMs: ttfbMs,
+               facts: tap.finish())
     }
 
     /// Runs one upstream send with a first-byte timeout, surfacing a `FlexTimeout`
@@ -185,6 +221,10 @@ public final class ProxyServer: @unchecked Sendable {
             do {
                 return try await sendTask.value
             } catch {
+                // A client disconnect cancels this task; that is not a retryable
+                // upstream timeout, so surface it as cancellation and stop the
+                // Flex policy from retrying or falling back.
+                if Task.isCancelled { throw CancellationError() }
                 if sendTask.isCancelled { throw FlexTimeout(cancelUpstream: { sendTask.cancel() }) }
                 throw error
             }
@@ -195,10 +235,21 @@ public final class ProxyServer: @unchecked Sendable {
 
     // MARK: - Response writing
 
+    /// Builds the forward request with our own framing: the buffered body's
+    /// Content-Length, and no client Transfer-Encoding.
+    private static func upstreamRequest(
+        method: String, uri: String, baseHeaders: [(String, String)],
+        declaresBody: Bool, body: Data
+    ) -> UpstreamRequest {
+        var headers = baseHeaders
+        if declaresBody || !body.isEmpty { headers.append(("Content-Length", String(body.count))) }
+        return UpstreamRequest(method: method, path: uri, headers: headers, body: body)
+    }
+
     private func writeResponseHead(_ response: UpstreamResponse, channel: Channel) {
         var headers = HTTPHeaders()
         var hasLength = false
-        for (name, value) in response.headers where !Self.hopByHopHeaders.contains(name.lowercased()) {
+        for (name, value) in HeaderFilter.stripHopByHop(response.headers) {
             if name.lowercased() == "content-length" { hasLength = true }
             headers.add(name: name, value: value)
         }
@@ -215,7 +266,7 @@ public final class ProxyServer: @unchecked Sendable {
         try await channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer))).get()
     }
 
-    private func writeError(status: Int, message: String, channel: Channel) async {
+    func writeError(status: Int, message: String, channel: Channel) async {
         let body = Data(#"{"error":"\#(message)"}"#.utf8)
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: "application/json")
@@ -232,13 +283,16 @@ public final class ProxyServer: @unchecked Sendable {
 
     private func record(
         started: Date, path: String, rewrite: RewriteResult, settings: Settings,
-        status: Int, retries: Int, usedFallback: Bool, ttfbMs: Int = 0
+        status: Int, retries: Int, usedFallback: Bool, ttfbMs: Int = 0,
+        facts: ResponseFacts = ResponseFacts()
     ) {
         stats.record(RequestRecord(
             time: started, path: path, model: rewrite.model, sort: settings.sort, tier: settings.tier,
-            actualTier: nil, provider: nil, status: status, ttfbMs: ttfbMs, retries: retries,
-            usedFallback: usedFallback,
-            skippedReason: rewrite.skipped["service_tier"] ?? rewrite.skipped.values.first))
+            actualTier: facts.actualTier, provider: facts.provider, status: status, ttfbMs: ttfbMs,
+            retries: retries, usedFallback: usedFallback,
+            skippedReason: rewrite.skipped["service_tier"] ?? rewrite.skipped.values.first,
+            promptTokens: facts.promptTokens, completionTokens: facts.completionTokens,
+            costUSD: facts.costUSD))
     }
 
     static func isStreaming(_ body: Data) -> Bool {
@@ -246,27 +300,42 @@ public final class ProxyServer: @unchecked Sendable {
         return object["stream"] as? Bool == true
     }
 
-    private static func makeSSLContext(
+    static func serverTLSConfiguration(
         _ leaf: (certificatePEM: String, privateKeyPEM: String)
-    ) throws -> NIOSSLContext {
+    ) throws -> TLSConfiguration {
         let certificate = try NIOSSLCertificate(bytes: Array(leaf.certificatePEM.utf8), format: .pem)
         let key = try NIOSSLPrivateKey(bytes: Array(leaf.privateKeyPEM.utf8), format: .pem)
         var tls = TLSConfiguration.makeServerConfiguration(
             certificateChain: [.certificate(certificate)], privateKey: .privateKey(key))
         tls.applicationProtocols = ["http/1.1"]
-        return try NIOSSLContext(configuration: tls)
+        tls.minimumTLSVersion = .tlsv12
+        return tls
+    }
+
+    private static func makeSSLContext(
+        _ leaf: (certificatePEM: String, privateKeyPEM: String)
+    ) throws -> NIOSSLContext {
+        try NIOSSLContext(configuration: serverTLSConfiguration(leaf))
     }
 }
 
-/// Buffers one request, then hands it to the server and cancels the handler's
-/// task when the client disconnects (which cancels the upstream stream).
-private final class ProxyConnectionHandler: ChannelInboundHandler {
+/// Buffers one request at a time, then hands it to the server. Requests are
+/// serialized per connection (a response is fully written before the next
+/// request starts), and closing the client connection cancels the in-flight work.
+private final class ProxyConnectionHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
+
+    private struct Request {
+        var head: HTTPRequestHead
+        var body: Data
+    }
 
     private weak var server: ProxyServer?
     private var head: HTTPRequestHead?
     private var body = ByteBuffer()
-    private var task: Task<Void, Never>?
+    private var pending: [Request] = []
+    private var current: Task<Void, Never>?
+    private var exceededBodyLimit = false
 
     init(server: ProxyServer) { self.server = server }
 
@@ -275,28 +344,86 @@ private final class ProxyConnectionHandler: ChannelInboundHandler {
         case .head(let head):
             self.head = head
             self.body.clear()
+            self.exceededBodyLimit = false
+            if let server = self.server,
+               let length = head.headers.first(name: "Content-Length").flatMap(Int.init),
+               length > server.maxBodyBytes {
+                exceededBodyLimit = true
+                rejectTooLarge(context: context, server: server)
+                return
+            }
+            // Release a waiting client before it sends the body; otherwise the
+            // client blocks forever and the request never completes.
+            if head.headers.first(name: "Expect")?.lowercased() == "100-continue" {
+                context.writeAndFlush(
+                    NIOAny(HTTPServerResponsePart.head(
+                        HTTPResponseHead(version: .http1_1, status: .continue))),
+                    promise: nil)
+            }
         case .body(var buffer):
+            guard !exceededBodyLimit, let server = self.server else { return }
+            // Chunked bodies have no Content-Length, so cap as bytes accumulate.
+            if body.readableBytes + buffer.readableBytes > server.maxBodyBytes {
+                exceededBodyLimit = true
+                body.clear()
+                rejectTooLarge(context: context, server: server)
+                return
+            }
             self.body.writeBuffer(&buffer)
         case .end:
             guard let head = self.head, let server = self.server else { return }
-            let body = Data(self.body.readableBytesView)
-            let channel = context.channel
-            task = Task { await server.handle(head: head, body: body, channel: channel) }
+            guard !exceededBodyLimit else { return }
+            pending.append(Request(head: head, body: Data(body.readableBytesView)))
+            pump(channel: context.channel, server: server)
         }
     }
 
+    private func rejectTooLarge(context: ChannelHandlerContext, server: ProxyServer) {
+        let channel = context.channel
+        Task {
+            await server.writeError(status: 413, message: "request body too large", channel: channel)
+            try? await channel.close().get()
+        }
+    }
+
+    /// Starts the next queued request only when nothing else is in flight, so
+    /// responses stay ordered and a client close cancels the one running.
+    private func pump(channel: Channel, server: ProxyServer) {
+        guard current == nil, !pending.isEmpty else { return }
+        let request = pending.removeFirst()
+        current = Task { [weak self] in
+            await server.handle(head: request.head, body: request.body, channel: channel)
+            await self?.finished(channel: channel, server: server)
+        }
+    }
+
+    private func finished(channel: Channel, server: ProxyServer) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            channel.eventLoop.execute {
+                self.current = nil
+                self.pump(channel: channel, server: server)
+                continuation.resume()
+            }
+        }
+    }
+
+    private func cancelAll() {
+        current?.cancel()
+        current = nil
+        pending.removeAll()
+    }
+
     func channelInactive(context: ChannelHandlerContext) {
-        task?.cancel()
-        task = nil
+        cancelAll()
         context.fireChannelInactive()
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
-        task?.cancel()
+        cancelAll()
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        task?.cancel()
+        cancelAll()
         context.close(promise: nil)
     }
 }
