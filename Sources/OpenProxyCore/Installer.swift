@@ -128,6 +128,9 @@ public final class Installer: @unchecked Sendable {
             edit = """
             cat "$hosts" > "$tmp"
             if ! grep -Eq \(quoted(HostsFile.managedLinePattern)) "$tmp"; then
+                if [ -s "$tmp" ] && [ -n "$(tail -c 1 "$tmp")" ]; then
+                    printf '\\n' >> "$tmp"
+                fi
                 printf '%s\\n' \(quoted(HostsFile.entry)) >> "$tmp"
             fi
             """

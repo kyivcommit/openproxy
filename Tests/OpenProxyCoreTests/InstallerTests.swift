@@ -230,6 +230,20 @@ struct InstallerTests {
 
     // MARK: - Quoting: spaces and single quotes must survive the AppleScript/shell layers
 
+    @Test func hostsEditScriptAddsNewlineBeforeAppendingWhenMissing() throws {
+        // `/etc/hosts` without a trailing newline must not have the entry glued onto the last line.
+        let dir = FileManager.default.temporaryDirectory.appending(path: "hosts-nonl-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let hostsPath = dir.appending(path: "hosts").path
+        try Data("127.0.0.1 localhost".utf8).write(to: URL(fileURLWithPath: hostsPath))
+
+        try runShell("set -e\n" + Installer.hostsEditScript(hostsPath: hostsPath, adding: true))
+
+        let text = try String(contentsOfFile: hostsPath, encoding: .utf8)
+        #expect(text == "127.0.0.1 localhost\n\(hostsEntry)\n")
+        #expect(!text.contains("localhost\(hostsEntry)"))
+    }
     @Test func quotesPathsWithSpacesAndSingleQuotes() {
         let path = "/tmp/a b'c/ca.pem"
         let command = Installer.nodeCAEnvCommand(caPEMURL: URL(fileURLWithPath: path))
