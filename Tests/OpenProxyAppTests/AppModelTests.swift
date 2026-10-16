@@ -165,6 +165,8 @@ struct AppModelTests {
 
         #expect(model.warnings.count == 1)
         #expect(model.warnings[0].contains("Install"))
+        // InstallError renders as its message, so the stderr/cancel reason stays readable.
+        #expect(model.warnings[0].contains("user cancelled"))
         #expect(h.runner.scripts.count == 1)
     }
 

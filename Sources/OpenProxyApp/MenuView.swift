@@ -125,7 +125,11 @@ struct MenuView: View {
 
     private func unreachableBlock(_ message: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("⚠︎ \(message)").font(.caption).foregroundStyle(.orange)
+            Text("⚠︎ \(message)")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
             Button("Uninstall") { Task { await model.uninstall() } }
         }
     }
@@ -134,7 +138,12 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Warnings").font(.headline)
             ForEach(model.warnings, id: \.self) { warning in
-                Text("⚠︎ \(warning)").font(.caption).foregroundStyle(.orange)
+                Text("⚠︎ \(warning)")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    // Command stderr can be long; show it wrapped and selectable, never clipped.
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
         }
     }

@@ -329,6 +329,36 @@ struct InstallerTests {
         #expect(appleScript.contains("\\\\ bye"))
     }
 
+    // MARK: - Item 4: capture stderr, map cancellation, keep the menu message readable
+
+    @Test func osascriptCancellationMapsToClearMessage() {
+        for stderr in ["execution error: User canceled. (-128)", "user cancelled", "error -128"] {
+            let message = OsascriptRunner.failureMessage(terminationStatus: 1, stderr: stderr)
+            #expect(message.lowercased().contains("cancel"))
+        }
+    }
+
+    @Test func osascriptFailureIncludesTrimmedAndCappedStderr() {
+        let short = OsascriptRunner.failureMessage(
+            terminationStatus: 2, stderr: "   mkdir: permission denied  ")
+        #expect(short == "mkdir: permission denied")
+
+        let long = String(repeating: "x", count: 900)
+        let message = OsascriptRunner.failureMessage(terminationStatus: 1, stderr: "boom\n\(long)\n")
+        #expect(message.hasPrefix("boom"))
+        #expect(message.count <= 501) // capped at 500 plus the ellipsis
+    }
+
+    @Test func osascriptFailureWithoutStderrFallsBackToTheStatus() {
+        let message = OsascriptRunner.failureMessage(terminationStatus: 7, stderr: "   \n")
+        #expect(message.contains("7"))
+    }
+
+    @Test func installErrorDescribesAsItsMessage() {
+        #expect(InstallError.runnerFailed("boom").description == "boom")
+        #expect(String(describing: InstallError.runnerFailed("boom")) == "boom")
+    }
+
     // MARK: - Hosts edit: stop at the first error, never mask it with flushcache
 
     @Test func installScriptStopsAtFirstErrorAndOrdersSteps() async throws {

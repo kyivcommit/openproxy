@@ -72,16 +72,36 @@ public struct OsascriptRunner: PrivilegedRunner {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", Self.appleScript(forShellScript: script)]
+        let errPipe = Pipe()
+        process.standardError = errPipe
         do {
             try process.run()
         } catch {
             throw InstallError.runnerFailed(String(describing: error))
         }
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        if process.terminationStatus != 0 {
-            // The user cancelling the admin dialog also lands here; the UI reports the refusal.
-            throw InstallError.runnerFailed("osascript exited with status \(process.terminationStatus)")
+        guard process.terminationStatus != 0 else { return }
+        throw InstallError.runnerFailed(Self.failureMessage(
+            terminationStatus: process.terminationStatus,
+            stderr: String(decoding: errData, as: UTF8.self)))
+    }
+
+    /// Maps a failed `osascript` run to a clear message: a dismissed admin prompt (`User
+    /// canceled` / `-128`) reads as "cancelled"; anything else carries the trimmed, capped
+    /// stderr so the real reason is visible in the menu.
+    static func failureMessage(terminationStatus: Int32, stderr: String) -> String {
+        if terminatedByUser(stderr) {
+            return "Installation was cancelled: the administrator password prompt was dismissed."
         }
+        let detail = Installer.capped(stderr.trimmingCharacters(in: .whitespacesAndNewlines))
+        return detail.isEmpty ? "osascript exited with status \(terminationStatus)" : detail
+    }
+
+    static func terminatedByUser(_ stderr: String) -> Bool {
+        let lowered = stderr.lowercased()
+        return lowered.contains("user canceled") || lowered.contains("user cancelled")
+            || lowered.contains("-128")
     }
 
     /// Wraps a shell script in an AppleScript `do shell script` string, escaping
@@ -115,6 +135,17 @@ public struct InstallStatus: Equatable, Sendable {
 public enum InstallError: Error, Equatable, Sendable {
     case runnerFailed(String)
     case commandFailed(command: String, status: Int32)
+}
+
+extension InstallError: CustomStringConvertible {
+    /// Renders the human message directly, so the menu shows `boom` and not
+    /// `runnerFailed("boom")`.
+    public var description: String {
+        switch self {
+        case .runnerFailed(let message): return message
+        case .commandFailed(let command, let status): return "Command failed with status \(status): \(command)"
+        }
+    }
 }
 
 /// Installs the CA and the hosts entry for `openrouter.ai`.
