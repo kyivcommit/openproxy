@@ -1,0 +1,165 @@
+import Foundation
+import Testing
+import X509
+import Crypto
+
+@testable import OpenProxyCore
+
+/// Prefer a full OpenSSL (handles name constraints, prints "OK"); fall back to system LibreSSL.
+/// `nil` means openssl is absent and the openssl test is skipped.
+let opensslPath: String? = ["/opt/homebrew/bin/openssl", "/usr/local/bin/openssl", "/usr/bin/openssl"]
+    .first { FileManager.default.isExecutableFile(atPath: $0) }
+
+@Suite("CertAuthority")
+struct CertAuthorityTests {
+    @Test func keyFileMode600() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+
+        let key = directory.appending(path: "ca.key")
+        let attributes = try FileManager.default.attributesOfItem(atPath: key.path)
+        #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        #expect(FileManager.default.fileExists(atPath: authority.caCertificatePEMURL.path))
+    }
+
+    @Test func leafVerifiesAgainstCAForOpenrouter() async throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+        let leaf = try authority.leaf()
+
+        let ca = try Certificate(pemEncoded: String(contentsOf: authority.caCertificatePEMURL))
+        let leafCertificate = try Certificate(pemEncoded: leaf.certificatePEM)
+
+        var verifier = Verifier(rootCertificates: CertificateStore([ca])) {
+            RFC5280Policy()
+            ServerIdentityPolicy(serverHostname: "openrouter.ai", serverIP: nil)
+        }
+        let result = await verifier.validate(leaf: leafCertificate, intermediates: CertificateStore())
+        guard case .validCertificate = result else {
+            Issue.record("openrouter.ai leaf did not verify against its CA (hostname or name constraint failure)")
+            return
+        }
+    }
+
+    @Test func leafForOtherHostRejected() async throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+
+        let ca = try Certificate(pemEncoded: String(contentsOf: authority.caCertificatePEMURL))
+        let caKey = try Certificate.PrivateKey(pemEncoded: String(contentsOf: directory.appending(path: "ca.key")))
+        let other = try Self.makeLeaf(hostname: "example.com", issuer: ca, issuerKey: caKey)
+
+        var verifier = Verifier(rootCertificates: CertificateStore([ca])) {
+            RFC5280Policy()
+        }
+        let result = await verifier.validate(leaf: other, intermediates: CertificateStore())
+        if case .validCertificate = result {
+            Issue.record("a leaf for example.com must be rejected by the CA name constraint")
+        }
+    }
+
+    @Test func regeneratesNearExpiry() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+
+        let day0 = Date()
+        let first = try authority.leaf(now: day0)
+        let cached = try authority.leaf(now: day0.addingTimeInterval(30 * 86_400))
+        #expect(first.certificatePEM == cached.certificatePEM)
+
+        let regenerated = try authority.leaf(now: day0.addingTimeInterval(61 * 86_400))
+        #expect(regenerated.certificatePEM != first.certificatePEM)
+    }
+
+    @Test func reloadKeepsSameCA() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let first = CertAuthority(directory: directory)
+        try first.loadOrCreate()
+        let firstPEM = try String(contentsOf: first.caCertificatePEMURL)
+
+        let second = CertAuthority(directory: directory)
+        try second.loadOrCreate()
+        let secondPEM = try String(contentsOf: second.caCertificatePEMURL)
+
+        #expect(firstPEM == secondPEM)
+    }
+
+    @Test func commonNameMatchesInstallerContract() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+        let ca = try Certificate(pemEncoded: String(contentsOf: authority.caCertificatePEMURL))
+        // Task 8 finds/removes the trusted cert by this exact common name.
+        #expect(ca.subject == (try DistinguishedName { CommonName("OpenProxy Local CA") }))
+    }
+
+    @Test(.enabled(if: opensslPath != nil))
+    func opensslVerifiesLeaf() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+        let leaf = try authority.leaf()
+        let leafURL = directory.appending(path: "leaf.pem")
+        try leaf.certificatePEM.write(to: leafURL, atomically: true, encoding: .utf8)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: opensslPath!)
+        process.arguments = ["verify", "-CAfile", authority.caCertificatePEMURL.path, leafURL.path]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let log = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #expect(process.terminationStatus == 0, "openssl verify failed: \(log)")
+    }
+
+    // MARK: - Helpers
+
+    static func makeTempDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appending(path: "openproxy-ca-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    /// Builds a leaf with the given SAN, signed by the CA, so tests can probe the name constraint.
+    static func makeLeaf(hostname: String, issuer: Certificate, issuerKey: Certificate.PrivateKey) throws -> Certificate {
+        let key = P256.Signing.PrivateKey()
+        let now = Date()
+        return try Certificate(
+            version: .v3,
+            serialNumber: Certificate.SerialNumber(),
+            publicKey: Certificate.PublicKey(key.publicKey),
+            notValidBefore: now.addingTimeInterval(-60),
+            notValidAfter: now.addingTimeInterval(90 * 86_400),
+            issuer: issuer.subject,
+            subject: try DistinguishedName { CommonName(hostname) },
+            signatureAlgorithm: .ecdsaWithSHA256,
+            extensions: Certificate.Extensions {
+                BasicConstraints.notCertificateAuthority
+                KeyUsage(digitalSignature: true)
+                SubjectAlternativeNames([.dnsName(hostname)])
+                try ExtendedKeyUsage([.serverAuth])
+            },
+            issuerPrivateKey: issuerKey
+        )
+    }
+}
