@@ -86,8 +86,9 @@ final class ResponseTap: @unchecked Sendable {
             facts.actualTier = (usage?["service_tier"] as? String) ?? (usage?["speed"] as? String)
         }
         facts.provider = object["provider"] as? String
-        facts.promptTokens = usage?["prompt_tokens"] as? Int
-        facts.completionTokens = usage?["completion_tokens"] as? Int
+        // /api/v1/messages (Anthropic) names these input/output_tokens.
+        facts.promptTokens = (usage?["prompt_tokens"] as? Int) ?? (usage?["input_tokens"] as? Int)
+        facts.completionTokens = (usage?["completion_tokens"] as? Int) ?? (usage?["output_tokens"] as? Int)
         facts.costUSD = usage?["cost"] as? Double
         return facts
     }
