@@ -105,6 +105,40 @@ struct EndpointCatalogTests {
         return try Data(contentsOf: url)
     }
 
+    static func speedFixture() throws -> Data {
+        let url = try #require(
+            Bundle.module.url(
+                forResource: "endpoints-with-speed", withExtension: "json", subdirectory: "Fixtures"))
+        return try Data(contentsOf: url)
+    }
+
+    @Test func parsesUptimeLast1d() throws {
+        let endpoints = try #require(EndpointCatalog.parseEndpoints(try Self.deepseekFixture()))
+        let alibaba = try #require(endpoints.first { $0.tag == "alibaba" })
+        #expect(alibaba.uptimeLast1d != nil)
+        #expect(alibaba.uptimeLast30m == 100)
+        // Keyless fetches carry no speed metrics.
+        #expect(alibaba.throughput == nil)
+        #expect(alibaba.latency == nil)
+    }
+
+    @Test func parsesSpeedPercentileObjects() throws {
+        let endpoints = try #require(EndpointCatalog.parseEndpoints(try Self.speedFixture()))
+        let relace = try #require(endpoints.first { $0.tag == "relace" })
+        // Object shape: the p50 percentile wins.
+        #expect(relace.throughput == 155)
+        #expect(abs((relace.latency ?? 0) - 0.59) < 1e-9)
+    }
+
+    @Test func parsesPlainNumberSpeedMetrics() throws {
+        let json = Data(#"""
+        {"data":{"endpoints":[{"tag":"x","throughput_last_30m":42.5,"latency_last_30m":0.25}]}}
+        """#.utf8)
+        let endpoints = try #require(EndpointCatalog.parseEndpoints(json))
+        #expect(endpoints.first?.throughput == 42.5)
+        #expect(endpoints.first?.latency == 0.25)
+    }
+
     @Test func parsesFlexAndPriority() throws {
         let availability = try #require(EndpointCatalog.parseAvailability(try Self.fixtureData()))
         #expect(availability.hasFlex)

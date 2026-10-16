@@ -1,0 +1,53 @@
+{
+  "data": {
+    "id": "deepseek/deepseek-v4.1-flash",
+    "name": "DeepSeek: DeepSeek V4.1 Flash",
+    "endpoints": [
+      {
+        "name": "Alibaba | deepseek/deepseek-v4.1-flash",
+        "model_id": "deepseek/deepseek-v4.1-flash",
+        "model_name": "DeepSeek: DeepSeek V4.1 Flash",
+        "pricing": {"prompt": "0.0000006", "completion": "0.0000006"},
+        "provider_name": "Alibaba",
+        "tag": "alibaba",
+        "service_tier": null,
+        "quantization": "unknown",
+        "status": 0,
+        "throughput_last_30m": {"p50": 116.0, "p75": 100.0, "p90": 80.0, "p99": 60.0},
+        "latency_last_30m": {"p50": 1.01, "p75": 1.2, "p90": 1.5, "p99": 2.0},
+        "uptime_last_1d": 97.14,
+        "uptime_last_30m": 99.5
+      },
+      {
+        "name": "DeepSeek | deepseek/deepseek-v4.1-flash",
+        "model_id": "deepseek/deepseek-v4.1-flash",
+        "model_name": "DeepSeek: DeepSeek V4.1 Flash",
+        "pricing": {"prompt": "0.0000006", "completion": "0.0000006"},
+        "provider_name": "DeepSeek",
+        "tag": "deepseek",
+        "service_tier": null,
+        "quantization": "unknown",
+        "status": 0,
+        "throughput_last_30m": {"p50": 53.0, "p75": 45.0, "p90": 30.0, "p99": 20.0},
+        "latency_last_30m": {"p50": 0.86, "p75": 1.0, "p90": 1.3, "p99": 1.8},
+        "uptime_last_1d": 100.0,
+        "uptime_last_30m": 100.0
+      },
+      {
+        "name": "Relace | deepseek/deepseek-v4.1-flash",
+        "model_id": "deepseek/deepseek-v4.1-flash",
+        "model_name": "DeepSeek: DeepSeek V4.1 Flash",
+        "pricing": {"prompt": "0.0000006", "completion": "0.0000006"},
+        "provider_name": "Relace",
+        "tag": "relace",
+        "service_tier": null,
+        "quantization": "unknown",
+        "status": 0,
+        "throughput_last_30m": {"p50": 155.0, "p75": 140.0, "p90": 110.0, "p99": 80.0},
+        "latency_last_30m": {"p50": 0.59, "p75": 0.7, "p90": 0.9, "p99": 1.2},
+        "uptime_last_1d": 100.0,
+        "uptime_last_30m": 100.0
+      }
+    ]
+  }
+}

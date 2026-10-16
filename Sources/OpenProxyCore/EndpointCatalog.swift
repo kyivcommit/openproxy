@@ -18,11 +18,17 @@ public struct Endpoint: Equatable, Sendable {
     public var promptUSDPerMillion: Double
     public var completionUSDPerMillion: Double
     public var uptimeLast30m: Double?
+    public var uptimeLast1d: Double?
+    /// Output tokens per second (p50 of `throughput_last_30m`); nil unless the fetch carried a key.
+    public var throughput: Double?
+    /// Seconds to first token (p50 of `latency_last_30m`); nil unless the fetch carried a key.
+    public var latency: Double?
 
     public init(
         tag: String, providerName: String = "", quantization: String? = nil,
         serviceTier: String? = nil, promptUSDPerMillion: Double = 0,
-        completionUSDPerMillion: Double = 0, uptimeLast30m: Double? = nil
+        completionUSDPerMillion: Double = 0, uptimeLast30m: Double? = nil,
+        uptimeLast1d: Double? = nil, throughput: Double? = nil, latency: Double? = nil
     ) {
         self.tag = tag
         self.providerName = providerName
@@ -31,6 +37,9 @@ public struct Endpoint: Equatable, Sendable {
         self.promptUSDPerMillion = promptUSDPerMillion
         self.completionUSDPerMillion = completionUSDPerMillion
         self.uptimeLast30m = uptimeLast30m
+        self.uptimeLast1d = uptimeLast1d
+        self.throughput = throughput
+        self.latency = latency
     }
 }
 
@@ -137,8 +146,23 @@ public actor EndpointCatalog {
                 serviceTier: endpoint["service_tier"] as? String,
                 promptUSDPerMillion: Self.perMillion(pricing?["prompt"]),
                 completionUSDPerMillion: Self.perMillion(pricing?["completion"]),
-                uptimeLast30m: (endpoint["uptime_last_30m"] as? NSNumber)?.doubleValue)
+                uptimeLast30m: (endpoint["uptime_last_30m"] as? NSNumber)?.doubleValue,
+                uptimeLast1d: (endpoint["uptime_last_1d"] as? NSNumber)?.doubleValue,
+                throughput: Self.percentileValue(endpoint["throughput_last_30m"]),
+                latency: Self.percentileValue(endpoint["latency_last_30m"]))
         }
+    }
+
+    /// Reads a speed metric that the API sends either as a plain number or as an object of
+    /// percentiles (`{"p50": …}`); p50 wins when present. Latency and throughput are compared
+    /// only across endpoints of the same response, so the doc's ms/seconds ambiguity cancels.
+    private static func percentileValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        guard let object = value as? [String: Any] else { return nil }
+        for key in ["p50", "p75", "p90", "p99"] {
+            if let number = object[key] as? NSNumber { return number.doubleValue }
+        }
+        return nil
     }
 
     /// Reads `data.endpoints[].service_tier`; nil when the payload has no `data.endpoints` array.
