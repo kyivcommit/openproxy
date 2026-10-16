@@ -282,15 +282,22 @@ public final class ProxyServer: @unchecked Sendable {
     }
 }
 
-/// Buffers one request, then hands it to the server and cancels the handler's
-/// task when the client disconnects (which cancels the upstream stream).
-private final class ProxyConnectionHandler: ChannelInboundHandler {
+/// Buffers one request at a time, then hands it to the server. Requests are
+/// serialized per connection (a response is fully written before the next
+/// request starts), and closing the client connection cancels the in-flight work.
+private final class ProxyConnectionHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
+
+    private struct Request {
+        var head: HTTPRequestHead
+        var body: Data
+    }
 
     private weak var server: ProxyServer?
     private var head: HTTPRequestHead?
     private var body = ByteBuffer()
-    private var task: Task<Void, Never>?
+    private var pending: [Request] = []
+    private var current: Task<Void, Never>?
 
     init(server: ProxyServer) { self.server = server }
 
@@ -303,24 +310,49 @@ private final class ProxyConnectionHandler: ChannelInboundHandler {
             self.body.writeBuffer(&buffer)
         case .end:
             guard let head = self.head, let server = self.server else { return }
-            let body = Data(self.body.readableBytesView)
-            let channel = context.channel
-            task = Task { await server.handle(head: head, body: body, channel: channel) }
+            pending.append(Request(head: head, body: Data(body.readableBytesView)))
+            pump(channel: context.channel, server: server)
         }
     }
 
+    /// Starts the next queued request only when nothing else is in flight, so
+    /// responses stay ordered and a client close cancels the one running.
+    private func pump(channel: Channel, server: ProxyServer) {
+        guard current == nil, !pending.isEmpty else { return }
+        let request = pending.removeFirst()
+        current = Task { [weak self] in
+            await server.handle(head: request.head, body: request.body, channel: channel)
+            await self?.finished(channel: channel, server: server)
+        }
+    }
+
+    private func finished(channel: Channel, server: ProxyServer) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            channel.eventLoop.execute {
+                self.current = nil
+                self.pump(channel: channel, server: server)
+                continuation.resume()
+            }
+        }
+    }
+
+    private func cancelAll() {
+        current?.cancel()
+        current = nil
+        pending.removeAll()
+    }
+
     func channelInactive(context: ChannelHandlerContext) {
-        task?.cancel()
-        task = nil
+        cancelAll()
         context.fireChannelInactive()
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
-        task?.cancel()
+        cancelAll()
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        task?.cancel()
+        cancelAll()
         context.close(promise: nil)
     }
 }

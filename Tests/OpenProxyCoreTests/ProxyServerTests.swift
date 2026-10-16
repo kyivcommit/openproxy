@@ -242,6 +242,36 @@ private func withServer(
 
 private struct TimeoutError: Error {}
 
+private func openRawTLSChannel(port: Int, group: EventLoopGroup) async throws -> Channel {
+    var tls = TLSConfiguration.makeClientConfiguration()
+    tls.certificateVerification = .none
+    let context = try NIOSSLContext(configuration: tls)
+    return try await ClientBootstrap(group: group)
+        .channelInitializer { channel in
+            do {
+                try channel.pipeline.syncOperations.addHandler(
+                    NIOSSLClientHandler(context: context, serverHostname: "openrouter.ai"))
+                return channel.eventLoop.makeSucceededVoidFuture()
+            } catch {
+                return channel.eventLoop.makeFailedFuture(error)
+            }
+        }
+        .connect(host: "127.0.0.1", port: port).get()
+}
+
+private func writePipelinedRequests(
+    _ requests: [(path: String, body: Data)], on channel: Channel
+) async throws {
+    var buffer = channel.allocator.buffer(capacity: 512)
+    for request in requests {
+        buffer.writeString(
+            "POST \(request.path) HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                + "Content-Length: \(request.body.count)\r\n\r\n")
+        buffer.writeBytes(request.body)
+    }
+    try await channel.writeAndFlush(buffer).get()
+}
+
 private func waitUntil(_ condition: @Sendable () -> Bool, timeout: TimeInterval) async -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
@@ -249,6 +279,17 @@ private func waitUntil(_ condition: @Sendable () -> Bool, timeout: TimeInterval)
         try? await Task.sleep(nanoseconds: 10_000_000)
     }
     return condition()
+}
+
+/// Polls a condition that must stay false for the window (e.g. "no second request
+/// was started"). A bounded wait is the only way to assert a non-event.
+private func staysFalse(_ condition: @Sendable () -> Bool, within timeout: TimeInterval) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return false }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    return !condition()
 }
 
 private func json(_ data: Data) -> [String: Any] {
@@ -422,6 +463,44 @@ struct ProxyServerTests {
             let upstreamCancelled = await waitUntil(
                 { harness.upstream.cancels.contains { $0.cancelled } }, timeout: 1)
             #expect(upstreamCancelled)
+        }
+    }
+
+    @Test func pipelinedRequestsAreSerializedPerConnection() async throws {
+        let gate = Signal()
+        let first = FakeReply(
+            status: 200, headers: [("content-type", "application/json")],
+            stream: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield(Data("first".utf8))
+                    let task = Task {
+                        await gate.wait()
+                        continuation.finish()
+                    }
+                    continuation.onTermination = { _ in task.cancel() }
+                }
+            })
+        let second = FakeReply(
+            status: 200, headers: [("content-type", "application/json")], body: Data("second".utf8))
+        try await withServer(replies: [first, second]) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let channel = try await openRawTLSChannel(port: harness.port, group: group)
+            try await writePipelinedRequests(
+                [
+                    (path: chatPath, body: Data(#"{"model":"a"}"#.utf8)),
+                    (path: chatPath, body: Data(#"{"model":"b"}"#.utf8)),
+                ],
+                on: channel)
+
+            #expect(await waitUntil({ harness.upstream.requests.count >= 1 }, timeout: 2))
+            // The second pipelined request must not reach upstream while the first response is open.
+            #expect(await staysFalse({ harness.upstream.requests.count >= 2 }, within: 0.4))
+
+            // Closing the socket cancels the in-flight request; the queued one never runs.
+            try await channel.close().get()
+            #expect(await waitUntil({ harness.upstream.cancels.contains { $0.cancelled } }, timeout: 1))
+            #expect(harness.upstream.requests.count == 1)
         }
     }
 
