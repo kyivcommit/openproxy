@@ -337,11 +337,18 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
                     // The client's Host is meaningless to us (we dial a resolved IP);
                     // use the configured authority, matching the TLS SNI.
                     head.headers.replaceOrAdd(name: "Host", value: port == 443 ? host : "\(host):\(port)")
-                    try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()
+                    // Write the whole request with a single flush. The response handler closes the
+                    // channel as soon as the upstream response ends, so flushing the head (and body)
+                    // separately lets that close race a still-pending write for the rest of the
+                    // request: the send then fails with "I/O on closed channel" even though the
+                    // upstream has already replied (seen with a bodyless GET, where the upstream
+                    // completes the request at the head). One flush keeps the awaited write and the
+                    // request on the wire in lockstep.
+                    channel.write(HTTPClientRequestPart.head(head), promise: nil)
                     if !request.body.isEmpty {
                         var buffer = channel.allocator.buffer(capacity: request.body.count)
                         buffer.writeBytes(request.body)
-                        try await channel.writeAndFlush(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
+                        channel.write(HTTPClientRequestPart.body(.byteBuffer(buffer)), promise: nil)
                     }
                     try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
 

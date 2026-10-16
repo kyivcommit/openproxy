@@ -237,6 +237,41 @@ private final class FirstDataProbe: ChannelInboundHandler, @unchecked Sendable {
     var received: Bool { lock.withLock { _received } }
 }
 
+/// Counts the application-level flushes the client issues. The client's response
+/// handler closes the channel as soon as a response ends, so flushing the request
+/// in more than one write lets that close race a still-pending write.
+private final class FlushCountingHandler: ChannelOutboundHandler, @unchecked Sendable {
+    typealias OutboundIn = Any
+
+    private let lock = NSLock()
+    private var _flushes = 0
+
+    var flushes: Int { lock.withLock { _flushes } }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        context.write(data, promise: promise)
+    }
+
+    func flush(context: ChannelHandlerContext) {
+        lock.withLock { _flushes += 1 }
+        context.flush()
+    }
+}
+
+/// Installs a `FlushCountingHandler` at the tail of the client pipeline.
+private struct FlushCountingConnector: UpstreamConnector {
+    let counter: FlushCountingHandler
+
+    func connect(
+        host: String, port: Int, group: EventLoopGroup,
+        initializer: @escaping @Sendable (Channel) -> EventLoopFuture<Void>
+    ) -> EventLoopFuture<Channel> {
+        ClientBootstrapConnector().connect(host: host, port: port, group: group) { channel in
+            initializer(channel).flatMap { channel.pipeline.addHandler(counter) }
+        }
+    }
+}
+
 // MARK: - Harness
 
 private struct Harness: @unchecked Sendable {
@@ -1053,6 +1088,39 @@ struct ProxyServerTests {
                 headers: [("Host", "evil.example.com")], body: Data()))
             let received = try #require(upstream.received.first)
             #expect(received.header("host") == "openrouter.ai:\(upstream.port)")
+        } catch {
+            await upstream.stop()
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        await upstream.stop()
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    /// A bodyless GET is complete at the request head, so the upstream can reply (and the
+    /// client close the channel) before the client has flushed the trailing `.end`. The
+    /// request must therefore go out as a single flush, or the `end` write races the
+    /// response-driven close and fails with "I/O on closed channel".
+    @Test func requestIsWrittenInASingleFlushSoTheResponseCloseCannotRaceIt() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-flush-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let ca = CertAuthority(directory: directory)
+        try ca.loadOrCreate()
+        let upstream = try RecordingUpstream(ca: ca)
+        do {
+            try await upstream.start()
+            let counter = FlushCountingHandler()
+            let client = NIOUpstreamClient(
+                resolver: StaticResolver(addresses: ["127.0.0.1"]),
+                host: "openrouter.ai", port: upstream.port,
+                trustRoots: [upstream.caCertificate], allowLoopback: true,
+                connector: FlushCountingConnector(counter: counter))
+            let response = try await client.send(UpstreamRequest(
+                method: "GET", path: "/api/v1/models", headers: [], body: Data()))
+            for try await _ in response.body {}
+            _ = try #require(upstream.received.first)
+            #expect(counter.flushes == 1)
         } catch {
             await upstream.stop()
             try? FileManager.default.removeItem(at: directory)
