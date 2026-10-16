@@ -261,6 +261,7 @@ private func withServer(
 private func withCustomUpstream(
     settings: Settings,
     upstream: UpstreamClient,
+    stats: StatsStore,
     _ body: (ProxyServer, Int) async throws -> Void
 ) async throws {
     let directory = FileManager.default.temporaryDirectory.appending(path: "openproxy-cust-\(UUID().uuidString)")
@@ -272,7 +273,7 @@ private func withCustomUpstream(
         ca: ca,
         upstream: upstream,
         catalog: TierCatalog(fetcher: FakeEndpointsFetcher(hasFlex: true)),
-        stats: try StatsStore(path: ":memory:"),
+        stats: stats,
         settings: { settings })
     try await server.start()
     do {
@@ -760,7 +761,9 @@ struct ProxyServerTests {
             enabled: true, sort: .balanced, tier: .flex,
             flex: FlexPolicy(fallback: true, attempts: 3))
         let upstream = SlowCancelClient()
-        try await withCustomUpstream(settings: settings, upstream: upstream) { _, port in
+        try await withCustomUpstream(
+            settings: settings, upstream: upstream, stats: try StatsStore(path: ":memory:")
+        ) { _, port in
             let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
             defer { group.shutdownGracefully(queue: .global()) { _ in } }
             let channel = try await openRawTLSChannel(port: port, group: group)
@@ -924,6 +927,35 @@ struct ProxyServerTests {
         #expect(serverConfig.minimumTLSVersion == .tlsv12)
         let client = NIOUpstreamClient(resolver: StaticResolver(addresses: []))
         #expect(client.minimumTLSVersion == .tlsv12)
+    }
+
+    @Test func flexFailureRecordsRealAttemptsAndFallback() async throws {
+        let settings = Settings(
+            enabled: true, sort: .balanced, tier: .flex,
+            flex: FlexPolicy(
+                fallback: true, attempts: 2, firstByteTimeout: 0.05, nonStreamingTimeout: 0.05))
+        let upstream = SlowCancelClient()
+        let stats = try StatsStore(path: ":memory:")
+        try await withCustomUpstream(settings: settings, upstream: upstream, stats: stats) { _, port in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let (channel, monitor) = try await openRawTLSChannel(
+                port: port, group: group, monitor: true)
+            let body = Data(#"{"model":"openai/gpt-5","stream":true}"#.utf8)
+            var buffer = channel.allocator.buffer(capacity: 256)
+            buffer.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer x\r\n"
+                    + "Content-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n")
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(buffer).get()
+
+            #expect(await waitUntil({ monitor.received.range(of: Data("502".utf8)) != nil }, timeout: 3))
+            #expect(upstream.count == 3)  // 2 flex attempts + 1 fallback
+            #expect(await waitUntil({ stats.summary(since: .distantPast).total == 1 }, timeout: 2))
+            // usedFallback was previously always false on the error path.
+            #expect(stats.summary(since: .distantPast).fallbackCount == 1)
+            try? await channel.close().get()
+        }
     }
 
     @Test func nonLoopbackPeerRejected() throws {        let foreign = try SocketAddress(ipAddress: "10.0.0.1", port: 1234)

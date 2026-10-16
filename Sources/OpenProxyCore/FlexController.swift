@@ -35,6 +35,21 @@ public struct FlexOutcome<R: FlexResponse>: Sendable {
     }
 }
 
+/// Thrown when the Flex policy runs out of attempts (and fallback, when enabled),
+/// carrying the real counters so callers can record them instead of zeros.
+public struct FlexFailure: Error, Sendable {
+    /// Total number of upstream `send` calls that were made before the failure.
+    public let attempts: Int
+    public let usedFallback: Bool
+    public let underlying: Error
+
+    public init(attempts: Int, usedFallback: Bool, underlying: Error) {
+        self.attempts = attempts
+        self.usedFallback = usedFallback
+        self.underlying = underlying
+    }
+}
+
 /// Executes the Flex policy (spec §6): retry capacity failures up to
 /// `policy.attempts`, then optionally fall back to a request without
 /// `service_tier`. Switching is only possible before the first response byte.
@@ -76,6 +91,10 @@ public enum FlexController {
                 timedOut.cancelTimedOutUpstream()
                 lastTimeout = timedOut
                 lastResponse = nil
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw FlexFailure(attempts: attempt, usedFallback: false, underlying: error)
             }
         }
 
@@ -86,12 +105,16 @@ public enum FlexController {
                 return FlexOutcome(response: response, usedFallback: true, attempts: attempts + 1)
             } catch let timedOut as FlexTimeout {
                 timedOut.cancelTimedOutUpstream()
-                throw timedOut
+                throw FlexFailure(attempts: attempts + 1, usedFallback: true, underlying: timedOut)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw FlexFailure(attempts: attempts + 1, usedFallback: true, underlying: error)
             }
         }
         if let response = lastResponse {
             return FlexOutcome(response: response, usedFallback: false, attempts: attempts)
         }
-        throw lastTimeout ?? FlexTimeout()
+        throw FlexFailure(attempts: attempts, usedFallback: false, underlying: lastTimeout ?? FlexTimeout())
     }
 }

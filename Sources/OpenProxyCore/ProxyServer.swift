@@ -172,9 +172,12 @@ public final class ProxyServer: @unchecked Sendable {
             // A cancelled request is a client disconnect, not an upstream failure:
             // do not fabricate a 502 or record one.
             if Task.isCancelled || error is CancellationError { return }
+            let failure = error as? FlexFailure
             await writeError(status: 502, message: "upstream unavailable", channel: channel)
             record(started: started, path: path, rewrite: rewrite, settings: settings,
-                   status: 502, retries: retries, usedFallback: usedFallback)
+                   status: 502, retries: max(0, (failure?.attempts ?? 0) - 1),
+                   usedFallback: failure?.usedFallback ?? false,
+                   ttfbMs: Int(Date().timeIntervalSince(started) * 1000))
             return
         }
 
