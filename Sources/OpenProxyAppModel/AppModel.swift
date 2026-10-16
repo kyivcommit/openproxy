@@ -230,6 +230,13 @@ public final class AppModel {
                         + "would break every client. Fix the uninstall problem, then quit again.")
                     return
                 }
+                // Finding 4: hosts was restored but the leftover CA-trust cleanup failed, so
+                // terminating now would drop that warning and leave per-user trust behind.
+                if warnings.contains(where: { $0.key == .uninstall }) {
+                    warn(.quit, "Quit was cancelled: openrouter.ai access was restored, but the CA trust "
+                        + "could not be fully removed, so per-user trust may remain. Fix it, then quit again.")
+                    return
+                }
             }
         }
         quitDecision.terminate()

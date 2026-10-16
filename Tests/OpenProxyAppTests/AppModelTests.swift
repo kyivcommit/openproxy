@@ -502,6 +502,25 @@ struct AppModelTests {
         #expect(model.warnings.contains { $0.message.contains("still routed") })
     }
 
+    @Test func uninstallAndQuitStaysRunningWhenTrustCleanupFails() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        await model.refresh()
+        #expect(model.status.hostsEntry)
+        // The hosts entry is restored, but the login-keychain trust cleanup fails.
+        h.commandRunner.errorOnContains = "remove-trusted-cert"
+        h.quitDecision.choice = .uninstallAndQuit
+
+        await model.quit()
+
+        // Terminating would silently drop the trustCleanupFailed warning while per-user trust
+        // may remain, so stay running and surface it.
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(!model.status.hostsEntry)
+        #expect(model.warnings.contains { $0.key == .uninstall })
+        #expect(model.warnings.contains { $0.key == .quit })
+    }
+
     // MARK: - Item 1: keyed warnings clear on success
 
     @Test func successfulInstallClearsStaleOperationWarnings() async throws {
