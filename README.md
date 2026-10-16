@@ -2,7 +2,7 @@
 
 A macOS menu bar app that transparently sits between your coding agents (opencode, pi, aider, …) and `openrouter.ai`. It adds a **provider sort** and **service tier** policy to every chat request, so you configure routing once for all clients instead of in each one.
 
-- **Transparent for keychain-based clients:** curl, Apple Python, Rust and opencode need no configuration changes. Node, Bun and Homebrew Python need the CA supplied once — see [Client trust](#client-trust).
+- **Transparent for keychain-based clients:** curl, Apple Python and opencode need no configuration changes; Rust is expected to (not re-verified with per-user trust). Node, Bun and Homebrew Python need the CA supplied once — see [Client trust](#client-trust).
 - **Sort:** Balanced, Throughput (`:nitro`), Price (`:floor`), Exacto (`:exacto`) — applied by OpenRouter itself via the model-id variant.
 - **Service tier:** Auto, Default, Priority, Flex. Flex has retry, timeout and "fall back without flex" settings.
 - **Never overrides the client:** if a request already sets `service_tier`, `speed`, `provider.order|sort|only`, a `:variant` or an `@preset/…` model, nothing is changed.
@@ -34,12 +34,14 @@ Whether a client trusts the proxy CA without changes depends on which trust stor
 | Client | Works with no changes? | What it needs |
 |---|---|---|
 | `curl` (`/usr/bin/curl`) | yes | uses Secure Transport, so it sees the keychain-trusted CA |
-| Apple Python 3 | yes | uses the system keychain |
-| Rust (native roots) | yes | uses the native trust store |
+| Apple Python 3 | yes | uses the system keychain (measured with per-user trust) |
+| Rust (native roots) | expected | uses the native trust store; expected to work, but not re-verified with the per-user CA |
 | `opencode` (started fresh) | yes | sees the keychain-trusted CA |
 | Node (`node`, `pi`) | no | `NODE_EXTRA_CA_CERTS=<ca.pem>`, or `NODE_OPTIONS='--use-system-ca --use-bundled-ca'` |
 | Bun | no | `bun --use-system-ca` (or `BUN_OPTIONS=--use-system-ca`); `NODE_EXTRA_CA_CERTS` also works |
 | Homebrew Python 3, `requests`, `httpx` | no | `SSL_CERT_FILE=<ca.pem>` or `REQUESTS_CA_BUNDLE=<ca.pem>` |
+
+Measured on macOS 27 with per-user trust: curl, Apple Python 3 and opencode (fresh process) pass; Bun needs `--use-system-ca`; Node/`pi` need `NODE_EXTRA_CA_CERTS`; Homebrew Python needs `SSL_CERT_FILE`. Rust is listed as expected only — it was measured in the earlier spike with the CA in the System keychain, not with the current per-user trust.
 
 In Node, `--use-system-ca` alone does not pick up the login-keychain CA; use `NODE_EXTRA_CA_CERTS` or the `--use-system-ca --use-bundled-ca` pair. Python 3.13+ strict verification now works with this CA because it carries the Subject and Authority Key Identifier extensions.
 
