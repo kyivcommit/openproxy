@@ -302,6 +302,15 @@ public final class Installer: @unchecked Sendable {
         return SHA256.hash(data: der).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Item 6: `remove-trusted-cert` on a certificate that has no trust settings at all (an
+    /// install that failed at the trust phase, or a rotated CA) exits non-zero with this exact
+    /// Security.framework message. That is "already not trusted" — a success for cleanup —
+    /// not a leftover-trust warning. Verified against a throwaway keychain.
+    static func isAlreadyNotTrusted(_ result: CommandResult) -> Bool {
+        let text = (result.standardError + "\n" + result.standardOutput).lowercased()
+        return text.contains("the specified item could not be found in the keychain")
+    }
+
     /// Command output can be huge; cap what reaches the menu.
     static func capped(_ text: String, limit: Int = 500) -> String {
         text.count > limit ? String(text.prefix(limit)) + "…" : text
@@ -365,7 +374,7 @@ public final class Installer: @unchecked Sendable {
         var failures: [String] = []
         let removeTrust = await commandRunner.run(
             "security remove-trusted-cert \(Self.quoted(caPEMURL.path))")
-        if !removeTrust.succeeded {
+        if !removeTrust.succeeded && !Self.isAlreadyNotTrusted(removeTrust) {
             failures.append("per-user trust: \(removeTrust.failureDetail)")
         }
         let deleteCerts = await commandRunner.run(Self.deleteCertificatesScript(

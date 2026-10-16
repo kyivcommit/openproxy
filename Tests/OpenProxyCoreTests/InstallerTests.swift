@@ -307,6 +307,30 @@ struct InstallerTests {
         #expect(commands.commands.contains { $0.contains("remove-trusted-cert") })
     }
 
+    // MARK: - Item 6: a missing trust setting is success, not a warning
+
+    @Test func removeTrustThatWasNeverSetIsNotAFailure() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            command.contains("remove-trusted-cert")
+                ? CommandResult(status: 1, standardError: "SecTrustSettingsRemoveTrustSettings: The specified item could not be found in the keychain.")
+                : CommandResult(status: 0)
+        })
+
+        // The exact Security.framework error for "no trust settings" must not be reported.
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+    }
+
+    @Test func isAlreadyNotTrustedRecognisesOnlyTheMissingSettingError() {
+        #expect(Installer.isAlreadyNotTrusted(CommandResult(
+            status: 1,
+            standardError: "SecTrustSettingsRemoveTrustSettings: The specified item could not be found in the keychain.")))
+        #expect(!Installer.isAlreadyNotTrusted(CommandResult(status: 1, standardError: "SecTrustSettingsSetTrustSettings: denied")))
+        #expect(!Installer.isAlreadyNotTrusted(CommandResult(status: 0)))
+    }
+
     @Test func uninstallRemovesAdminTrustInPrivilegedPhaseBeforeSweepingSystemKeychain() async throws {
         // An older install used `add-trusted-cert -d`, which writes admin trust settings that
         // deleting the certificate item leaves behind; `remove-trusted-cert -d` clears them.
