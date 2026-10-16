@@ -83,6 +83,23 @@ struct InstallerTests {
         #expect(script.contains(hostsPath))
     }
 
+    @Test func uninstallDeletesCertificatesBySHA1Hash() async throws {
+        // Two CAs can share the CN (a reinstall): `delete-certificate -c <CN>` fails as
+        // "ambiguous", so every match is deleted by its SHA-1 hash instead.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).uninstall()
+
+        let script = try #require(runner.scripts.first)
+        #expect(script.contains("security find-certificate -a -Z -c 'OpenProxy Local CA'"))
+        #expect(script.contains("SHA-1 hash:"))
+        #expect(script.contains("for hash in $hashes"))
+        #expect(script.contains("security delete-certificate -Z \"$hash\""))
+        #expect(!script.contains("security delete-certificate -c"))
+    }
+
     @Test func uninstallPropagatesRunnerFailureAsTypedError() async throws {
         let hostsPath = try makeHostsFile("\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
