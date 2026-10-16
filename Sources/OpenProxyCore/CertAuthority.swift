@@ -41,6 +41,8 @@ public final class CertAuthority: @unchecked Sendable {
 
         if FileManager.default.fileExists(atPath: caCertificatePEMURL.path),
            FileManager.default.fileExists(atPath: caKeyURL.path) {
+            // An older install may have left the key group/world-readable; tighten it on load.
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: caKeyURL.path)
             let certificate = try Certificate(pemEncoded: String(contentsOf: caCertificatePEMURL))
             let key = try Certificate.PrivateKey(pemEncoded: String(contentsOf: caKeyURL))
             lock.withLock {
@@ -130,7 +132,12 @@ public final class CertAuthority: @unchecked Sendable {
     }
 
     private static func write(_ text: String, to url: URL, permissions: Int) throws {
-        try Data(text.utf8).write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
+        // Create with the target mode directly: writing first would briefly expose a 0600 key under the process umask.
+        let created = FileManager.default.createFile(
+            atPath: url.path,
+            contents: Data(text.utf8),
+            attributes: [.posixPermissions: permissions]
+        )
+        guard created else { throw CocoaError(.fileWriteUnknown) }
     }
 }

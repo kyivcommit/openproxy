@@ -35,6 +35,43 @@ private final class Clock: @unchecked Sendable {
 
 private struct Boom: Error {}
 
+/// Suspends inside `fetch` until `release()` so tests can force overlapping lookups.
+private final class SuspendingFetcher: EndpointsFetcher, @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls: [String] = []
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+    private let data: Data
+
+    init(data: Data) { self.data = data }
+
+    var modelIds: [String] { lock.withLock { calls } }
+
+    func fetch(modelId: String, authorization: String) async throws -> Data {
+        let alreadyReleased = lock.withLock { () -> Bool in
+            calls.append(modelId)
+            return released
+        }
+        if alreadyReleased { return data }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.withLock {
+                if released { continuation.resume() } else { waiters.append(continuation) }
+            }
+        }
+        return data
+    }
+
+    func release() {
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            released = true
+            let w = waiters
+            waiters = []
+            return w
+        }
+        pending.forEach { $0.resume() }
+    }
+}
+
 @Suite("TierCatalog")
 struct TierCatalogTests {
     static func fixtureData() throws -> Data {
@@ -110,5 +147,22 @@ struct TierCatalogTests {
         _ = await catalog.availability(model: "openai/gpt-5:nitro", authorization: "Bearer k")
 
         #expect(fetcher.modelIds == ["openai/gpt-5"])
+    }
+
+    @Test func coalescesConcurrentLookupsForSameModel() async throws {
+        let fetcher = SuspendingFetcher(data: try Self.fixtureData())
+        let catalog = TierCatalog(fetcher: fetcher)
+
+        async let first = catalog.availability(model: "m", authorization: "k")
+        async let second = catalog.availability(model: "m", authorization: "k")
+
+        // Let both callers reach the actor while the single fetch is still suspended.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        fetcher.release()
+
+        let (firstResult, secondResult) = await (first, second)
+        #expect(firstResult == TierAvailability(hasFlex: true, hasPriority: true))
+        #expect(secondResult == firstResult)
+        #expect(fetcher.modelIds == ["m"])
     }
 }
