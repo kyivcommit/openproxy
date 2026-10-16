@@ -1,3 +1,4 @@
 .build/
 spike/*.key
 .DS_Store
+build/
