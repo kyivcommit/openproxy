@@ -17,6 +17,13 @@ public struct FlexPolicy: Codable, Equatable, Sendable {
     public var nonStreamingTimeout: TimeInterval = 120
 
     public init() {}
+
+    public init(fallback: Bool = true, attempts: Int = 2, firstByteTimeout: TimeInterval = 30, nonStreamingTimeout: TimeInterval = 120) {
+        self.fallback = fallback
+        self.attempts = min(max(attempts, 1), 5)
+        self.firstByteTimeout = firstByteTimeout
+        self.nonStreamingTimeout = nonStreamingTimeout
+    }
 }
 
 public struct Settings: Codable, Equatable, Sendable {
@@ -26,6 +33,13 @@ public struct Settings: Codable, Equatable, Sendable {
     public var flex = FlexPolicy()
 
     public init() {}
+
+    public init(enabled: Bool = true, sort: SortMode = .balanced, tier: TierMode = .auto, flex: FlexPolicy = FlexPolicy()) {
+        self.enabled = enabled
+        self.sort = sort
+        self.tier = tier
+        self.flex = flex
+    }
 }
 
 public struct TierAvailability: Equatable, Sendable {
