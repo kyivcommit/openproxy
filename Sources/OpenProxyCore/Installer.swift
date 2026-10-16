@@ -233,11 +233,15 @@ public final class Installer: @unchecked Sendable {
         text.count > limit ? String(text.prefix(limit)) + "…" : text
     }
 
+    /// Phase A (privileged) restores `/etc/hosts` first — the critical safety path — and
+    /// best-effort sweeps a leftover CA from the System keychain; phase B (unprivileged)
+    /// removes the user-domain trust and the login-keychain certificate. A phase-B failure
+    /// must never surface as an uninstall failure because hosts is already restored.
     public func uninstall() async throws {
         let script = """
         set -e
         \(Self.hostsEditScript(hostsPath: hostsPath, adding: false))
-        \(Self.deleteCertificatesScript(commonName: caCommonName))
+        \(Self.deleteCertificatesScript(commonName: caCommonName, keychain: "/Library/Keychains/System.keychain"))
         dscacheutil -flushcache
         """
         do {
@@ -245,16 +249,29 @@ public final class Installer: @unchecked Sendable {
         } catch {
             throw InstallError.runnerFailed(String(describing: error))
         }
+        await removeUserDomainTrust()
+    }
+
+    /// Best-effort, unprivileged cleanup of the user-domain trust and the login-keychain
+    /// certificate. Errors are ignored: the hosts entry is the safety-critical half and it is
+    /// already gone. `remove-trusted-cert` reads the file, so it runs before anything else.
+    private func removeUserDomainTrust() async {
+        _ = await commandRunner.run(
+            "security remove-trusted-cert \(Self.quoted(caPEMURL.path))")
+        _ = await commandRunner.run(Self.deleteCertificatesScript(
+            commonName: caCommonName,
+            keychain: "\"$HOME/Library/Keychains/login.keychain-db\""))
     }
 
     /// Deletes every certificate with our common name by its SHA-1 hash. `security
     /// delete-certificate -c <CN>` fails with "ambiguous" when two CAs share the CN — the
     /// normal reinstall case — so each match returned by `find-certificate` is deleted by hash.
-    static func deleteCertificatesScript(commonName: String) -> String {
+    /// Best-effort (`|| true`): a keychain without our cert must not fail the caller.
+    static func deleteCertificatesScript(commonName: String, keychain: String) -> String {
         """
-        hashes=$(security find-certificate -a -Z -c \(quoted(commonName)) /Library/Keychains/System.keychain 2>/dev/null | awk '/SHA-1 hash:/ { print $NF }')
+        hashes=$(security find-certificate -a -Z -c \(quoted(commonName)) \(keychain) 2>/dev/null | awk '/SHA-1 hash:/ { print $NF }')
         for hash in $hashes; do
-            security delete-certificate -Z "$hash" /Library/Keychains/System.keychain
+            security delete-certificate -Z "$hash" \(keychain) || true
         done
         """
     }

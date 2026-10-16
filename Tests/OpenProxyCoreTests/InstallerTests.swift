@@ -224,6 +224,54 @@ struct InstallerTests {
         await #expect(throws: InstallError.self) { try await installer.uninstall() }
     }
 
+    @Test func uninstallRestoresHostsBeforeSweepingKeychains() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner()
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+
+        let script = try #require(runner.scripts.first)
+        let remove = try #require(script.range(of: "sed -E"))
+        let sweep = try #require(script.range(of: "security find-certificate"))
+        let flush = try #require(script.range(of: "dscacheutil -flushcache"))
+        #expect(remove.lowerBound < sweep.lowerBound)
+        #expect(sweep.lowerBound < flush.lowerBound)
+
+        // Phase B (unprivileged): user-domain trust removal + login-keychain cert cleanup.
+        #expect(commands.commands.contains { $0.contains("security remove-trusted-cert") })
+        #expect(commands.commands.contains { $0.contains("login.keychain-db") })
+    }
+
+    @Test func uninstallIsIdempotentWhenNothingIsInstalled() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).uninstall()
+
+        #expect(runner.scripts.count == 1)
+        let script = try #require(runner.scripts.first)
+        #expect(script.contains("sed -E"))
+        #expect(!script.contains(hostsEntry))
+    }
+
+    @Test func uninstallRestoresHostsEvenWhenTrustRemovalFails() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { _ in
+            CommandResult(status: 1, standardError: "no trust settings")
+        })
+
+        // Best-effort phase B: a failure must not throw and must not undo the hosts restore.
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+
+        #expect(runner.scripts.count == 1)
+        #expect(commands.commands.contains { $0.contains("remove-trusted-cert") })
+    }
+
     @Test func statusReportsHostsEntry() async throws {
         let withEntry = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         let withoutEntry = try makeHostsFile("127.0.0.1 localhost\n")
