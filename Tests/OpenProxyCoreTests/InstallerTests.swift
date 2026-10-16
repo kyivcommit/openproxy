@@ -600,6 +600,85 @@ struct InstallerTests {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         #expect(opensslFingerprint == fingerprint)
     }
+
+    // MARK: - Item 6: execute the SHA-1 sweep against a fake `security`
+
+    @Test func sweepDeletesNothingWhenNoCertificatesMatch() throws {
+        let result = try runSweep(hashes: [])
+        #expect(result.status == 0)
+        #expect(result.deletes.isEmpty)
+    }
+
+    @Test func sweepDeletesSingleMatchByHash() throws {
+        let result = try runSweep(hashes: ["AAAA"])
+        #expect(result.status == 0)
+        #expect(result.deletes.count == 1)
+        #expect(result.deletes.first?.contains("-Z AAAA") == true)
+    }
+
+    @Test func sweepDeletesEachMatchingCertificateByHash() throws {
+        let result = try runSweep(hashes: ["AAAA", "BBBB"])
+        #expect(result.status == 0)
+        #expect(result.deletes.count == 2)
+        #expect(result.deletes.contains { $0.contains("-Z AAAA") })
+        #expect(result.deletes.contains { $0.contains("-Z BBBB") })
+    }
+
+    @Test func sweepUsesTrustFlagForLoginKeychainOnly() throws {
+        let login = try runSweep(hashes: ["AAAA"], removeTrustSettings: true)
+        #expect(login.deletes.first?.contains("delete-certificate -t -Z AAAA") == true)
+        let system = try runSweep(hashes: ["AAAA"], removeTrustSettings: false)
+        #expect(system.deletes.first?.contains("delete-certificate -Z AAAA") == true)
+        #expect(system.deletes.first?.contains("-t ") == false)
+    }
+
+    @Test func sweepKeepsGoingWhenADeleteFails() throws {
+        // Best-effort: a failing delete must not abort the loop or fail the script.
+        let result = try runSweep(hashes: ["AAAA", "BBBB"], deleteStatus: 1)
+        #expect(result.status == 0)
+        #expect(result.deletes.count == 2)
+    }
+}
+
+/// Executes `Installer.deleteCertificatesScript` under `/bin/sh` with a fake `security`
+/// executable first in `PATH`, so the sweep's real shell behaviour (hash parsing, the
+/// per-hash loop, the trust flag, `|| true`) is exercised, not just the script text.
+/// Returns the script's exit status and the arguments of every `delete-certificate` call.
+private func runSweep(
+    hashes: [String],
+    keychain: String = "login.keychain-db",
+    removeTrustSettings: Bool = false,
+    deleteStatus: Int32 = 0
+) throws -> (status: Int32, deletes: [String]) {
+    let dir = FileManager.default.temporaryDirectory.appending(path: "sweep-\(UUID().uuidString)")
+    let bin = dir.appending(path: "bin")
+    try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let log = dir.appending(path: "deletes.log")
+    let hashLines = hashes.map { "SHA-1 hash: \($0)" }.joined(separator: "\n")
+    let fake = """
+    #!/bin/sh
+    case "$1" in
+      find-certificate) printf '%s\\n' \(shellQuoted(hashLines));;
+      delete-certificate) printf '%s\\n' "$*" >> \(shellQuoted(log.path)); exit \(deleteStatus);;
+    esac
+    """
+    let executable = bin.appending(path: "security")
+    try Data(fake.utf8).write(to: executable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", Installer.deleteCertificatesScript(
+        commonName: "OpenProxy Local CA", keychain: keychain, removeTrustSettings: removeTrustSettings)]
+    var environment = ProcessInfo.processInfo.environment
+    environment["PATH"] = bin.path + ":" + (environment["PATH"] ?? "/usr/bin:/bin")
+    process.environment = environment
+    try process.run()
+    process.waitUntilExit()
+    let logged = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+    return (process.terminationStatus, logged.split(separator: "\n").map(String.init))
 }
 
 /// The POSIX single-quote escaping the installer must produce for arbitrary paths.
