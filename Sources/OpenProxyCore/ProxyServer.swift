@@ -21,11 +21,6 @@ public struct ProxyConfig: Sendable {
 /// The TLS interceptor: terminates the client's TLS, applies the Sort/Tier policy,
 /// forwards to the real OpenRouter, and streams the response back untouched.
 public final class ProxyServer: @unchecked Sendable {
-    private static let hopByHopHeaders: Set<String> = [
-        "connection", "keep-alive", "transfer-encoding", "upgrade",
-        "proxy-connection", "proxy-authenticate", "te", "trailer",
-    ]
-
     private let config: ProxyConfig
     private let ca: CertAuthority
     private let upstream: UpstreamClient
@@ -128,13 +123,13 @@ public final class ProxyServer: @unchecked Sendable {
             let name = $0.name.lowercased()
             return name == "content-length" || name == "transfer-encoding"
         }
-        let baseHeaders = requestHead.headers.compactMap { header -> (String, String)? in
-            let name = header.name.lowercased()
-            // `expect` is consumed here (we answered 100 ourselves); forwarding it
-            // would make the upstream wait for a continuation that never comes.
-            return (name == "content-length" || name == "transfer-encoding" || name == "expect")
-                ? nil : (header.name, header.value)
-        }
+        let baseHeaders = HeaderFilter.stripHopByHop(requestHead.headers.map { ($0.name, $0.value) })
+            .filter { header in
+                let name = header.0.lowercased()
+                // `expect` is consumed here (we answered 100 ourselves); forwarding
+                // it would make the upstream wait for a continuation that never comes.
+                return name != "content-length" && name != "expect"
+            }
         let response: UpstreamResponse
         var retries = 0
         var usedFallback = false
@@ -235,7 +230,7 @@ public final class ProxyServer: @unchecked Sendable {
     private func writeResponseHead(_ response: UpstreamResponse, channel: Channel) {
         var headers = HTTPHeaders()
         var hasLength = false
-        for (name, value) in response.headers where !Self.hopByHopHeaders.contains(name.lowercased()) {
+        for (name, value) in HeaderFilter.stripHopByHop(response.headers) {
             if name.lowercased() == "content-length" { hasLength = true }
             headers.add(name: name, value: value)
         }

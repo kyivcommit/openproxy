@@ -737,6 +737,65 @@ struct ProxyServerTests {
         }
     }
 
+    @Test func requestHopByHopHeadersAreStripped() async throws {
+        try await withServer(replies: [FakeReply()]) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let channel = try await openRawTLSChannel(port: harness.port, group: group)
+            let body = Data(#"{"model":"openai/gpt-5"}"#.utf8)
+            var buffer = channel.allocator.buffer(capacity: 512)
+            buffer.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    + "Connection: keep-alive, x-custom\r\nX-Custom: secret\r\n"
+                    + "Proxy-Authorization: Basic abc\r\nTE: trailers\r\nUpgrade: h2c\r\n"
+                    + "X-Keep: yes\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n")
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(buffer).get()
+
+            #expect(await waitUntil({ !harness.upstream.requests.isEmpty }, timeout: 2))
+            let names = Set(harness.upstream.requests[0].headers.map { $0.0.lowercased() })
+            for gone in ["connection", "x-custom", "proxy-authorization", "te", "upgrade"] {
+                #expect(!names.contains(gone))
+            }
+            #expect(names.contains("x-keep"))
+            try? await channel.close().get()
+        }
+    }
+
+    @Test func responseConnectionNominatedHeadersAreStripped() async throws {
+        let reply = FakeReply(
+            status: 200,
+            headers: [
+                ("content-type", "application/json"),
+                ("connection", "close, x-resp"),
+                ("x-resp", "up"),
+                ("proxy-authenticate", "Basic realm=x"),
+                ("keep-alive", "timeout=5"),
+            ],
+            body: Data("{}".utf8))
+        try await withServer(replies: [reply]) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let (channel, monitor) = try await openRawTLSChannel(
+                port: harness.port, group: group, monitor: true)
+            let body = Data(#"{"model":"openai/gpt-5"}"#.utf8)
+            var buffer = channel.allocator.buffer(capacity: 256)
+            buffer.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                    + "Content-Length: \(body.count)\r\n\r\n")
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(buffer).get()
+
+            #expect(await waitUntil({ monitor.received.range(of: Data("200 OK".utf8)) != nil }, timeout: 2))
+            let head = String(decoding: monitor.received, as: UTF8.self).lowercased()
+            #expect(head.contains("content-type"))
+            #expect(!head.contains("x-resp"))
+            #expect(!head.contains("proxy-authenticate"))
+            #expect(!head.contains("keep-alive"))
+            try? await channel.close().get()
+        }
+    }
+
     @Test func nonLoopbackPeerRejected() throws {        let foreign = try SocketAddress(ipAddress: "10.0.0.1", port: 1234)
         let loopback = try SocketAddress(ipAddress: "127.0.0.1", port: 1234)
         #expect(!ProxyServer.isAllowedPeer(foreign, allowNonLoopback: false))
