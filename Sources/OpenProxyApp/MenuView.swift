@@ -80,19 +80,42 @@ struct MenuView: View {
     private var statsBlock: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Stats (24h)").font(.headline)
-            Text("Requests: \(model.summary.total)")
-            ForEach(model.summary.byProvider.sorted(by: { $0.value > $1.value }), id: \.key) { provider, count in
-                Text("• \(provider): \(count)").font(.caption)
+            Text("Model requests: \(model.summary.modelRequests)")
+                .help("Requests that carried a model id, so the Sort and Tier policy could apply.")
+            Text("Other requests: \(model.summary.otherRequests)")
+                .help("Requests without a model id (e.g. /models, /key); they pass through unchanged.")
+            if !model.summary.byProvider.isEmpty {
+                Text("Providers").font(.caption)
+                    .help("The top 5 providers by request count, as OpenRouter reported them.")
+                ForEach(topProviders, id: \.key) { provider, count in
+                    Text("• \(provider): \(count)").font(.caption)
+                }
             }
-            ForEach(model.summary.byActualTier.sorted(by: { $0.value > $1.value }), id: \.key) { tier, count in
-                Text("• tier \(tier): \(count)").font(.caption)
-            }
-            let share = model.summary.total == 0
-                ? 0
-                : Double(model.summary.fallbackCount) / Double(model.summary.total)
-            Text(String(format: "Fallback: %.0f%%  Cost: $%.4f", share * 100, model.summary.totalCostUSD))
-                .font(.caption)
+            Text("Service tier used: \(serviceTiersUsed)").font(.caption)
+                .help("The service tier that actually served the request (from OpenRouter's response), not the one requested.")
+            Text(fallbackLine).font(.caption)
+                .help("Flex requests that exhausted their retries and fell back to a non-flex request, out of every request made with Tier=Flex.")
+            Text(String(format: "Cost: $%.4f", model.summary.totalCostUSD)).font(.caption)
+                .help("Sum of the costs OpenRouter reported for these requests.")
         }
+    }
+
+    private var topProviders: [(key: String, value: Int)] {
+        Array(model.summary.byProvider.sorted(by: { $0.value > $1.value }).prefix(5))
+    }
+
+    /// Only the tiers OpenRouter actually served, in a fixed order; "none" when nothing was
+    /// reported yet.
+    private var serviceTiersUsed: String {
+        let tiers = ["flex", "priority", "default"]
+            .compactMap { tier in model.summary.byActualTier[tier].map { "\(tier) \($0)" } }
+        return tiers.isEmpty ? "none" : tiers.joined(separator: " · ")
+    }
+
+    private var fallbackLine: String {
+        let flex = model.summary.flexRequests
+        guard flex > 0 else { return "Fallbacks: -" }
+        return "Fallbacks: \(model.summary.fallbackCount) of \(flex) flex requests"
     }
 
     private var statusBlock: some View {

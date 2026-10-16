@@ -37,6 +37,23 @@ struct StatsTests {
         #expect(abs(summary.totalCostUSD - 0.03) < 1e-9)
     }
 
+    @Test func summarySplitsModelAndOtherRequestsAndCountsFlex() throws {
+        let store = try StatsStore(path: ":memory:")
+        store.record(record(actualTier: "flex", provider: "openai"))
+        // A request without a model id (e.g. /models): forwarded, not policy-managed.
+        store.record(record(path: "/api/v1/models", model: nil))
+        store.record(RequestRecord(
+            time: Date(), path: "/api/v1/chat/completions", model: "openai/gpt-5", sort: .balanced,
+            tier: .flex, status: 503, ttfbMs: 8, retries: 1, usedFallback: true, costUSD: 0.02))
+
+        let summary = store.summary(since: .distantPast)
+        #expect(summary.total == 3)
+        #expect(summary.modelRequests == 2)
+        #expect(summary.otherRequests == 1)
+        #expect(summary.flexRequests == 1)
+        #expect(summary.fallbackCount == 1)
+    }
+
     @Test func sinceExcludesOlderRows() throws {
         let now = Date()
         let store = try StatsStore(path: ":memory:")

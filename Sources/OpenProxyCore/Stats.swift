@@ -44,18 +44,29 @@ public struct RequestRecord: Sendable {
 
 public struct StatsSummary: Sendable {
     public var total: Int
+    /// Requests that carried a model id (chat/responses/messages): the ones the Sort and
+    /// Tier policy could apply to.
+    public var modelRequests: Int
+    /// Requests without a model id (e.g. `/models`, `/key`), forwarded unchanged.
+    public var otherRequests: Int
     public var byProvider: [String: Int]
     public var byActualTier: [String: Int]
+    /// Requests made while Tier=Flex: the denominator for the fallback count.
+    public var flexRequests: Int
     public var fallbackCount: Int
     public var totalCostUSD: Double
 
     public init(
-        total: Int = 0, byProvider: [String: Int] = [:], byActualTier: [String: Int] = [:],
-        fallbackCount: Int = 0, totalCostUSD: Double = 0
+        total: Int = 0, modelRequests: Int = 0, otherRequests: Int = 0,
+        byProvider: [String: Int] = [:], byActualTier: [String: Int] = [:],
+        flexRequests: Int = 0, fallbackCount: Int = 0, totalCostUSD: Double = 0
     ) {
         self.total = total
+        self.modelRequests = modelRequests
+        self.otherRequests = otherRequests
         self.byProvider = byProvider
         self.byActualTier = byActualTier
+        self.flexRequests = flexRequests
         self.fallbackCount = fallbackCount
         self.totalCostUSD = totalCostUSD
     }
@@ -161,12 +172,18 @@ public final class StatsStore: @unchecked Sendable {
         let sinceValue = since.timeIntervalSince1970
         return StatsSummary(
             total: scalar("SELECT COUNT(*) FROM requests WHERE time >= ?1", sinceValue),
+            modelRequests: scalar(
+                "SELECT COUNT(*) FROM requests WHERE time >= ?1 AND model IS NOT NULL", sinceValue),
+            otherRequests: scalar(
+                "SELECT COUNT(*) FROM requests WHERE time >= ?1 AND model IS NULL", sinceValue),
             byProvider: grouped(
                 "SELECT provider, COUNT(*) FROM requests WHERE time >= ?1 AND provider IS NOT NULL GROUP BY provider",
                 sinceValue),
             byActualTier: grouped(
                 "SELECT actual_tier, COUNT(*) FROM requests WHERE time >= ?1 AND actual_tier IS NOT NULL GROUP BY actual_tier",
                 sinceValue),
+            flexRequests: scalar(
+                "SELECT COUNT(*) FROM requests WHERE time >= ?1 AND tier = 'flex'", sinceValue),
             fallbackCount: scalar(
                 "SELECT COALESCE(SUM(used_fallback), 0) FROM requests WHERE time >= ?1", sinceValue),
             totalCostUSD: scalarDouble(
