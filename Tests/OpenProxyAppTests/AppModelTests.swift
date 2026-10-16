@@ -118,6 +118,23 @@ struct AppModelTests {
         #expect(model.status.hostsEntry == true)
     }
 
+    @Test func graphCreatesSupportDirectoryWithOwnerOnlyPermissions() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-graph-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        // A clean install has no openproxy directory yet; the graph must create it
+        // before the SQLite store tries to open stats.sqlite inside it.
+        let base = parent.appending(path: "openproxy")
+
+        _ = try AppGraph.makeModel(baseDirectory: base)
+
+        #expect(FileManager.default.fileExists(atPath: base.path))
+        let attributes = try FileManager.default.attributesOfItem(atPath: base.path)
+        #expect(attributes[.posixPermissions] as? Int == 0o700)
+        #expect(FileManager.default.fileExists(atPath: base.appending(path: "stats.sqlite").path))
+    }
+
     @Test func portInUseBecomesWarningAndLeavesHostsUntouched() async throws {
         let h = try Harness()
         h.server.startError = PortInUse()
