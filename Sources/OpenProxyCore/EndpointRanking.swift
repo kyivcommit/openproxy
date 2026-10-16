@@ -4,7 +4,7 @@ extension Endpoint {
     /// What Smart price sorts by: the more expensive side (input or output), USD per million tokens.
     public var costKeyUSDPerMillion: Double { max(promptUSDPerMillion, completionUSDPerMillion) }
 
-    /// Input plus output price; the first tie-break when the cost key is equal.
+    /// Input plus output price; the last tie-break before the tag.
     public var combinedUSDPerMillion: Double { promptUSDPerMillion + completionUSDPerMillion }
 }
 
@@ -75,17 +75,24 @@ public enum EndpointRanking {
         return true
     }
 
-    /// Cost key ascending; ties: lower input+output, then higher uptime, then tag.
+    /// Cost key ascending; ties: higher throughput, lower latency, higher uptime, lower sum, tag.
     static func isCheaper(_ a: Endpoint, _ b: Endpoint) -> Bool {
         if a.costKeyUSDPerMillion != b.costKeyUSDPerMillion {
             return a.costKeyUSDPerMillion < b.costKeyUSDPerMillion
         }
+        // Speed is present only when the endpoints were fetched with a client key; nil sorts last.
+        if a.throughput != b.throughput {
+            return (a.throughput ?? -.infinity) > (b.throughput ?? -.infinity)
+        }
+        if a.latency != b.latency {
+            return (a.latency ?? .infinity) < (b.latency ?? .infinity)
+        }
+        let aUptime = a.uptimeLast1d ?? a.uptimeLast30m ?? 0
+        let bUptime = b.uptimeLast1d ?? b.uptimeLast30m ?? 0
+        if aUptime != bUptime { return aUptime > bUptime }
         if a.combinedUSDPerMillion != b.combinedUSDPerMillion {
             return a.combinedUSDPerMillion < b.combinedUSDPerMillion
         }
-        let aUptime = a.uptimeLast30m ?? 0
-        let bUptime = b.uptimeLast30m ?? 0
-        if aUptime != bUptime { return aUptime > bUptime }
         return a.tag < b.tag
     }
 }

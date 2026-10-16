@@ -13,24 +13,43 @@ struct EndpointRankingTests {
         return try #require(EndpointCatalog.parseEndpoints(try Data(contentsOf: url)))
     }
 
+    static func speedFixture() throws -> Data {
+        let url = try #require(
+            Bundle.module.url(
+                forResource: "endpoints-with-speed", withExtension: "json", subdirectory: "Fixtures"))
+        return try Data(contentsOf: url)
+    }
+
     /// Unquantized by default: that is the only quantization Smart price keeps.
     func endpoint(
         _ tag: String, quant: String? = "unknown", tier: String? = nil,
-        prompt: Double, completion: Double = 0, uptime: Double? = 100
+        prompt: Double, completion: Double = 0, uptime: Double? = 100,
+        uptime1d: Double? = nil, throughput: Double? = nil, latency: Double? = nil
     ) -> Endpoint {
         Endpoint(
             tag: tag, providerName: tag, quantization: quant, serviceTier: tier,
-            promptUSDPerMillion: prompt, completionUSDPerMillion: completion, uptimeLast30m: uptime)
+            promptUSDPerMillion: prompt, completionUSDPerMillion: completion,
+            uptimeLast30m: uptime, uptimeLast1d: uptime1d,
+            throughput: throughput, latency: latency)
     }
 
     @Test func realFixtureKeepsOnlyUnquantizedEndpoints() throws {
         let ranking = EndpointRanking.rank(endpoints: try Self.fixture(), tier: .auto)
 
         // Only endpoints with no declared precision stay; the fp8 providers are gone too.
-        #expect(ranking.leader == "alibaba")
-        #expect(ranking.order.first == "alibaba")
-        #expect(ranking.order == ["alibaba", "deepseek", "relace", "phala", "cloudflare"])
+        // The keyless fixture carries no speed, so the tie-break falls to 1d uptime then sum.
+        #expect(ranking.leader == "deepseek")
+        #expect(ranking.order.first == "deepseek")
+        #expect(ranking.order == ["deepseek", "relace", "alibaba", "phala", "digitalocean"])
         #expect(!ranking.order.contains(where: { $0.contains("fp") || $0.contains("int") }))
+    }
+
+    @Test func syntheticFixtureBreaksCostTiesByThroughput() throws {
+        // Equal cost key max(prompt, completion): Relace (155 tps) wins over Alibaba (116) and
+        // DeepSeek (53), matching the screenshot order.
+        let endpoints = try #require(EndpointCatalog.parseEndpoints(try Self.speedFixture()))
+        let ranking = EndpointRanking.rank(endpoints: endpoints, tier: .auto)
+        #expect(ranking.order == ["relace", "alibaba", "deepseek"])
     }
 
     @Test func realFixtureFlexHasNoEligibleEndpoint() throws {
@@ -43,14 +62,14 @@ struct EndpointRankingTests {
     @Test func realFixturePriorityFallsBackToStandardEndpoints() throws {
         // The priority endpoints are fp8 / below the uptime floor, so only standard ones remain.
         let ranking = EndpointRanking.rank(endpoints: try Self.fixture(), tier: .priority)
-        #expect(ranking.leader == "alibaba")
+        #expect(ranking.leader == "deepseek")
         #expect(!ranking.order.contains("deepinfra/fp8/priority"))
         #expect(!ranking.order.contains("baseten/fast"))
     }
 
     @Test func realFixtureDefaultMatchesAuto() throws {
         let ranking = EndpointRanking.rank(endpoints: try Self.fixture(), tier: .default)
-        #expect(ranking.leader == "alibaba")
+        #expect(ranking.leader == "deepseek")
     }
 
     @Test func declaredPrecisionsAreSkipped() {
@@ -95,14 +114,41 @@ struct EndpointRankingTests {
         #expect(EndpointRanking.rank(endpoints: endpoints, tier: .auto).leader == "balanced")
     }
 
-    @Test func tiesBreakBySumThenUptimeThenTag() {
+    @Test func tiesBreakByUptimeThenSumThenTag() {
+        // No speed anywhere (keyless fetch): 1d uptime first, then the sum, then the tag.
         let endpoints = [
-            endpoint("b", prompt: 1, uptime: 100), // key 1, sum 1
-            endpoint("a", prompt: 1, uptime: 100), // key 1, sum 1
-            endpoint("high", prompt: 1, uptime: 99.5), // key 1, sum 1, lower uptime
-            endpoint("lowerSum", prompt: 1, completion: 0.1), // same key 1, higher sum 1.1, appends last
+            endpoint("b", prompt: 1, uptime: 100), // key 1, uptime 100, sum 1
+            endpoint("a", prompt: 1, uptime: 100), // key 1, uptime 100, sum 1
+            endpoint("high", prompt: 1, uptime: 99.5), // key 1, lower uptime
+            endpoint("lowerSum", prompt: 1, completion: 0.1), // key 1, uptime 100, sum 1.1
         ]
-        #expect(EndpointRanking.rank(endpoints: endpoints, tier: .auto).order == ["a", "b", "high", "lowerSum"])
+        #expect(EndpointRanking.rank(endpoints: endpoints, tier: .auto).order == ["a", "b", "lowerSum", "high"])
+    }
+
+    @Test func uptimeFallsBackTo30mWhen1dIsMissing() {
+        let endpoints = [
+            endpoint("recent1d", prompt: 1, uptime: 90, uptime1d: 99), // 1d wins
+            endpoint("high30m", prompt: 1, uptime: 100), // fallback to 30m at 100
+        ]
+        #expect(EndpointRanking.rank(endpoints: endpoints, tier: .auto).order == ["high30m", "recent1d"])
+    }
+
+    @Test func speedTiesBreakByLatencyThenThroughput() {
+        let endpoints = [
+            endpoint("slow", prompt: 1, throughput: 100, latency: 2),
+            endpoint("fast", prompt: 1, throughput: 100, latency: 0.5), // same throughput, lower latency
+            endpoint("slower", prompt: 1, throughput: 50, latency: 0.1), // lowest latency but less throughput
+        ]
+        #expect(EndpointRanking.rank(endpoints: endpoints, tier: .auto).order == ["fast", "slow", "slower"])
+    }
+
+    @Test func mixedSpeedRowsSortMeasuredFirst() {
+        let endpoints = [
+            endpoint("keyless", prompt: 1, throughput: nil, latency: nil),
+            endpoint("measured", prompt: 1, throughput: 10, latency: 5),
+        ]
+        // A keyless row has no speed but must not outrank a measured one on the speed criteria.
+        #expect(EndpointRanking.rank(endpoints: endpoints, tier: .auto).order == ["measured", "keyless"])
     }
 
     @Test func hysteresisKeepsLeaderWithinTenPercent() {
