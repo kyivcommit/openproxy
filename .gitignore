@@ -2,3 +2,5 @@
 spike/*.key
 .DS_Store
 build/
+/docs/
+/spike/
