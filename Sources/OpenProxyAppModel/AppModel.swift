@@ -97,10 +97,6 @@ public final class AppModel {
     public private(set) var warnings: [Warning] = []
     public private(set) var loginItemStatus: LoginItemStatus = .notRegistered
 
-    /// One-time advice shown after a successful Install: long-running clients must restart
-    /// to load the new CA. Not a warning; cleared by the user or the next Uninstall.
-    public private(set) var installNotice: String?
-
     /// Derived from `status`, so it stays visible for as long as the danger lasts
     /// (proxy quit/crashed with the hosts entry still routed) and clears itself.
     public var unreachableWarning: String? { status.unreachableWarning }
@@ -130,7 +126,6 @@ public final class AppModel {
     private let server: ProxyServerControlling
     private let loginItem: LoginItemRegistering
     private let quitDecision: QuitDecision
-    private let pasteboard: PasteboardWriting
 
     public init(
         settingsStore: SettingsStore,
@@ -139,7 +134,6 @@ public final class AppModel {
         server: ProxyServerControlling,
         loginItem: LoginItemRegistering,
         quitDecision: QuitDecision,
-        pasteboard: PasteboardWriting = NSPasteboardWriter(),
         caWasRegenerated: Bool = false,
         refreshInterval: Duration = .seconds(5)
     ) {
@@ -149,7 +143,6 @@ public final class AppModel {
         self.server = server
         self.loginItem = loginItem
         self.quitDecision = quitDecision
-        self.pasteboard = pasteboard
         self.refreshInterval = refreshInterval
         self.currentSettings = settingsStore.settings
         self.status = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
@@ -190,26 +183,26 @@ public final class AppModel {
             await refresh()
             return
         }
-        var installed = false
         do {
-            try await installer.install()
-            installed = true
+            let warnings = try await installer.install()
             // The stale install/uninstall/start/quit warnings are no longer true.
             clearWarnings(Self.operationWarningKeys)
+            // The CA and hosts are in place; only the Node env step can have warned.
+            if let warning = warnings.first {
+                warn(.nodeEnv, warning)
+            } else {
+                clearWarnings([.nodeEnv])
+            }
         } catch {
             warn(.install, "Install failed: \(error). The system was not fully changed.")
         }
         await refresh()
-        if installed {
-            installNotice = Self.restartClientsNotice
-        }
     }
 
     public func uninstall() async {
         do {
             try await installer.uninstall()
             clearWarnings(Self.operationWarningKeys)
-            installNotice = nil
         } catch {
             warn(.uninstall, "Uninstall failed: \(error).")
         }
@@ -279,32 +272,6 @@ public final class AppModel {
         }
         refreshRunning = false
     }
-
-    /// Puts the `export NODE_EXTRA_CA_CERTS=…` line on the pasteboard for the user's shell
-    /// profile. The app never edits a profile itself.
-    public func copyNodeCALine() {
-        pasteboard.copy(Installer.nodeCAExportLine(caPEMPath: installer.caPEMPath))
-    }
-
-    /// Sets `NODE_EXTRA_CA_CERTS` for GUI apps launched from now on. Running processes keep
-    /// their old environment, which is why the menu tells the user to restart them.
-    public func setNodeCAEnvForGUIApps() async {
-        do {
-            try await installer.applyNodeCAEnv()
-        } catch {
-            warn(.nodeEnv, "Could not set NODE_EXTRA_CA_CERTS: \(error).")
-        }
-        await refresh()
-    }
-
-    public func dismissInstallNotice() {
-        installNotice = nil
-    }
-
-    /// Shown once after a successful Install (finding: clients that started before Install
-    /// keep their old trust store).
-    static let restartClientsNotice =
-        "Restart long-running clients (e.g. `opencode service restart`) so they trust the new CA."
 
     /// Called by the menu on appear/disappear: refresh once right away, then on
     /// `refreshInterval` while the menu stays open so a crashed proxy or new

@@ -67,14 +67,6 @@ private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
     }
 }
 
-/// Records what would go on the clipboard, so tests never touch the real pasteboard.
-@MainActor
-private final class FakePasteboard: PasteboardWriting {
-    private(set) var copied: [String] = []
-
-    func copy(_ string: String) { copied.append(string) }
-}
-
 private struct PortInUse: Error {}
 private enum LoginItemTestError: Error { case denied }
 
@@ -117,7 +109,6 @@ private struct Harness {
     let server: FakeServer
     let loginItem: FakeLoginItem
     let quitDecision: FakeQuitDecision
-    let pasteboard: FakePasteboard
 
     init(hostsText: String? = nil) throws {
         let directory = FileManager.default.temporaryDirectory
@@ -142,14 +133,13 @@ private struct Harness {
         self.server = FakeServer()
         self.loginItem = FakeLoginItem()
         self.quitDecision = FakeQuitDecision()
-        self.pasteboard = FakePasteboard()
     }
 
     func model(refreshInterval: Duration = .seconds(5)) -> AppModel {
         AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: loginItem, quitDecision: quitDecision,
-            pasteboard: pasteboard, refreshInterval: refreshInterval)
+            refreshInterval: refreshInterval)
     }
 
     /// Bounded polling helper: returns false after `timeout` so a missing
@@ -618,78 +608,30 @@ struct AppModelTests {
         #expect(model.warnings.contains { $0.key == .legacyCA })
     }
 
-    // MARK: - Item 2: Node CA env actions
+    // MARK: - Item 1: Install sets NODE_EXTRA_CA_CERTS
 
-    @Test func copyNodeCALinePutsExportOnPasteboard() throws {
+    @Test func successfulInstallSetsNodeCAEnv() async throws {
         let h = try Harness()
         let model = h.model()
 
-        model.copyNodeCALine()
-
-        #expect(h.pasteboard.copied == ["export NODE_EXTRA_CA_CERTS=\"\(h.installer.caPEMPath)\""])
-    }
-
-    @Test func setNodeCAEnvForGUIAppsRunsLaunchctl() async throws {
-        let h = try Harness()
-        let model = h.model()
-
-        await model.setNodeCAEnvForGUIApps()
+        await model.install()
 
         #expect(h.commandRunner.commands.contains {
             $0.contains("launchctl setenv NODE_EXTRA_CA_CERTS")
         })
-        #expect(model.warnings.isEmpty)
+        #expect(!model.warnings.contains { $0.key == .nodeEnv })
     }
 
-    @Test func setNodeCAEnvFailureBecomesWarning() async throws {
+    @Test func installStaysSuccessfulWhenNodeCAEnvFails() async throws {
         let h = try Harness()
         h.commandRunner.errorOnContains = "launchctl setenv"
         let model = h.model()
 
-        await model.setNodeCAEnvForGUIApps()
+        await model.install()
 
+        // The CA and hosts install succeeded; only the env step warned.
+        #expect(h.runner.scripts.count == 1)
         #expect(model.warnings.contains { $0.key == .nodeEnv })
-    }
-
-    // MARK: - Item 3: one-time restart notice after Install
-
-    @Test func successfulInstallShowsRestartNotice() async throws {
-        let h = try Harness()
-        let model = h.model()
-
-        await model.install()
-
-        #expect(model.installNotice?.contains("opencode service restart") == true)
-    }
-
-    @Test func failedInstallShowsNoRestartNotice() async throws {
-        let h = try Harness()
-        h.runner.error = InstallError.runnerFailed("user cancelled")
-        let model = h.model()
-
-        await model.install()
-
-        #expect(model.installNotice == nil)
-    }
-
-    @Test func dismissInstallNoticeClearsIt() async throws {
-        let h = try Harness()
-        let model = h.model()
-        await model.install()
-
-        model.dismissInstallNotice()
-
-        #expect(model.installNotice == nil)
-    }
-
-    @Test func uninstallClearsInstallNotice() async throws {
-        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
-        let model = h.model()
-        await model.install()
-        #expect(model.installNotice != nil)
-
-        await model.uninstall()
-
-        #expect(model.installNotice == nil)
+        #expect(!model.warnings.contains { $0.key == .install })
     }
 }

@@ -115,18 +115,21 @@ struct InstallerTests {
         try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).install()
 
         // Phase 1: unprivileged, user-domain trust in the login keychain, then verify.
-        #expect(commands.commands.count == 2)
+        #expect(commands.commands.count == 3)
         let add = try #require(commands.commands.first)
         #expect(add.contains(#"security add-trusted-cert -r trustRoot -k "$HOME/Library/Keychains/login.keychain-db""#))
         #expect(!add.contains(" -d "))
         #expect(!add.contains("System.keychain"))
-        let verify = try #require(commands.commands.last)
+        let verify = try #require(commands.commands.dropFirst().first)
         #expect(verify.contains("security verify-cert -c"))
         #expect(verify.contains("-p basic"))
         // Both commands act on the same private temp copy, never the user-writable ca.pem directly.
         let copied = try #require(tempCopyPath(in: add))
         #expect(copied == tempCopyPath(in: verify))
         #expect(copied != TestCA.pemURL.path)
+        // After trust + hosts succeed, the Node env variable points new processes at the CA.
+        let nodeEnv = try #require(commands.commands.last)
+        #expect(nodeEnv.contains("launchctl setenv NODE_EXTRA_CA_CERTS"))
 
         // Phase 2: one admin script with the hosts entry and the flush only.
         #expect(runner.scripts.count == 1)
@@ -208,6 +211,42 @@ struct InstallerTests {
         let installer = makeInstaller(runner: runner, hostsPath: hostsPath)
 
         await #expect(throws: InstallError.self) { try await installer.install() }
+    }
+
+    @Test func installSetsNodeCAEnvAfterHostsAndReturnsNoWarnings() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner()
+
+        let warnings = try await makeInstaller(
+            runner: runner, commandRunner: commands, hostsPath: hostsPath).install()
+
+        #expect(warnings.isEmpty)
+        // The env step runs last, after the privileged hosts edit.
+        let nodeEnv = try #require(commands.commands.last)
+        #expect(nodeEnv.contains("launchctl setenv NODE_EXTRA_CA_CERTS"))
+        #expect(nodeEnv.contains(TestCA.pemURL.path))
+        #expect(runner.scripts.count == 1)
+    }
+
+    @Test func installWarnsButSucceedsWhenNodeCAEnvFails() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            command.contains("launchctl setenv")
+                ? CommandResult(status: 1, standardError: "launchctl: failed")
+                : CommandResult(status: 0)
+        })
+
+        let warnings = try await makeInstaller(
+            runner: runner, commandRunner: commands, hostsPath: hostsPath).install()
+
+        // The hosts edit already ran and the install succeeds; the env failure is a warning.
+        #expect(runner.scripts.count == 1)
+        #expect(warnings.count == 1)
+        #expect(warnings.first?.contains("NODE_EXTRA_CA_CERTS") == true)
     }
 
     // MARK: - Item 2: uninstall

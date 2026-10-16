@@ -313,7 +313,12 @@ public final class Installer: @unchecked Sendable {
     /// Phase 1 trusts the CA in the user's login keychain (user-domain trust, no `-d`) and
     /// verifies it; phase 2 adds the hosts entry. Fail closed: a trust failure throws before
     /// any hosts edit, so a client is never routed to a proxy it cannot trust.
-    public func install() async throws {
+    ///
+    /// Returns non-fatal warnings: the install itself succeeded, but a best-effort follow-up
+    /// (pointing `NODE_EXTRA_CA_CERTS` at the CA for Node clients) did not. Callers show them
+    /// in the menu instead of failing the install.
+    @discardableResult
+    public func install() async throws -> [String] {
         let trustedCopy = try privateCopyOfCA()
         defer { try? FileManager.default.removeItem(at: trustedCopy.deletingLastPathComponent()) }
 
@@ -341,6 +346,16 @@ public final class Installer: @unchecked Sendable {
             try await runner.run(script: script)
         } catch {
             throw InstallError.runnerFailed(String(describing: error))
+        }
+
+        // Trust and hosts are in place; finally point new processes at the CA so Node clients
+        // started afterwards trust it. Unprivileged and non-fatal: a failure never rolls back
+        // the working routes above, it only surfaces as a warning.
+        do {
+            try await applyNodeCAEnv()
+            return []
+        } catch {
+            return ["Could not set NODE_EXTRA_CA_CERTS: \(error)."]
         }
     }
 
@@ -581,15 +596,6 @@ public final class Installer: @unchecked Sendable {
             portListening: port.succeeded,
             nodeCAEnv: !nodeEnv.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         )
-    }
-
-    /// Path to the CA certificate PEM, for the copyable Node line.
-    public var caPEMPath: String { caPEMURL.path }
-
-    /// The shell line Node clients need in their profile. The app only copies it; it never
-    /// writes any shell profile.
-    public static func nodeCAExportLine(caPEMPath: String) -> String {
-        "export NODE_EXTRA_CA_CERTS=\"\(caPEMPath)\""
     }
 
     /// Points new processes at the CA for Node clients. Unprivileged, so toggling it never prompts.

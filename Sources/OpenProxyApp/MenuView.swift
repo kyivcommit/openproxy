@@ -37,10 +37,6 @@ struct MenuView: View {
                 Divider()
                 unreachableBlock(untrustedCA)
             }
-            if let notice = model.installNotice {
-                Divider()
-                installNoticeBlock(notice)
-            }
             if !model.warnings.isEmpty {
                 Divider()
                 warningBlock
@@ -105,27 +101,27 @@ struct MenuView: View {
             caRow
             statusRow("Hosts entry", model.status.hostsEntry)
             statusRow("Port 443 listening", model.status.portListening)
-            statusRow("Node CA env", model.status.nodeCAEnv)
-            nodeCAActions
+            nodeEnvRow
             Text("Autostart: \(model.loginItemStatus.label)").font(.caption)
         }
     }
 
-    /// Finding: the Node row showed a cross with no action. These two buttons are the
-    /// offered fix; the app never edits a shell profile.
-    private var nodeCAActions: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Button("Copy Node CA line") { model.copyNodeCALine() }
-                Button("Set for GUI apps") { Task { await model.setNodeCAEnvForGUIApps() } }
+    /// Install sets `NODE_EXTRA_CA_CERTS` for processes started afterwards; the hint appears
+    /// only while the variable is set, so the user knows what is already running must restart.
+    private var nodeEnvRow: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            statusRow("Node CA env", model.status.nodeCAEnv)
+            if model.status.nodeCAEnv {
+                Text(Self.nodeRestartHint)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .font(.caption)
-            Text("Terminal sessions need the export line in your shell profile; running clients must be restarted.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
+
+    private static let nodeRestartHint =
+        "Restart your terminal app and any running agents so they pick up the CA."
 
     /// Distinguishes "not installed" from "present but not trusted" (the real-install bug:
     /// the certificate was in a keychain but its trust settings had not been applied).
@@ -156,24 +152,6 @@ struct MenuView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
             Button("Uninstall") { Task { await model.uninstall() } }
-        }
-    }
-
-    /// A one-time, dismissible info line (not a warning): restart long-running clients
-    /// after Install so they load the new CA.
-    private func installNoticeBlock(_ message: String) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Text("ℹ︎ \(message)")
-                .font(.caption)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            Button {
-                model.dismissInstallNotice()
-            } label: {
-                Image(systemName: "xmark.circle")
-            }
-            .buttonStyle(.plain)
-            .help("Dismiss")
         }
     }
 
