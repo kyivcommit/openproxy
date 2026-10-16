@@ -133,7 +133,14 @@ struct MenuView: View {
     /// only while the variable is set, so the user knows what is already running must restart.
     private var nodeEnvRow: some View {
         VStack(alignment: .leading, spacing: 2) {
-            statusRow("Node CA env", model.status.nodeCAEnv)
+            if let note = model.status.nodeCAEnvNote {
+                // A set variable pointing at a missing CA: say so, without a misleading cross.
+                Text("Node CA env: \(note)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                statusRow("Node CA env", model.status.nodeCAEnv)
+            }
             if model.status.nodeCAEnv {
                 Text(Self.nodeRestartHint)
                     .font(.caption2)

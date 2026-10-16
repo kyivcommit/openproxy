@@ -417,6 +417,19 @@ struct AppModelTests {
         #expect(model.untrustedCAWarning == nil)
     }
 
+    @Test func nodeCAEnvSetWithMissingCAReadsAsANeutralNote() {
+        // Leftover env var (e.g. after the CA was removed): set, but not usable.
+        let orphan = InstallStatus(
+            caTrusted: false, caPresent: false, hostsEntry: false, portListening: false, nodeCAEnv: true)
+        #expect(orphan.nodeCAEnvNote == "set (CA not installed)")
+        let healthy = InstallStatus(
+            caTrusted: true, caPresent: true, hostsEntry: true, portListening: true, nodeCAEnv: true)
+        #expect(healthy.nodeCAEnvNote == nil)
+        let unset = InstallStatus(
+            caTrusted: false, caPresent: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
+        #expect(unset.nodeCAEnvNote == nil)
+    }
+
     @Test func portInUseBecomesWarningAndLeavesHostsUntouched() async throws {
         let h = try Harness()
         h.server.startError = PortInUse()

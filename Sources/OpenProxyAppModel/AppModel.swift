@@ -67,6 +67,13 @@ extension InstallStatus {
         return "openrouter.ai is routed to 127.0.0.1 but the CA is missing or not trusted, "
             + "so every client's TLS handshake fails. Press Uninstall to restore access, then Install again."
     }
+
+    /// The Node-env row text when `NODE_EXTRA_CA_CERTS` is set but no CA is installed (for
+    /// example a leftover from an install whose CA was later removed): the value is set, but
+    /// it is not usable, so the row must not read as a clean check mark.
+    public var nodeCAEnvNote: String? {
+        nodeCAEnv && !caPresent ? "set (CA not installed)" : nil
+    }
 }
 
 /// UI-free view model. It owns the live settings, the stats summary and the
