@@ -119,3 +119,7 @@ CI (`.github/workflows/ci.yml`) builds, tests and packages on macOS.
 - Trust is **per-user**: the CA is trusted and stored only in your login keychain, not system-wide, and the private key is a file (`ca.key`, mode 600) under `~/Library/Application Support/openproxy/`. The CA is name-constrained to `openrouter.ai`, but anyone who can read the key could impersonate that one host to this Mac. Treat the directory as sensitive.
 - `Authorization` headers are forwarded to OpenRouter only and never logged or stored.
 - While the hosts entry is installed and the app is not running, `openrouter.ai` is unreachable from this Mac.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
