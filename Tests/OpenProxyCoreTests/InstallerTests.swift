@@ -265,11 +265,77 @@ struct InstallerTests {
             CommandResult(status: 1, standardError: "no trust settings")
         })
 
-        // Best-effort phase B: a failure must not throw and must not undo the hosts restore.
-        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+        // Phase B is best-effort for correctness, but the hosts restore — the safety-critical
+        // half — already ran and must never be undone. The leftover failure is reported, not
+        // swallowed as a clean success.
+        await #expect(throws: InstallError.self) { try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall() }
 
         #expect(runner.scripts.count == 1)
         #expect(commands.commands.contains { $0.contains("remove-trusted-cert") })
+    }
+
+    @Test func uninstallRemovesAdminTrustInPrivilegedPhaseBeforeSweepingSystemKeychain() async throws {
+        // An older install used `add-trusted-cert -d`, which writes admin trust settings that
+        // deleting the certificate item leaves behind; `remove-trusted-cert -d` clears them.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).uninstall()
+
+        let script = try #require(runner.scripts.first)
+        let hostsRestore = try #require(script.range(of: "sed -E"))
+        let removeTrust = try #require(script.range(of: "security remove-trusted-cert -d"))
+        let sweep = try #require(script.range(of: "security find-certificate"))
+        #expect(hostsRestore.lowerBound < removeTrust.lowerBound)
+        #expect(removeTrust.lowerBound < sweep.lowerBound)
+        // The CA file is passed and the step is best-effort, so a missing admin trust
+        // setting cannot fail the uninstall.
+        #expect(script.contains(TestCA.pemURL.path))
+        let trustLine = try #require(script.split(separator: "\n").first { $0.contains("remove-trusted-cert") })
+        #expect(trustLine.contains("|| true"))
+    }
+
+    @Test func uninstallDeletesLoginKeychainCertWithTrustSettings() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner()
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+
+        // System keychain (privileged phase): no per-user trust settings to carry.
+        let system = try #require(runner.scripts.first)
+        #expect(system.contains("security delete-certificate -Z \"$hash\""))
+        #expect(!system.contains("delete-certificate -t"))
+
+        // Login keychain (phase B): `-t` removes the per-user trust settings with the cert.
+        let login = try #require(commands.commands.first { $0.contains("login.keychain-db") })
+        #expect(login.contains("security delete-certificate -t -Z \"$hash\""))
+    }
+
+    @Test func uninstallReportsLeftoverCleanupFailureAfterHostsRemoval() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            command.contains("remove-trusted-cert")
+                ? CommandResult(status: 1, standardError: "no trust settings")
+                : CommandResult(status: 0)
+        })
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        // Hosts was restored first and was never blocked...
+        #expect(runner.scripts.count == 1)
+        #expect(runner.scripts.first?.contains("sed -E") == true)
+        // ...but the leftover trust cleanup failure is reported, not hidden behind a success.
+        #expect(thrown?.description.contains("trust") == true)
     }
 
     @Test func statusReportsHostsEntry() async throws {
