@@ -1,0 +1,155 @@
+import Foundation
+
+/// Runs a shell script with administrator privileges. Injected so tests can record
+/// the script without triggering the real macOS authorization dialog.
+public protocol PrivilegedRunner: Sendable {
+    func run(script: String) async throws
+}
+
+/// The production runner: `osascript -e 'do shell script … with administrator privileges'`
+/// produces the single system authorization prompt for all privileged steps.
+public struct OsascriptRunner: PrivilegedRunner {
+    public init() {}
+
+    public func run(script: String) async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", Self.appleScript(forShellScript: script)]
+        do {
+            try process.run()
+        } catch {
+            throw InstallError.runnerFailed(String(describing: error))
+        }
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            // The user cancelling the admin dialog also lands here; the UI reports the refusal.
+            throw InstallError.runnerFailed("osascript exited with status \(process.terminationStatus)")
+        }
+    }
+
+    /// Wraps a shell script in an AppleScript `do shell script` string, escaping
+    /// backslashes and quotes so arbitrary hosts text survives intact.
+    static func appleScript(forShellScript script: String) -> String {
+        let escaped = script
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "do shell script \"\(escaped)\" with administrator privileges"
+    }
+}
+
+public struct InstallStatus: Equatable, Sendable {
+    public var caTrusted: Bool
+    public var hostsEntry: Bool
+    public var portListening: Bool
+    public var nodeCAEnv: Bool
+
+    public init(caTrusted: Bool, hostsEntry: Bool, portListening: Bool, nodeCAEnv: Bool) {
+        self.caTrusted = caTrusted
+        self.hostsEntry = hostsEntry
+        self.portListening = portListening
+        self.nodeCAEnv = nodeCAEnv
+    }
+}
+
+public enum InstallError: Error, Equatable, Sendable {
+    case runnerFailed(String)
+    case commandFailed(command: String, status: Int32)
+}
+
+/// Installs the CA into the System keychain and the hosts entry for `openrouter.ai`.
+/// All privileged steps run inside a single admin script so the user sees one prompt.
+public final class Installer: @unchecked Sendable {
+    private let caPEMURL: URL
+    private let caCommonName: String
+    private let runner: PrivilegedRunner
+    private let hostsPath: String
+
+    public init(
+        caPEMURL: URL,
+        caCommonName: String = "OpenProxy Local CA",
+        runner: PrivilegedRunner,
+        hostsPath: String = "/etc/hosts"
+    ) {
+        self.caPEMURL = caPEMURL
+        self.caCommonName = caCommonName
+        self.runner = runner
+        self.hostsPath = hostsPath
+    }
+
+    public func install() async throws {
+        let newHosts = HostsFile.adding(to: Self.readHosts(hostsPath))
+        let script = """
+        security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \(Self.quoted(caPEMURL.path))
+        printf '%s' \(Self.quoted(newHosts)) > \(Self.quoted(hostsPath))
+        dscacheutil -flushcache
+        """
+        do {
+            try await runner.run(script: script)
+        } catch {
+            throw InstallError.runnerFailed(String(describing: error))
+        }
+    }
+
+    public func uninstall() async throws {
+        let newHosts = HostsFile.removing(from: Self.readHosts(hostsPath))
+        let script = """
+        printf '%s' \(Self.quoted(newHosts)) > \(Self.quoted(hostsPath))
+        security delete-certificate -c \(Self.quoted(caCommonName)) /Library/Keychains/System.keychain
+        dscacheutil -flushcache
+        """
+        do {
+            try await runner.run(script: script)
+        } catch {
+            throw InstallError.runnerFailed(String(describing: error))
+        }
+    }
+
+    public func status() async -> InstallStatus {
+        InstallStatus(
+            caTrusted: Self.shell("security find-certificate -c \(Self.quoted(caCommonName)) /Library/Keychains/System.keychain").status == 0,
+            hostsEntry: HostsFile.isPresent(in: Self.readHosts(hostsPath)),
+            portListening: Self.shell("nc -z -G 1 127.0.0.1 443").status == 0,
+            nodeCAEnv: !Self.shell("launchctl getenv NODE_EXTRA_CA_CERTS").output
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+    }
+
+    /// Points new processes at the CA for Node clients. Unprivileged, so toggling it never prompts.
+    public func applyNodeCAEnv() throws {
+        let command = Self.nodeCAEnvCommand(caPEMURL: caPEMURL)
+        let status = Self.shell(command).status
+        guard status == 0 else {
+            throw InstallError.commandFailed(command: command, status: status)
+        }
+    }
+
+    static func nodeCAEnvCommand(caPEMURL: URL) -> String {
+        "launchctl setenv NODE_EXTRA_CA_CERTS \(quoted(caPEMURL.path))"
+    }
+
+    private static func readHosts(_ path: String) -> String {
+        (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+    }
+
+    /// Single-quotes a value for `/bin/sh`, the only quoting that survives arbitrary text.
+    private static func quoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func shell(_ command: String) -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", command]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return (-1, "")
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+}
