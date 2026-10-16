@@ -75,4 +75,16 @@ struct StatsTests {
         #expect(summary.fallbackCount == 0)
         #expect(summary.totalCostUSD == 0)
     }
+
+    @Test func largeIntegerFieldsDoNotTrap() throws {
+        // Tokens and millisecond durations routinely exceed Int32.max; the old
+        // `Int32(...)` binds trapped. A record must round-trip without crashing.
+        let store = try StatsStore(path: ":memory:")
+        store.record(RequestRecord(
+            time: Date(), path: "/api/v1/chat/completions", model: "m", sort: .balanced, tier: .auto,
+            status: 200, ttfbMs: 3_000_000_000, retries: 0, usedFallback: false,
+            promptTokens: 3_000_000_000, completionTokens: 3_000_000_000, costUSD: 1))
+
+        #expect(store.summary(since: .distantPast).total == 1)
+    }
 }

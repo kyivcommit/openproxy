@@ -1,6 +1,7 @@
 import Foundation
 import X509
 import Crypto
+import SwiftASN1
 
 /// A local CA constrained to `openrouter.ai`, plus short-lived leaf certificates for it.
 ///
@@ -15,15 +16,30 @@ public final class CertAuthority: @unchecked Sendable {
     private static let commonName = "OpenProxy Local CA"
     private static let leafValidity: TimeInterval = 90 * 86_400
     private static let renewalWindow: TimeInterval = 30 * 86_400
+    /// Forbid every IP SAN. Without these the `permitted DNS:openrouter.ai` constraint is
+    /// bypassed by a leaf carrying an IP SAN; a stolen `ca.key` could then sign an IP leaf
+    /// that Security.framework and OpenSSL both accept. The mask is the CIDR network mask,
+    /// so an all-zero mask covers the whole address space (`0.0.0.0/0` and `::/0`).
+    private static let excludedIPRanges: [ASN1OctetString] = [
+        ASN1OctetString(contentBytes: [0, 0, 0, 0, 0, 0, 0, 0]),  // 0.0.0.0/0
+        ASN1OctetString(contentBytes: ArraySlice([UInt8](repeating: 0, count: 32))),  // ::/0
+    ]
 
     private let directory: URL
+    private let clock: @Sendable () -> Date
     private let lock = NSLock()
     private var caCertificate: Certificate?
     private var caPrivateKey: Certificate.PrivateKey?
     private var cachedLeaf: (certificate: Certificate, privateKey: Certificate.PrivateKey, notValidAfter: Date)?
 
-    public init(directory: URL) {
+    public convenience init(directory: URL) {
+        self.init(directory: directory, clock: Date.init)
+    }
+
+    /// `clock` is a test seam for exercising leaf renewal; production uses `Date.init`.
+    init(directory: URL, clock: @escaping @Sendable () -> Date) {
         self.directory = directory
+        self.clock = clock
     }
 
     /// PEM of the CA certificate; also the path written by `loadOrCreate`.
@@ -65,9 +81,10 @@ public final class CertAuthority: @unchecked Sendable {
 
     /// Returns the current leaf certificate and key, issuing a new one if none is cached or the
     /// cached one is within 30 days of expiry.
-    public func leaf(now: Date = Date()) throws -> (certificatePEM: String, privateKeyPEM: String) {
+    public func leaf(now: Date? = nil) throws -> (certificatePEM: String, privateKeyPEM: String) {
         try lock.withLock {
             guard let caCertificate, let caPrivateKey else { throw Error.notLoaded }
+            let now = now ?? clock()
 
             if let cached = cachedLeaf, now < cached.notValidAfter.addingTimeInterval(-Self.renewalWindow) {
                 return (try cached.certificate.serializeAsPEM().pemString, try cached.privateKey.serializeAsPEM().pemString)
@@ -97,7 +114,9 @@ public final class CertAuthority: @unchecked Sendable {
             extensions: Certificate.Extensions {
                 Critical(BasicConstraints.isCertificateAuthority(maxPathLength: 0))
                 Critical(KeyUsage(keyCertSign: true, cRLSign: true))
-                Critical(NameConstraints(permittedDNSDomains: [hostname]))
+                Critical(NameConstraints(
+                    permittedDNSDomains: [hostname],
+                    excludedIPRanges: excludedIPRanges))
             },
             issuerPrivateKey: privateKey
         )

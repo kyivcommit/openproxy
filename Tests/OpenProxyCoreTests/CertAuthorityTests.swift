@@ -2,6 +2,7 @@ import Foundation
 import Testing
 import X509
 import Crypto
+import SwiftASN1
 
 @testable import OpenProxyCore
 
@@ -82,6 +83,54 @@ struct CertAuthorityTests {
         if case .validCertificate = result {
             Issue.record("a leaf for example.com must be rejected by the CA name constraint")
         }
+    }
+
+    @Test func leafWithIPSANRejectedBySwiftVerifier() async throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+
+        let ca = try Certificate(pemEncoded: String(contentsOf: authority.caCertificatePEMURL))
+        let caKey = try Certificate.PrivateKey(pemEncoded: String(contentsOf: directory.appending(path: "ca.key")))
+        // A stolen ca.key used to be able to mint an IP-SAN leaf the DNS-only constraint let through.
+        let ipLeaf = try Self.makeLeaf(
+            san: .ipAddress(ASN1OctetString(contentBytes: [1, 2, 3, 4])), issuer: ca, issuerKey: caKey)
+
+        var verifier = Verifier(rootCertificates: CertificateStore([ca])) {
+            RFC5280Policy()
+        }
+        let result = await verifier.validate(leaf: ipLeaf, intermediates: CertificateStore())
+        if case .validCertificate = result {
+            Issue.record("a leaf with an IP SAN must be rejected by the CA's excluded IP name constraint")
+        }
+    }
+
+    @Test(.enabled(if: opensslPath != nil))
+    func leafWithIPSANRejectedByOpenssl() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+        let ca = try Certificate(pemEncoded: String(contentsOf: authority.caCertificatePEMURL))
+        let caKey = try Certificate.PrivateKey(pemEncoded: String(contentsOf: directory.appending(path: "ca.key")))
+        let ipLeaf = try Self.makeLeaf(
+            san: .ipAddress(ASN1OctetString(contentBytes: [1, 2, 3, 4])), issuer: ca, issuerKey: caKey)
+        let leafURL = directory.appending(path: "ip-leaf.pem")
+        try ipLeaf.serializeAsPEM().pemString.write(to: leafURL, atomically: true, encoding: .utf8)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: opensslPath!)
+        process.arguments = ["verify", "-CAfile", authority.caCertificatePEMURL.path, leafURL.path]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let log = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #expect(process.terminationStatus != 0, "openssl accepted an IP-SAN leaf: \(log)")
     }
 
     @Test func regeneratesNearExpiry() throws {
@@ -174,6 +223,30 @@ struct CertAuthorityTests {
                 BasicConstraints.notCertificateAuthority
                 KeyUsage(digitalSignature: true)
                 SubjectAlternativeNames([.dnsName(hostname)])
+                try ExtendedKeyUsage([.serverAuth])
+            },
+            issuerPrivateKey: issuerKey
+        )
+    }
+
+    /// Builds a leaf with a single SAN of the caller's choosing, signed by the CA, so tests
+    /// can probe the name constraint (DNS and IP forms).
+    static func makeLeaf(san: GeneralName, issuer: Certificate, issuerKey: Certificate.PrivateKey) throws -> Certificate {
+        let key = P256.Signing.PrivateKey()
+        let now = Date()
+        return try Certificate(
+            version: .v3,
+            serialNumber: Certificate.SerialNumber(),
+            publicKey: Certificate.PublicKey(key.publicKey),
+            notValidBefore: now.addingTimeInterval(-60),
+            notValidAfter: now.addingTimeInterval(90 * 86_400),
+            issuer: issuer.subject,
+            subject: try DistinguishedName { CommonName("openproxy-leaf") },
+            signatureAlgorithm: .ecdsaWithSHA256,
+            extensions: Certificate.Extensions {
+                BasicConstraints.notCertificateAuthority
+                KeyUsage(digitalSignature: true)
+                SubjectAlternativeNames([san])
                 try ExtendedKeyUsage([.serverAuth])
             },
             issuerPrivateKey: issuerKey

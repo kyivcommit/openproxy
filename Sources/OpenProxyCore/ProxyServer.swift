@@ -43,6 +43,8 @@ public final class ProxyServer: @unchecked Sendable {
     private let settings: @Sendable () -> Settings
     private let group: EventLoopGroup
     private var channel: Channel?
+    private let sslLock = NSLock()
+    private var cachedSSL: (leafPEM: String, context: NIOSSLContext)?
 
     public private(set) var boundPort = 0
 
@@ -68,7 +70,7 @@ public final class ProxyServer: @unchecked Sendable {
     }
 
     public func start() async throws {
-        let sslContext = try Self.makeSSLContext(ca.leaf())
+        _ = try currentSSLContext()
         let config = self.config
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
@@ -81,6 +83,9 @@ public final class ProxyServer: @unchecked Sendable {
                     return channel.close()
                 }
                 return channel.eventLoop.makeCompletedFuture {
+                    // The leaf is fetched per handshake (and rebuilt only when it changes) so a
+                    // long-running process picks up a cert regenerated near expiry without a restart.
+                    let sslContext = try self.currentSSLContext()
                     try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: sslContext))
                     // Pipelining assistance stays off: it pauses socket reads until the
                     // response completes, which would hide a client disconnect mid-stream.
@@ -92,6 +97,17 @@ public final class ProxyServer: @unchecked Sendable {
         let bound = try await bootstrap.bind(host: config.bindHost, port: config.port).get()
         self.channel = bound
         self.boundPort = bound.localAddress?.port ?? config.port
+    }
+
+    /// The current leaf's TLS context, rebuilt only when `CertAuthority` regenerates the leaf.
+    private func currentSSLContext() throws -> NIOSSLContext {
+        let leaf = try ca.leaf()
+        return try sslLock.withLock {
+            if let cachedSSL, cachedSSL.leafPEM == leaf.certificatePEM { return cachedSSL.context }
+            let context = try Self.makeSSLContext(leaf)
+            cachedSSL = (leaf.certificatePEM, context)
+            return context
+        }
     }
 
     public func stop() async {
@@ -224,7 +240,7 @@ public final class ProxyServer: @unchecked Sendable {
     private func sendUpstream(_ request: UpstreamRequest, timeout: TimeInterval) async throws -> UpstreamResponse {
         let sendTask = Task { try await upstream.send(request) }
         let timeoutTask = Task {
-            try await Task.sleep(nanoseconds: UInt64(max(timeout, 0) * 1_000_000_000))
+            try await Task.sleep(nanoseconds: Self.timeoutNanoseconds(timeout))
             sendTask.cancel()
         }
         defer { timeoutTask.cancel() }
@@ -309,6 +325,13 @@ public final class ProxyServer: @unchecked Sendable {
     static func isStreaming(_ body: Data) -> Bool {
         guard let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else { return false }
         return object["stream"] as? Bool == true
+    }
+
+    /// Clamps a first-byte timeout before converting to nanoseconds: a huge or NaN interval
+    /// would trap in the `UInt64` conversion, and anything past an hour is effectively forever.
+    static func timeoutNanoseconds(_ timeout: TimeInterval) -> UInt64 {
+        let clamped = timeout.isFinite ? min(max(timeout, 0), 3600) : 0
+        return UInt64(clamped * 1_000_000_000)
     }
 
     static func serverTLSConfiguration(

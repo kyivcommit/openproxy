@@ -78,9 +78,10 @@ public enum UpstreamError: Error, Equatable, Sendable {
     case forbiddenAddress(String)
 }
 
-/// Resolves via Cloudflare's DNS-over-HTTPS JSON API, so `/etc/hosts` (which
-/// points `openrouter.ai` at the proxy) cannot feed us our own address, and
-/// keeps the last known good answer for offline/DoS fallbacks.
+/// Resolves via public DNS-over-HTTPS JSON APIs, so `/etc/hosts` (which points
+/// `openrouter.ai` at the proxy) cannot feed us our own address, and keeps the last
+/// known good answer for offline/DoS fallbacks. Two providers are tried in order so a
+/// single provider outage still resolves; the system resolver is never used.
 public final class DoHResolver: HostResolver, @unchecked Sendable {
     struct Record: Sendable {
         var addresses: [String]
@@ -88,36 +89,46 @@ public final class DoHResolver: HostResolver, @unchecked Sendable {
         var ttl: TimeInterval?
     }
 
+    /// Both return the RFC 8427-style `{"Answer":[{"type":1,"data":...}]}` shape.
+    public static let defaultEndpoints: [URL] = [
+        URL(string: "https://cloudflare-dns.com/dns-query")!,
+        URL(string: "https://dns.google/resolve")!,
+    ]
+
+    private let endpoints: [URL]
     private let now: @Sendable () -> Date
     private let maxStale: TimeInterval
-    private let fetch: @Sendable (String) async throws -> Record
+    private let fetch: @Sendable (URL, String) async throws -> Record
     private let lock = NSLock()
     private var cache: [String: (record: Record, storedAt: Date)] = [:]
 
-    public convenience init(endpoint: URL = URL(string: "https://cloudflare-dns.com/dns-query")!) {
-        self.init(endpoint: endpoint, now: Date.init, maxStale: 3600)
+    public convenience init(endpoints: [URL] = DoHResolver.defaultEndpoints) {
+        self.init(endpoints: endpoints, now: Date.init, maxStale: 3600)
     }
 
     /// `fetch`, `now` and `maxStale` are injection points for tests; production
-    /// uses the Cloudflare query and a one-hour cap on stale answers.
+    /// queries the default providers and caps stale answers at one hour.
     init(
-        endpoint: URL,
+        endpoints: [URL],
         now: @escaping @Sendable () -> Date,
         maxStale: TimeInterval,
-        fetch: (@Sendable (String) async throws -> Record)? = nil
+        fetch: (@Sendable (URL, String) async throws -> Record)? = nil
     ) {
+        self.endpoints = endpoints
         self.now = now
         self.maxStale = maxStale
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 10
         let session = URLSession(configuration: configuration)
-        self.fetch = fetch ?? { host in try await Self.query(host, endpoint: endpoint, session: session) }
+        self.fetch = fetch ?? { endpoint, host in try await Self.query(host, endpoint: endpoint, session: session) }
     }
 
     public func resolve(_ host: String) async throws -> [String] {
-        if let record = try? await fetch(host), !record.addresses.isEmpty {
-            lock.withLock { cache[host] = (record, now()) }
-            return record.addresses
+        for endpoint in endpoints {
+            if let record = try? await fetch(endpoint, host), !record.addresses.isEmpty {
+                lock.withLock { cache[host] = (record, now()) }
+                return record.addresses
+            }
         }
         // A failed lookup may fall back to the last good answer, but no further
         // than the record's TTL (or the cap when the answer had none).
