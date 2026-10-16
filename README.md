@@ -2,7 +2,7 @@
 
 A macOS menu bar app that transparently sits between your coding agents (opencode, pi, aider, …) and `openrouter.ai`. It adds a **provider sort** and **service tier** policy to every chat request, so you configure routing once for all clients instead of in each one.
 
-- **Transparent:** no client configuration changes. Clients keep talking to `https://openrouter.ai`.
+- **Transparent for keychain-based clients:** curl, Apple Python, Rust and opencode need no configuration changes. Node, Bun and Homebrew Python need the CA supplied once — see [Client trust](#client-trust).
 - **Sort:** Balanced, Throughput (`:nitro`), Price (`:floor`), Exacto (`:exacto`) — applied by OpenRouter itself via the model-id variant.
 - **Service tier:** Auto, Default, Priority, Flex. Flex has retry, timeout and "fall back without flex" settings.
 - **Never overrides the client:** if a request already sets `service_tier`, `speed`, `provider.order|sort|only`, a `:variant` or an `@preset/…` model, nothing is changed.
@@ -27,15 +27,37 @@ Dismissing either prompt stops the install: the hosts entry is written only afte
 
 If macOS cannot show the trust dialog, trust the CA manually in Keychain Access: **login** keychain → `OpenProxy Local CA` → *Get Info* → *Always Trust*. The certificate lives in the login keychain; the private key stays in `~/Library/Application Support/openproxy/ca.key` (mode 600).
 
-### Node-based clients
+### Client trust
 
-Node ignores the macOS keychain. Clients built on Node (for example pi) need the CA once:
+Whether a client trusts the proxy CA without changes depends on which trust store it uses. Measured against the running app (2026-10-16); `<ca.pem>` is `~/Library/Application Support/openproxy/ca.pem`:
+
+| Client | Works with no changes? | What it needs |
+|---|---|---|
+| `curl` (`/usr/bin/curl`) | yes | uses Secure Transport, so it sees the keychain-trusted CA |
+| Apple Python 3 | yes | uses the system keychain |
+| Rust (native roots) | yes | uses the native trust store |
+| `opencode` (started fresh) | yes | sees the keychain-trusted CA |
+| Node (`node`, `pi`) | no | `NODE_EXTRA_CA_CERTS=<ca.pem>`, or `NODE_OPTIONS='--use-system-ca --use-bundled-ca'` |
+| Bun | no | `bun --use-system-ca` (or `BUN_OPTIONS=--use-system-ca`); `NODE_EXTRA_CA_CERTS` also works |
+| Homebrew Python 3, `requests`, `httpx` | no | `SSL_CERT_FILE=<ca.pem>` or `REQUESTS_CA_BUNDLE=<ca.pem>` |
+
+In Node, `--use-system-ca` alone does not pick up the login-keychain CA; use `NODE_EXTRA_CA_CERTS` or the `--use-system-ca --use-bundled-ca` pair. Python 3.13+ strict verification now works with this CA because it carries the Subject and Authority Key Identifier extensions.
+
+The menu's **Copy Node CA line** button copies the export line, and **Set for GUI apps** runs `launchctl setenv NODE_EXTRA_CA_CERTS <ca.pem>` for GUI apps launched from then on. The app never edits any shell profile. For Node-based clients (for example pi):
 
 ```sh
-launchctl setenv NODE_EXTRA_CA_CERTS "$HOME/Library/Application Support/openproxy/ca.pem"
+export NODE_EXTRA_CA_CERTS="$HOME/Library/Application Support/openproxy/ca.pem"
 ```
 
-(or `NODE_OPTIONS='--use-system-ca --use-bundled-ca'`) and a restart of the client. Python with `certifi` (requests, httpx) needs `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` similarly. curl, Bun, opencode, Apple Python and Rust (native roots) work without changes.
+### Long-running clients
+
+A process that started before Install keeps the trust store it loaded at startup, so it must be restarted to pick up the new CA. For `opencode`:
+
+```sh
+opencode service restart
+```
+
+Restart any other long-running client the same way.
 
 ## Uninstall / emergency removal
 
