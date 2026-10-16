@@ -33,6 +33,10 @@ struct MenuView: View {
                 Divider()
                 unreachableBlock(unreachable)
             }
+            if let untrustedCA = model.untrustedCAWarning {
+                Divider()
+                unreachableBlock(untrustedCA)
+            }
             if !model.warnings.isEmpty {
                 Divider()
                 warningBlock

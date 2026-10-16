@@ -23,7 +23,7 @@ Build: `scripts/build-app.sh` → `build/OpenProxy.app` (ad-hoc signed). Open it
 1. A trust dialog for the CA. Trust is **per-user**: the CA certificate is imported into your **login keychain**, not the System keychain.
 2. The admin password prompt for the `/etc/hosts` change and the DNS cache flush.
 
-Dismissing either prompt stops the install and changes nothing: the hosts entry is written only after the CA is verified as trusted, so clients are never routed to a proxy they cannot trust.
+Dismissing either prompt stops the install: the hosts entry is written only after the CA is verified as trusted, so clients are never routed to a proxy they cannot trust. The hosts file is left untouched; if the trust prompt was dismissed after the certificate was imported, an untrusted certificate may remain in your login keychain — press **Uninstall** to remove it.
 
 If macOS cannot show the trust dialog, trust the CA manually in Keychain Access: **login** keychain → `OpenProxy Local CA` → *Get Info* → *Always Trust*. The certificate lives in the login keychain; the private key stays in `~/Library/Application Support/openproxy/ca.key` (mode 600).
 

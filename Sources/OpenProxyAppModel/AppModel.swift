@@ -34,6 +34,14 @@ extension InstallStatus {
         return "openrouter.ai is routed to 127.0.0.1 but the proxy is not listening, "
             + "so all clients are blocked. Press Uninstall to restore access."
     }
+
+    /// Spec 9: with the hosts entry installed but the CA absent or untrusted, every
+    /// client's TLS handshake fails — independent of whether the proxy is listening.
+    public var untrustedCAWarning: String? {
+        guard hostsEntry, !caTrusted else { return nil }
+        return "openrouter.ai is routed to 127.0.0.1 but the CA is missing or not trusted, "
+            + "so every client's TLS handshake fails. Press Uninstall to restore access, then Install again."
+    }
 }
 
 /// UI-free view model. It owns the live settings, the stats summary and the
@@ -67,6 +75,10 @@ public final class AppModel {
     /// Derived from `status`, so it stays visible for as long as the danger lasts
     /// (proxy quit/crashed with the hosts entry still routed) and clears itself.
     public var unreachableWarning: String? { status.unreachableWarning }
+
+    /// Derived from `status`: hosts routed here with the CA missing or untrusted, shown
+    /// independently of the listener state because TLS fails for every client either way.
+    public var untrustedCAWarning: String? { status.untrustedCAWarning }
 
     /// How often an open menu refreshes the summary and status.
     public let refreshInterval: Duration
@@ -169,6 +181,14 @@ public final class AppModel {
                 break
             case .uninstallAndQuit:
                 await uninstall()
+                // Terminate only once the hosts entry is confirmed gone: a cancelled or
+                // failed uninstall would otherwise leave openrouter.ai pointing at a dead
+                // listener the moment the app exits.
+                if status.hostsEntry {
+                    warn("Quit was cancelled: openrouter.ai is still routed to this Mac, so quitting "
+                        + "would break every client. Fix the uninstall problem, then quit again.")
+                    return
+                }
             }
         }
         quitDecision.terminate()

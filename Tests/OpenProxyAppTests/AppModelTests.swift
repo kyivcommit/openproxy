@@ -18,14 +18,25 @@ private final class FakeServer: ProxyServerControlling, @unchecked Sendable {
 }
 
 /// A privileged runner that records scripts and can fail, so `Installer` never
-/// touches the keychain or `/etc/hosts` in tests.
+/// touches the keychain or `/etc/hosts` in tests. When `hostsPath` is set it also
+/// models the one externally visible effect of the privileged script on that temp
+/// file: install adds the managed line, uninstall removes it. Without this the
+/// post-install `status()` would still read a routed hosts file and mislead the
+/// quit gate that re-checks it.
 private final class FakeRunner: PrivilegedRunner, @unchecked Sendable {
     var error: Error?
+    var hostsPath: String?
     private(set) var scripts: [String] = []
 
     func run(script: String) async throws {
         scripts.append(script)
         if let error { throw error }
+        guard let hostsPath else { return }
+        let text = (try? String(contentsOfFile: hostsPath, encoding: .utf8)) ?? ""
+        let updated = script.contains("127.0.0.1 openrouter.ai # openproxy")
+            ? HostsFile.adding(to: text)
+            : HostsFile.removing(from: text)
+        try? updated.write(toFile: hostsPath, atomically: true, encoding: .utf8)
     }
 }
 
@@ -96,6 +107,7 @@ private struct Harness {
         let ca = CertAuthority(directory: directory)
         try ca.loadOrCreate()
         self.runner = FakeRunner()
+        self.runner.hostsPath = hostsURL.path
         self.commandRunner = FakeCommandRunner()
         self.installer = Installer(
             caPEMURL: ca.caCertificatePEMURL,
@@ -339,6 +351,27 @@ struct AppModelTests {
         #expect(notInstalled.unreachableWarning == nil)
     }
 
+    @Test func hostsEntryWithUntrustedCAProducesWarningIndependentOfListener() {
+        // Spec 9: hosts routed here with the CA absent or untrusted makes every client's TLS
+        // handshake fail, whether or not the proxy is listening.
+        let untrusted = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: true, portListening: true, nodeCAEnv: false)
+        #expect(untrusted.untrustedCAWarning != nil)
+        let presentButUntrusted = InstallStatus(caTrusted: false, caPresent: true, hostsEntry: true, portListening: true, nodeCAEnv: false)
+        #expect(presentButUntrusted.untrustedCAWarning != nil)
+        let trusted = InstallStatus(caTrusted: true, caPresent: true, hostsEntry: true, portListening: true, nodeCAEnv: false)
+        #expect(trusted.untrustedCAWarning == nil)
+        let noHosts = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: false, portListening: true, nodeCAEnv: false)
+        #expect(noHosts.untrustedCAWarning == nil)
+    }
+
+    @Test func modelExposesUntrustedCAWarningFromStatus() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        await model.refresh()
+        // The fake runner answers `verify-cert` with success, so trust reads as OK here.
+        #expect(model.untrustedCAWarning == nil)
+    }
+
     @Test func portInUseBecomesWarningAndLeavesHostsUntouched() async throws {
         let h = try Harness()
         h.server.startError = PortInUse()
@@ -434,5 +467,23 @@ struct AppModelTests {
 
         #expect(h.quitDecision.decideCount == 0)
         #expect(h.quitDecision.terminateCount == 1)
+    }
+
+    @Test func uninstallAndQuitStaysRunningWhenHostsRemovalFails() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        await model.refresh()
+        #expect(model.status.hostsEntry)
+        // The admin prompt for the hosts edit is dismissed: hosts is never restored.
+        h.runner.error = InstallError.runnerFailed("the administrator prompt was dismissed")
+        h.quitDecision.choice = .uninstallAndQuit
+
+        await model.quit()
+
+        // Terminating would leave openrouter.ai routed to a dead proxy, so stay running
+        // and surface why instead.
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.status.hostsEntry)
+        #expect(model.warnings.contains { $0.contains("still routed") })
     }
 }

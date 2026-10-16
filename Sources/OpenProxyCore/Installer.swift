@@ -52,15 +52,49 @@ public struct ShellCommandRunner: CommandRunning {
         } catch {
             return CommandResult(status: -1, standardError: String(describing: error))
         }
-        // Read both pipes before waiting so a full pipe buffer can never deadlock the child.
-        let outData = out.fileHandleForReading.readDataToEndOfFile()
-        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        // Drain stdout and stderr concurrently: reading stdout to EOF first deadlocks when
+        // the child fills the 64 KiB stderr pipe buffer and blocks before writing stdout.
+        // The blocking reads run on GCD threads, not the cooperative pool, so waiting on the
+        // child cannot starve other concurrently running async work.
+        let (outData, errData) = await withCheckedContinuation {
+            (continuation: CheckedContinuation<(Data, Data), Never>) in
+            let collector = PipeCollector()
+            let group = DispatchGroup()
+            let outHandle = out.fileHandleForReading
+            let errHandle = err.fileHandleForReading
+            group.enter()
+            DispatchQueue.global().async {
+                collector.setStdout(outHandle.readDataToEndOfFile())
+                group.leave()
+            }
+            group.enter()
+            DispatchQueue.global().async {
+                collector.setStderr(errHandle.readDataToEndOfFile())
+                group.leave()
+            }
+            group.notify(queue: .global()) {
+                continuation.resume(returning: (collector.stdout, collector.stderr))
+            }
+        }
         process.waitUntilExit()
         return CommandResult(
             status: process.terminationStatus,
             standardOutput: String(decoding: outData, as: UTF8.self),
             standardError: String(decoding: errData, as: UTF8.self))
     }
+}
+
+/// Holds the stdout/stderr bytes `ShellCommandRunner` drains on two background reads.
+private final class PipeCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var outData = Data()
+    private var errData = Data()
+
+    func setStdout(_ data: Data) { lock.withLock { outData = data } }
+    func setStderr(_ data: Data) { lock.withLock { errData = data } }
+
+    var stdout: Data { lock.withLock { outData } }
+    var stderr: Data { lock.withLock { errData } }
 }
 
 /// The production privileged runner: `osascript -e 'do shell script … with administrator privileges'`
@@ -135,6 +169,8 @@ public struct InstallStatus: Equatable, Sendable {
 public enum InstallError: Error, Equatable, Sendable {
     case runnerFailed(String)
     case commandFailed(command: String, status: Int32)
+    /// The safety-critical hosts restore succeeded, but leftover CA trust cleanup did not.
+    case trustCleanupFailed(String)
 }
 
 extension InstallError: CustomStringConvertible {
@@ -144,6 +180,9 @@ extension InstallError: CustomStringConvertible {
         switch self {
         case .runnerFailed(let message): return message
         case .commandFailed(let command, let status): return "Command failed with status \(status): \(command)"
+        case .trustCleanupFailed(let detail):
+            return "openrouter.ai access was restored, but removing the CA trust did not fully "
+                + "succeed: \(detail)"
         }
     }
 }
@@ -268,14 +307,16 @@ public final class Installer: @unchecked Sendable {
         text.count > limit ? String(text.prefix(limit)) + "…" : text
     }
 
-    /// Phase A (privileged) restores `/etc/hosts` first — the critical safety path — and
-    /// best-effort sweeps a leftover CA from the System keychain; phase B (unprivileged)
-    /// removes the user-domain trust and the login-keychain certificate. A phase-B failure
-    /// must never surface as an uninstall failure because hosts is already restored.
+    /// Phase A (privileged) restores `/etc/hosts` first — the critical safety path — then
+    /// best-effort clears any admin trust settings an old `add-trusted-cert -d` install left,
+    /// and sweeps a leftover CA from the System keychain; phase B (unprivileged) removes the
+    /// user-domain trust and the login-keychain certificate. Hosts restore must never be
+    /// blocked by the sweeps, and a leftover cleanup failure must be reported, not swallowed.
     public func uninstall() async throws {
         let script = """
         set -e
         \(Self.hostsEditScript(hostsPath: hostsPath, adding: false))
+        security remove-trusted-cert -d \(Self.quoted(caPEMURL.path)) || true
         \(Self.deleteCertificatesScript(commonName: caCommonName, keychain: "/Library/Keychains/System.keychain"))
         dscacheutil -flushcache
         """
@@ -284,29 +325,46 @@ public final class Installer: @unchecked Sendable {
         } catch {
             throw InstallError.runnerFailed(String(describing: error))
         }
-        await removeUserDomainTrust()
+        // The hosts entry is already gone at this point, so this is a warning-level failure
+        // (never a rollback), but it must not be reported as a clean success either.
+        if let failure = await removeUserDomainTrust() {
+            throw InstallError.trustCleanupFailed(failure)
+        }
     }
 
     /// Best-effort, unprivileged cleanup of the user-domain trust and the login-keychain
-    /// certificate. Errors are ignored: the hosts entry is the safety-critical half and it is
-    /// already gone. `remove-trusted-cert` reads the file, so it runs before anything else.
-    private func removeUserDomainTrust() async {
-        _ = await commandRunner.run(
+    /// certificate. The hosts entry is the safety-critical half and is already gone, so
+    /// failures are collected and reported rather than thrown here. `remove-trusted-cert`
+    /// reads the file, so it runs before anything else.
+    private func removeUserDomainTrust() async -> String? {
+        var failures: [String] = []
+        let removeTrust = await commandRunner.run(
             "security remove-trusted-cert \(Self.quoted(caPEMURL.path))")
-        _ = await commandRunner.run(Self.deleteCertificatesScript(
+        if !removeTrust.succeeded {
+            failures.append("per-user trust: \(removeTrust.failureDetail)")
+        }
+        let deleteCerts = await commandRunner.run(Self.deleteCertificatesScript(
             commonName: caCommonName,
-            keychain: "\"$HOME/Library/Keychains/login.keychain-db\""))
+            keychain: "\"$HOME/Library/Keychains/login.keychain-db\"",
+            removeTrustSettings: true))
+        if !deleteCerts.succeeded {
+            failures.append("login-keychain certificate: \(deleteCerts.failureDetail)")
+        }
+        return failures.isEmpty ? nil : failures.joined(separator: "; ")
     }
 
     /// Deletes every certificate with our common name by its SHA-1 hash. `security
     /// delete-certificate -c <CN>` fails with "ambiguous" when two CAs share the CN — the
     /// normal reinstall case — so each match returned by `find-certificate` is deleted by hash.
-    /// Best-effort (`|| true`): a keychain without our cert must not fail the caller.
-    static func deleteCertificatesScript(commonName: String, keychain: String) -> String {
-        """
+    /// Best-effort (`|| true`): a keychain without our cert must not fail the caller. On the
+    /// login keychain `removeTrustSettings` adds `-t` so the per-user trust settings are
+    /// removed with the certificate, not orphaned.
+    static func deleteCertificatesScript(commonName: String, keychain: String, removeTrustSettings: Bool = false) -> String {
+        let trustFlag = removeTrustSettings ? "-t " : ""
+        return """
         hashes=$(security find-certificate -a -Z -c \(quoted(commonName)) \(keychain) 2>/dev/null | awk '/SHA-1 hash:/ { print $NF }')
         for hash in $hashes; do
-            security delete-certificate -Z "$hash" \(keychain) || true
+            security delete-certificate \(trustFlag)-Z "$hash" \(keychain) || true
         done
         """
     }

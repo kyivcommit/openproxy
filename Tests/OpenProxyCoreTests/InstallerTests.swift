@@ -265,11 +265,77 @@ struct InstallerTests {
             CommandResult(status: 1, standardError: "no trust settings")
         })
 
-        // Best-effort phase B: a failure must not throw and must not undo the hosts restore.
-        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+        // Phase B is best-effort for correctness, but the hosts restore — the safety-critical
+        // half — already ran and must never be undone. The leftover failure is reported, not
+        // swallowed as a clean success.
+        await #expect(throws: InstallError.self) { try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall() }
 
         #expect(runner.scripts.count == 1)
         #expect(commands.commands.contains { $0.contains("remove-trusted-cert") })
+    }
+
+    @Test func uninstallRemovesAdminTrustInPrivilegedPhaseBeforeSweepingSystemKeychain() async throws {
+        // An older install used `add-trusted-cert -d`, which writes admin trust settings that
+        // deleting the certificate item leaves behind; `remove-trusted-cert -d` clears them.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).uninstall()
+
+        let script = try #require(runner.scripts.first)
+        let hostsRestore = try #require(script.range(of: "sed -E"))
+        let removeTrust = try #require(script.range(of: "security remove-trusted-cert -d"))
+        let sweep = try #require(script.range(of: "security find-certificate"))
+        #expect(hostsRestore.lowerBound < removeTrust.lowerBound)
+        #expect(removeTrust.lowerBound < sweep.lowerBound)
+        // The CA file is passed and the step is best-effort, so a missing admin trust
+        // setting cannot fail the uninstall.
+        #expect(script.contains(TestCA.pemURL.path))
+        let trustLine = try #require(script.split(separator: "\n").first { $0.contains("remove-trusted-cert") })
+        #expect(trustLine.contains("|| true"))
+    }
+
+    @Test func uninstallDeletesLoginKeychainCertWithTrustSettings() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner()
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+
+        // System keychain (privileged phase): no per-user trust settings to carry.
+        let system = try #require(runner.scripts.first)
+        #expect(system.contains("security delete-certificate -Z \"$hash\""))
+        #expect(!system.contains("delete-certificate -t"))
+
+        // Login keychain (phase B): `-t` removes the per-user trust settings with the cert.
+        let login = try #require(commands.commands.first { $0.contains("login.keychain-db") })
+        #expect(login.contains("security delete-certificate -t -Z \"$hash\""))
+    }
+
+    @Test func uninstallReportsLeftoverCleanupFailureAfterHostsRemoval() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            command.contains("remove-trusted-cert")
+                ? CommandResult(status: 1, standardError: "no trust settings")
+                : CommandResult(status: 0)
+        })
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        // Hosts was restored first and was never blocked...
+        #expect(runner.scripts.count == 1)
+        #expect(runner.scripts.first?.contains("sed -E") == true)
+        // ...but the leftover trust cleanup failure is reported, not hidden behind a success.
+        #expect(thrown?.description.contains("trust") == true)
     }
 
     @Test func statusReportsHostsEntry() async throws {
@@ -357,6 +423,25 @@ struct InstallerTests {
     @Test func installErrorDescribesAsItsMessage() {
         #expect(InstallError.runnerFailed("boom").description == "boom")
         #expect(String(describing: InstallError.runnerFailed("boom")) == "boom")
+    }
+
+    // MARK: - Item 4: drain stdout and stderr concurrently
+
+    @Test func shellCommandRunnerDrainsBothPipesWithoutDeadlock() async {
+        // A child that fills the stderr pipe buffer (>64 KiB) before writing stdout
+        // deadlocks a runner that reads stdout to EOF before stderr.
+        let result = await ShellCommandRunner().run(
+            "yes err | head -c 100000 >&2; yes out | head -c 100000")
+        #expect(result.status == 0)
+        #expect(result.standardError.count == 100000)
+        #expect(result.standardOutput.count == 100000)
+    }
+
+    @Test func shellCommandRunnerCapturesSmallOutputAndStatus() async {
+        let result = await ShellCommandRunner().run("printf 'hello'; printf 'oops' >&2; exit 3")
+        #expect(result.status == 3)
+        #expect(result.standardOutput == "hello")
+        #expect(result.standardError == "oops")
     }
 
     // MARK: - Hosts edit: stop at the first error, never mask it with flushcache
@@ -515,6 +600,85 @@ struct InstallerTests {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         #expect(opensslFingerprint == fingerprint)
     }
+
+    // MARK: - Item 6: execute the SHA-1 sweep against a fake `security`
+
+    @Test func sweepDeletesNothingWhenNoCertificatesMatch() throws {
+        let result = try runSweep(hashes: [])
+        #expect(result.status == 0)
+        #expect(result.deletes.isEmpty)
+    }
+
+    @Test func sweepDeletesSingleMatchByHash() throws {
+        let result = try runSweep(hashes: ["AAAA"])
+        #expect(result.status == 0)
+        #expect(result.deletes.count == 1)
+        #expect(result.deletes.first?.contains("-Z AAAA") == true)
+    }
+
+    @Test func sweepDeletesEachMatchingCertificateByHash() throws {
+        let result = try runSweep(hashes: ["AAAA", "BBBB"])
+        #expect(result.status == 0)
+        #expect(result.deletes.count == 2)
+        #expect(result.deletes.contains { $0.contains("-Z AAAA") })
+        #expect(result.deletes.contains { $0.contains("-Z BBBB") })
+    }
+
+    @Test func sweepUsesTrustFlagForLoginKeychainOnly() throws {
+        let login = try runSweep(hashes: ["AAAA"], removeTrustSettings: true)
+        #expect(login.deletes.first?.contains("delete-certificate -t -Z AAAA") == true)
+        let system = try runSweep(hashes: ["AAAA"], removeTrustSettings: false)
+        #expect(system.deletes.first?.contains("delete-certificate -Z AAAA") == true)
+        #expect(system.deletes.first?.contains("-t ") == false)
+    }
+
+    @Test func sweepKeepsGoingWhenADeleteFails() throws {
+        // Best-effort: a failing delete must not abort the loop or fail the script.
+        let result = try runSweep(hashes: ["AAAA", "BBBB"], deleteStatus: 1)
+        #expect(result.status == 0)
+        #expect(result.deletes.count == 2)
+    }
+}
+
+/// Executes `Installer.deleteCertificatesScript` under `/bin/sh` with a fake `security`
+/// executable first in `PATH`, so the sweep's real shell behaviour (hash parsing, the
+/// per-hash loop, the trust flag, `|| true`) is exercised, not just the script text.
+/// Returns the script's exit status and the arguments of every `delete-certificate` call.
+private func runSweep(
+    hashes: [String],
+    keychain: String = "login.keychain-db",
+    removeTrustSettings: Bool = false,
+    deleteStatus: Int32 = 0
+) throws -> (status: Int32, deletes: [String]) {
+    let dir = FileManager.default.temporaryDirectory.appending(path: "sweep-\(UUID().uuidString)")
+    let bin = dir.appending(path: "bin")
+    try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let log = dir.appending(path: "deletes.log")
+    let hashLines = hashes.map { "SHA-1 hash: \($0)" }.joined(separator: "\n")
+    let fake = """
+    #!/bin/sh
+    case "$1" in
+      find-certificate) printf '%s\\n' \(shellQuoted(hashLines));;
+      delete-certificate) printf '%s\\n' "$*" >> \(shellQuoted(log.path)); exit \(deleteStatus);;
+    esac
+    """
+    let executable = bin.appending(path: "security")
+    try Data(fake.utf8).write(to: executable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", Installer.deleteCertificatesScript(
+        commonName: "OpenProxy Local CA", keychain: keychain, removeTrustSettings: removeTrustSettings)]
+    var environment = ProcessInfo.processInfo.environment
+    environment["PATH"] = bin.path + ":" + (environment["PATH"] ?? "/usr/bin:/bin")
+    process.environment = environment
+    try process.run()
+    process.waitUntilExit()
+    let logged = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+    return (process.terminationStatus, logged.split(separator: "\n").map(String.init))
 }
 
 /// The POSIX single-quote escaping the installer must produce for arbitrary paths.
