@@ -329,6 +329,62 @@ struct InstallerTests {
         #expect(trustLine.contains("|| true"))
     }
 
+    // MARK: - Item 3: validate the PEM before the privileged remove-trusted-cert
+
+    @Test func uninstallValidatesFingerprintBeforeAdminTrustRemoval() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).uninstall()
+
+        let script = try #require(runner.scripts.first)
+        let fingerprint = try #require(Installer.sha256Fingerprint(ofPEM: TestCA.pem))
+        // The copy is validated against the SHA-256 fingerprint embedded by the app...
+        #expect(script.contains("-fingerprint -sha256"))
+        #expect(script.contains(fingerprint))
+        // ...and only the root-owned copy is handed to the privileged remove-trusted-cert.
+        let trustLine = try #require(script.split(separator: "\n").first { $0.contains("remove-trusted-cert") })
+        #expect(trustLine.contains("\"$ca_copy\""))
+        #expect(!trustLine.contains(TestCA.pemURL.path))
+    }
+
+    @Test func adminTrustRemovalUsesTheCopyOnlyWhenTheFingerprintMatches() throws {
+        let fingerprint = try #require(Installer.sha256Fingerprint(ofPEM: TestCA.pem))
+        let dir = FileManager.default.temporaryDirectory.appending(path: "admin-trust-\(UUID().uuidString)")
+        let bin = dir.appending(path: "bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let log = dir.appending(path: "calls.log")
+        let fake = """
+        #!/bin/sh
+        printf '%s\\n' "$*" >> \(shellQuoted(log.path))
+        """
+        let executable = bin.appending(path: "security")
+        try Data(fake.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        func run(_ script: String) throws -> Bool {
+            try? FileManager.default.removeItem(at: log)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", script]
+            var environment = ProcessInfo.processInfo.environment
+            environment["PATH"] = bin.path + ":" + (environment["PATH"] ?? "/usr/bin:/bin")
+            process.environment = environment
+            try process.run()
+            process.waitUntilExit()
+            return ((try? String(contentsOf: log, encoding: .utf8)) ?? "").contains("remove-trusted-cert")
+        }
+
+        #expect(try run(Installer.removeAdminTrustScript(caPEMURL: TestCA.pemURL, expectedFingerprint: fingerprint)))
+        // A fingerprint that does not match the file leaves the admin trust untouched.
+        #expect(try !run(Installer.removeAdminTrustScript(caPEMURL: TestCA.pemURL, expectedFingerprint: String(repeating: "0", count: 64))))
+        // No fingerprint: nothing is handed to root.
+        #expect(try !run(Installer.removeAdminTrustScript(caPEMURL: TestCA.pemURL, expectedFingerprint: nil)))
+    }
+
+
     @Test func uninstallDeletesLoginKeychainCertWithTrustSettings() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }

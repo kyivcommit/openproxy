@@ -313,10 +313,16 @@ public final class Installer: @unchecked Sendable {
     /// user-domain trust and the login-keychain certificate. Hosts restore must never be
     /// blocked by the sweeps, and a leftover cleanup failure must be reported, not swallowed.
     public func uninstall() async throws {
+        // Item 3 / TOCTOU: never point the privileged `remove-trusted-cert -d` at the
+        // user-writable ca.pem. Validate the file against the CA's own SHA-256 fingerprint,
+        // then drop admin trust for a root-owned copy, so a swap before the admin prompt
+        // cannot make root untrust some other certificate.
+        let fingerprint = (try? String(contentsOf: caPEMURL, encoding: .utf8))
+            .flatMap(Self.sha256Fingerprint(ofPEM:))
         let script = """
         set -e
         \(Self.hostsEditScript(hostsPath: hostsPath, adding: false))
-        security remove-trusted-cert -d \(Self.quoted(caPEMURL.path)) || true
+        \(Self.removeAdminTrustScript(caPEMURL: caPEMURL, expectedFingerprint: fingerprint))
         \(Self.deleteCertificatesScript(commonName: caCommonName, keychain: "/Library/Keychains/System.keychain"))
         dscacheutil -flushcache
         """
@@ -330,6 +336,25 @@ public final class Installer: @unchecked Sendable {
         if let failure = await removeUserDomainTrust() {
             throw InstallError.trustCleanupFailed(failure)
         }
+    }
+
+    /// Drops admin-domain trust that an older `add-trusted-cert -d` install left. The privileged
+    /// script copies the user-writable `ca.pem` into a root-owned temp file and only uses it
+    /// when its SHA-256 fingerprint matches the one the app embedded, so a swap between the
+    /// admin prompt and this step cannot make root untrust another certificate (item 3).
+    static func removeAdminTrustScript(caPEMURL: URL, expectedFingerprint: String?) -> String {
+        // No fingerprint (missing/invalid ca.pem) means we cannot validate the copy: skip the
+        // admin-domain step rather than hand root a file we cannot vouch for.
+        guard let expectedFingerprint else { return "true" }
+        return """
+        ca_copy=$(mktemp "${TMPDIR:-/tmp}/openproxy-ca-admin.XXXXXX")
+        if cp \(quoted(caPEMURL.path)) "$ca_copy" 2>/dev/null \\
+           && [ "$(openssl x509 -in "$ca_copy" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//;s/://g' | tr 'A-F' 'a-f')" = \(quoted(expectedFingerprint)) ]; then
+            chmod 600 "$ca_copy"
+            security remove-trusted-cert -d "$ca_copy" || true
+        fi
+        rm -f "$ca_copy"
+        """
     }
 
     /// Best-effort, unprivileged cleanup of the user-domain trust and the login-keychain
