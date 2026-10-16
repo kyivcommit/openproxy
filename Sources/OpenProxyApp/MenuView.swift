@@ -11,7 +11,7 @@ struct MenuView: View {
 
             Picker("Sort", selection: $model.settings.sort) {
                 ForEach(SortMode.allCases, id: \.self) { mode in
-                    Text(mode.rawValue.capitalized).tag(mode)
+                    Text(mode.displayName).tag(mode)
                 }
             }
 
@@ -20,6 +20,12 @@ struct MenuView: View {
                     Text(mode.rawValue.capitalized).tag(mode)
                 }
             }
+
+            Stepper(
+                "Refresh endpoint data every \(model.settings.pollMinutes) min",
+                value: $model.settings.pollMinutes, in: 1...60
+            )
+            .help("How often a model's endpoint list (for Smart price and the tier check) is refreshed; cached data is served while it refreshes.")
 
             if model.settings.tier == .flex {
                 flexSection

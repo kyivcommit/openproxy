@@ -172,6 +172,22 @@ struct AppModelTests {
         #expect(reloaded.settings.sort == .price)
     }
 
+    @Test func smartPriceAndPollMinutesPersistToDisk() throws {
+        // Item 5: the Sort picker's Smart price and the refresh stepper both go through
+        // the settings store, so a restart keeps them.
+        let h = try Harness()
+        let model = h.model()
+
+        model.settings.sort = .smartPrice
+        model.settings.pollMinutes = 30
+        // The stepper range clamps out-of-range values on the way in.
+        model.settings.pollMinutes = 90
+
+        let reloaded = SettingsStore(url: h.directory.appending(path: "settings.json"))
+        #expect(reloaded.settings.sort == .smartPrice)
+        #expect(reloaded.settings.pollMinutes == 60)
+    }
+
     @Test func enabledFalseLeavesServerRunning() async throws {
         let h = try Harness()
         let model = h.model()
