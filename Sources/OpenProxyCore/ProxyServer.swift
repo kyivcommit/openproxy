@@ -342,7 +342,8 @@ public final class ProxyServer: @unchecked Sendable {
         facts: ResponseFacts = ResponseFacts()
     ) {
         stats.record(RequestRecord(
-            time: started, path: path, model: rewrite.model, sort: settings.sort, tier: settings.tier,
+            time: started, path: path, model: rewrite.model, sort: settings.enabled ? settings.sort : .balanced,
+            tier: settings.enabled ? settings.tier : .auto,
             actualTier: facts.actualTier, provider: facts.provider, endpointTag: rewrite.endpointTag,
             status: status, ttfbMs: ttfbMs,
             retries: retries, usedFallback: usedFallback,
