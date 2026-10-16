@@ -29,6 +29,17 @@ private final class FakeRunner: PrivilegedRunner, @unchecked Sendable {
     }
 }
 
+/// An unprivileged command runner that records commands and succeeds by default, so the
+/// login-keychain trust phase in `Installer` never touches a real keychain in tests.
+private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
+    private(set) var commands: [String] = []
+
+    func run(_ command: String) async -> CommandResult {
+        commands.append(command)
+        return CommandResult(status: 0)
+    }
+}
+
 private struct PortInUse: Error {}
 private enum LoginItemTestError: Error { case denied }
 
@@ -66,6 +77,7 @@ private struct Harness {
     let settingsStore: SettingsStore
     let stats: StatsStore
     let runner: FakeRunner
+    let commandRunner: FakeCommandRunner
     let installer: Installer
     let server: FakeServer
     let loginItem: FakeLoginItem
@@ -80,10 +92,15 @@ private struct Harness {
         self.directory = directory
         self.settingsStore = SettingsStore(url: directory.appending(path: "settings.json"))
         self.stats = try StatsStore(path: ":memory:")
+        // A real CA so install()'s fingerprint check has a certificate to read.
+        let ca = CertAuthority(directory: directory)
+        try ca.loadOrCreate()
         self.runner = FakeRunner()
+        self.commandRunner = FakeCommandRunner()
         self.installer = Installer(
-            caPEMURL: directory.appending(path: "ca.pem"),
+            caPEMURL: ca.caCertificatePEMURL,
             runner: runner,
+            commandRunner: commandRunner,
             hostsPath: hostsURL.path)
         self.server = FakeServer()
         self.loginItem = FakeLoginItem()
@@ -260,6 +277,7 @@ struct AppModelTests {
             installer: Installer(
                 caPEMURL: dir.appending(path: "ca.pem"),
                 runner: FakeRunner(),
+                commandRunner: FakeCommandRunner(),
                 hostsPath: dir.appending(path: "hosts").path),
             server: FakeServer(),
             loginItem: FakeLoginItem(),

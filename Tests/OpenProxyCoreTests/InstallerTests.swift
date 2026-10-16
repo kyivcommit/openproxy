@@ -33,10 +33,33 @@ private final class RecordingRunner: PrivilegedRunner, @unchecked Sendable {
     }
 }
 
+/// Records the unprivileged commands and answers them from a handler, so the login-keychain
+/// trust phase and the status probes never touch a real keychain.
+private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+    private let handler: @Sendable (String) -> CommandResult
+
+    init(handler: @escaping @Sendable (String) -> CommandResult = { _ in CommandResult(status: 0) }) {
+        self.handler = handler
+    }
+
+    var commands: [String] { lock.withLock { recorded } }
+
+    func run(_ command: String) async -> CommandResult {
+        lock.withLock { recorded.append(command) }
+        return handler(command)
+    }
+}
+
 @Suite("Installer")
 struct InstallerTests {
-    private func makeInstaller(runner: PrivilegedRunner, hostsPath: String) -> Installer {
-        Installer(caPEMURL: TestCA.pemURL, runner: runner, hostsPath: hostsPath)
+    private func makeInstaller(
+        runner: PrivilegedRunner,
+        commandRunner: CommandRunning = FakeCommandRunner(),
+        hostsPath: String
+    ) -> Installer {
+        Installer(caPEMURL: TestCA.pemURL, runner: runner, commandRunner: commandRunner, hostsPath: hostsPath)
     }
 
     private func makeHostsFile(_ content: String) throws -> String {
@@ -45,20 +68,95 @@ struct InstallerTests {
         return url.path
     }
 
-    @Test func installRunsOneScriptWithAllSteps() async throws {
+    /// Extracts the private temp copy path (`/…/openproxy-ca-…/ca.pem`) from a command.
+    private func tempCopyPath(in command: String) -> String? {
+        command.range(of: "/[^']*openproxy-ca-[^']*/ca\\.pem", options: .regularExpression)
+            .map { String(command[$0]) }
+    }
+
+    // MARK: - Item 1: two-phase install
+
+    @Test func installTrustsInUserKeychainThenEditsHostsWithoutKeychainInScript() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
+        let commands = FakeCommandRunner()
 
-        try await makeInstaller(runner: runner, hostsPath: hostsPath).install()
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).install()
 
+        // Phase 1: unprivileged, user-domain trust in the login keychain, then verify.
+        #expect(commands.commands.count == 2)
+        let add = try #require(commands.commands.first)
+        #expect(add.contains(#"security add-trusted-cert -r trustRoot -k "$HOME/Library/Keychains/login.keychain-db""#))
+        #expect(!add.contains(" -d "))
+        #expect(!add.contains("System.keychain"))
+        let verify = try #require(commands.commands.last)
+        #expect(verify.contains("security verify-cert -c"))
+        #expect(verify.contains("-p basic"))
+        // Both commands act on the same private temp copy, never the user-writable ca.pem directly.
+        let copied = try #require(tempCopyPath(in: add))
+        #expect(copied == tempCopyPath(in: verify))
+        #expect(copied != TestCA.pemURL.path)
+
+        // Phase 2: one admin script with the hosts entry and the flush only.
         #expect(runner.scripts.count == 1)
         let script = try #require(runner.scripts.first)
-        #expect(script.contains("security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain"))
-        #expect(script.contains(TestCA.pemURL.path))
+        #expect(script.hasPrefix("set -e\n"))
         #expect(script.contains(hostsEntry))
         #expect(script.contains(hostsPath))
         #expect(script.contains("dscacheutil -flushcache"))
+        #expect(!script.contains("security add-trusted-cert"))
+        #expect(!script.contains("System.keychain"))
+        #expect(!script.contains("verify-cert"))
+    }
+
+    @Test func installFailsClosedWhenTrustIsNotVerified() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            command.contains("verify-cert")
+                ? CommandResult(status: 1, standardError: "CSSMERR_TP_NOT_TRUSTED")
+                : CommandResult(status: 0)
+        })
+        let installer = makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath)
+
+        await #expect(throws: InstallError.self) { try await installer.install() }
+        // The hosts entry is never routed to a proxy the clients cannot trust.
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func installFailsClosedWhenTrustCannotBeAdded() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            command.contains("add-trusted-cert")
+                ? CommandResult(status: 1, standardError: "SecTrustSettingsSetTrustSettings: denied")
+                : CommandResult(status: 0)
+        })
+        let installer = makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath)
+
+        await #expect(throws: InstallError.self) { try await installer.install() }
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func installFailsBeforeRunningAnythingWhenTheCAIsMissingOrInvalid() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        let badCA = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).pem")
+        try Data("not a certificate".utf8).write(to: badCA)
+        defer {
+            try? FileManager.default.removeItem(atPath: hostsPath)
+            try? FileManager.default.removeItem(at: badCA)
+        }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner()
+        let installer = Installer(
+            caPEMURL: badCA, runner: runner, commandRunner: commands, hostsPath: hostsPath)
+
+        await #expect(throws: InstallError.self) { try await installer.install() }
+        #expect(commands.commands.isEmpty)
+        #expect(runner.scripts.isEmpty)
     }
 
     @Test func installIsIdempotentForHostsContent() async throws {
@@ -81,6 +179,8 @@ struct InstallerTests {
 
         await #expect(throws: InstallError.self) { try await installer.install() }
     }
+
+    // MARK: - Item 2: uninstall
 
     @Test func uninstallRemovesHostsLineAndDeletesCertificate() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
@@ -137,6 +237,19 @@ struct InstallerTests {
         #expect(await makeInstaller(runner: runner, hostsPath: withoutEntry).status().hostsEntry == false)
     }
 
+    @Test func statusProbesTheKeychainThroughTheCommandRunner() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let present = FakeCommandRunner()
+        let absent = FakeCommandRunner(handler: { command in
+            command.contains("find-certificate") ? CommandResult(status: 1) : CommandResult(status: 0)
+        })
+
+        #expect(await makeInstaller(runner: runner, commandRunner: present, hostsPath: hostsPath).status().caTrusted)
+        #expect(await makeInstaller(runner: runner, commandRunner: absent, hostsPath: hostsPath).status().caTrusted == false)
+    }
+
     @Test func nodeCAEnvCommandTargetsLaunchctl() {
         let command = Installer.nodeCAEnvCommand(caPEMURL: URL(fileURLWithPath: fakeCAPath))
         #expect(command.contains("launchctl setenv NODE_EXTRA_CA_CERTS"))
@@ -151,7 +264,7 @@ struct InstallerTests {
         #expect(appleScript.contains("\\\\ bye"))
     }
 
-    // MARK: - Finding (a): stop at the first error, never mask it with flushcache
+    // MARK: - Hosts edit: stop at the first error, never mask it with flushcache
 
     @Test func installScriptStopsAtFirstErrorAndOrdersSteps() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
@@ -162,16 +275,14 @@ struct InstallerTests {
 
         let script = try #require(runner.scripts.first)
         // Without `set -e` the always-succeeding trailing flushcache made the whole script
-        // report success even when security/hosts failed; the script must abort at step one.
+        // report success even when hosts failed; the script must abort at step one.
         #expect(script.hasPrefix("set -e\n"))
-        let security = try #require(script.range(of: "security add-trusted-cert"))
         let hostsReplace = try #require(script.range(of: "mv \"$tmp\" \"$hosts\""))
         let flush = try #require(script.range(of: "dscacheutil -flushcache"))
-        #expect(security.lowerBound < hostsReplace.lowerBound)
         #expect(hostsReplace.lowerBound < flush.lowerBound)
     }
 
-    // MARK: - Finding (b): hosts edit runs privileged, re-reads, replaces atomically
+    // MARK: - Hosts edit runs privileged, re-reads, replaces atomically
 
     @Test func installDoesNotEmbedStaleHostsSnapshot() async throws {
         let hostsPath = try makeHostsFile("STALE-SENTINEL-98765\n")
@@ -258,6 +369,7 @@ struct InstallerTests {
         #expect(text == "127.0.0.1 localhost\n\(hostsEntry)\n")
         #expect(!text.contains("localhost\(hostsEntry)"))
     }
+
     @Test func quotesPathsWithSpacesAndSingleQuotes() {
         let path = "/tmp/a b'c/ca.pem"
         let command = Installer.nodeCAEnvCommand(caPEMURL: URL(fileURLWithPath: path))
@@ -270,26 +382,21 @@ struct InstallerTests {
         #expect(wrapped.contains("'/tmp/a b'\\\\''c/ca.pem'"))
     }
 
-    @Test func installQuotesCaAndHostsPathsWithSpacesAndSingleQuotes() async throws {
+    @Test func installQuotesHostsPathWithSpacesAndSingleQuotes() async throws {
         let dir = FileManager.default.temporaryDirectory.appending(path: "a b'c-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let hostsPath = dir.appending(path: "my hosts").path
         try Data("127.0.0.1 localhost\n".utf8).write(to: URL(fileURLWithPath: hostsPath))
-        let caPath = dir.appending(path: "my ca.pem").path
-        try FileManager.default.copyItem(at: TestCA.pemURL, to: URL(fileURLWithPath: caPath))
         defer { try? FileManager.default.removeItem(at: dir) }
         let runner = RecordingRunner()
 
-        try await Installer(
-            caPEMURL: URL(fileURLWithPath: caPath), runner: runner, hostsPath: hostsPath
-        ).install()
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).install()
 
         let script = try #require(runner.scripts.first)
-        #expect(script.contains(shellQuoted(caPath)))
         #expect(script.contains(shellQuoted(hostsPath)))
     }
 
-    // MARK: - Finding: validate the CA PEM before trusting it from a user-writable path
+    // MARK: - Validate the CA PEM before trusting it from a user-writable path
 
     @Test func sha256FingerprintMatchesOpenssl() throws {
         let pem = try String(contentsOf: TestCA.pemURL, encoding: .utf8)
@@ -312,26 +419,6 @@ struct InstallerTests {
             .replacingOccurrences(of: ":", with: "").lowercased()
             .trimmingCharacters(in: .whitespacesAndNewlines)
         #expect(opensslFingerprint == fingerprint)
-    }
-
-    @Test func installVerifiesCAFingerprintBeforeTrusting() async throws {
-        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
-        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
-        let runner = RecordingRunner()
-        let pem = try String(contentsOf: TestCA.pemURL, encoding: .utf8)
-        let fingerprint = try #require(Installer.sha256Fingerprint(ofPEM: pem))
-
-        try await makeInstaller(runner: runner, hostsPath: hostsPath).install()
-
-        let script = try #require(runner.scripts.first)
-        #expect(script.contains("openssl x509"))
-        #expect(script.contains("-fingerprint -sha256"))
-        #expect(script.contains(fingerprint))  // the unprivileged app's digest is embedded
-        // Trust is added from the root-owned temp copy, never the user-writable path directly.
-        #expect(script.contains(#"security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$tmpca""#))
-        let verify = try #require(script.range(of: "openssl x509"))
-        let trust = try #require(script.range(of: "security add-trusted-cert"))
-        #expect(verify.lowerBound < trust.lowerBound)
     }
 }
 

@@ -1,14 +1,70 @@
 import Foundation
 import Crypto
 
-/// Runs a shell script with administrator privileges. Injected so tests can record
-/// the script without triggering the real macOS authorization dialog.
+/// Runs a privileged shell script. Injected so tests can record the script without
+/// triggering the real macOS authorization dialog.
 public protocol PrivilegedRunner: Sendable {
     func run(script: String) async throws
 }
 
-/// The production runner: `osascript -e 'do shell script … with administrator privileges'`
-/// produces the single system authorization prompt for all privileged steps.
+/// Runs an unprivileged shell command and returns its exit status and output. Injected
+/// so the user-domain trust steps and the status probes are unit-testable without
+/// touching a real login keychain.
+public protocol CommandRunning: Sendable {
+    func run(_ command: String) async -> CommandResult
+}
+
+public struct CommandResult: Equatable, Sendable {
+    public var status: Int32
+    public var standardOutput: String
+    public var standardError: String
+
+    public init(status: Int32, standardOutput: String = "", standardError: String = "") {
+        self.status = status
+        self.standardOutput = standardOutput
+        self.standardError = standardError
+    }
+
+    public var succeeded: Bool { status == 0 }
+
+    /// stderr (stdout when stderr is empty), trimmed and capped, for a user-facing message.
+    public var failureDetail: String {
+        let primary = standardError.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = primary.isEmpty ? standardOutput.trimmingCharacters(in: .whitespacesAndNewlines) : primary
+        return Installer.capped(text)
+    }
+}
+
+/// The production command runner: `/bin/sh -c`, capturing stdout and stderr.
+public struct ShellCommandRunner: CommandRunning {
+    public init() {}
+
+    public func run(_ command: String) async -> CommandResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", command]
+        let out = Pipe()
+        let err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        do {
+            try process.run()
+        } catch {
+            return CommandResult(status: -1, standardError: String(describing: error))
+        }
+        // Read both pipes before waiting so a full pipe buffer can never deadlock the child.
+        let outData = out.fileHandleForReading.readDataToEndOfFile()
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return CommandResult(
+            status: process.terminationStatus,
+            standardOutput: String(decoding: outData, as: UTF8.self),
+            standardError: String(decoding: errData, as: UTF8.self))
+    }
+}
+
+/// The production privileged runner: `osascript -e 'do shell script … with administrator privileges'`
+/// produces the single system authorization prompt for the privileged phase.
 public struct OsascriptRunner: PrivilegedRunner {
     public init() {}
 
@@ -57,56 +113,108 @@ public enum InstallError: Error, Equatable, Sendable {
     case commandFailed(command: String, status: Int32)
 }
 
-/// Installs the CA into the System keychain and the hosts entry for `openrouter.ai`.
-/// All privileged steps run inside a single admin script so the user sees one prompt.
+/// Installs the CA and the hosts entry for `openrouter.ai`.
+///
+/// Two phases so each runs where the OS allows it:
+/// 1. unprivileged, from the user's own GUI session: trust the CA in the login keychain
+///    (`security add-trusted-cert` shows macOS's authorization dialog), then verify it;
+/// 2. one admin script: the `/etc/hosts` entry and a DNS cache flush, nothing else.
 public final class Installer: @unchecked Sendable {
     private let caPEMURL: URL
     private let caCommonName: String
     private let runner: PrivilegedRunner
+    private let commandRunner: CommandRunning
     private let hostsPath: String
 
     public init(
         caPEMURL: URL,
         caCommonName: String = "OpenProxy Local CA",
         runner: PrivilegedRunner,
+        commandRunner: CommandRunning,
         hostsPath: String = "/etc/hosts"
     ) {
         self.caPEMURL = caPEMURL
         self.caCommonName = caCommonName
         self.runner = runner
+        self.commandRunner = commandRunner
         self.hostsPath = hostsPath
     }
 
+    /// Phase 1 trusts the CA in the user's login keychain (user-domain trust, no `-d`) and
+    /// verifies it; phase 2 adds the hosts entry. Fail closed: a trust failure throws before
+    /// any hosts edit, so a client is never routed to a proxy it cannot trust.
     public func install() async throws {
-        // The unprivileged app computes the expected digest; the privileged script re-derives it
-        // from a root-owned copy before trusting it, so a swapped `ca.pem` (TOCTOU) can never be
-        // trusted. An unreadable/malformed CA yields no expected value and the script fails closed.
-        let expected = (try? String(contentsOf: caPEMURL, encoding: .utf8))
-            .flatMap(Self.sha256Fingerprint(ofPEM:)) ?? ""
-        // `set -e` aborts at the first failed step, so the trailing flushcache can no longer
-        // mask an earlier security/hosts failure; the script reports success only if all ran.
+        let trustedCopy = try privateCopyOfCA()
+        defer { try? FileManager.default.removeItem(at: trustedCopy.deletingLastPathComponent()) }
+
+        let add = await commandRunner.run(Self.addTrustCommand(copyPath: trustedCopy.path))
+        guard add.succeeded else {
+            throw InstallError.runnerFailed(Self.trustFailureMessage(add))
+        }
+        let verify = await commandRunner.run(Self.verifyTrustCommand(copyPath: trustedCopy.path))
+        guard verify.succeeded else {
+            throw InstallError.runnerFailed(
+                "The CA was added to the login keychain but could not be verified as trusted: "
+                    + verify.failureDetail)
+        }
+
+        // `set -e` aborts at the first failed step; the trailing flushcache can no longer mask
+        // an earlier hosts failure. No keychain command runs privileged anymore.
         let script = """
         set -e
-        ca=\(Self.quoted(caPEMURL.path))
-        expected=\(Self.quoted(expected))
-        tmpca=$(mktemp /tmp/openproxy-ca.XXXXXX)
-        trap 'rm -f "$tmpca"' EXIT
-        cp "$ca" "$tmpca"
-        chmod 400 "$tmpca"
-        actual=$(openssl x509 -in "$tmpca" -noout -fingerprint -sha256 | sed 's/.*=//' | tr -d ':' | tr 'A-Z' 'a-z')
-        if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
-            echo "openproxy: CA certificate missing or changed; refusing to install" >&2
-            exit 1
-        fi
-        security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$tmpca"
         \(Self.hostsEditScript(hostsPath: hostsPath, adding: true))
-        trap 'rm -f "$tmpca" "$tmp"' EXIT
         dscacheutil -flushcache
         """
         do {
             try await runner.run(script: script)
         } catch {
             throw InstallError.runnerFailed(String(describing: error))
+        }
+    }
+
+    /// User-domain trust (`-r trustRoot`, no `-d`) in the login keychain.
+    static func addTrustCommand(copyPath: String) -> String {
+        "security add-trusted-cert -r trustRoot -k \"$HOME/Library/Keychains/login.keychain-db\" \(quoted(copyPath))"
+    }
+
+    static func verifyTrustCommand(copyPath: String) -> String {
+        "security verify-cert -c \(quoted(copyPath)) -p basic"
+    }
+
+    private static func trustFailureMessage(_ result: CommandResult) -> String {
+        let detail = result.failureDetail
+        return detail.isEmpty
+            ? "Could not add the CA to the login keychain."
+            : "Could not add the CA to the login keychain: \(detail)"
+    }
+
+    /// Copies `ca.pem` into a private, owner-only temp directory and re-checks the SHA-256
+    /// fingerprint of the copy before anything trusts it, so a swapped, unreadable or malformed
+    /// `ca.pem` is never trusted. The caller removes the returned file's directory.
+    private func privateCopyOfCA() throws -> URL {
+        guard let pem = try? String(contentsOf: caPEMURL, encoding: .utf8),
+              let expected = Self.sha256Fingerprint(ofPEM: pem)
+        else {
+            throw InstallError.runnerFailed("The CA certificate is missing or is not a valid certificate.")
+        }
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-ca-\(UUID().uuidString)")
+        do {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            let copy = directory.appending(path: "ca.pem")
+            try Data(pem.utf8).write(to: copy)
+            try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: copy.path)
+            guard let copiedPEM = try? String(contentsOf: copy, encoding: .utf8),
+                  Self.sha256Fingerprint(ofPEM: copiedPEM) == expected
+            else {
+                throw InstallError.runnerFailed("The CA copy did not match the expected certificate.")
+            }
+            return copy
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
         }
     }
 
@@ -118,6 +226,11 @@ public final class Installer: @unchecked Sendable {
             .joined()
         guard let der = Data(base64Encoded: base64) else { return nil }
         return SHA256.hash(data: der).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Command output can be huge; cap what reaches the menu.
+    static func capped(_ text: String, limit: Int = 500) -> String {
+        text.count > limit ? String(text.prefix(limit)) + "…" : text
     }
 
     public func uninstall() async throws {
@@ -177,21 +290,24 @@ public final class Installer: @unchecked Sendable {
     }
 
     public func status() async -> InstallStatus {
-        InstallStatus(
-            caTrusted: Self.shell("security find-certificate -c \(Self.quoted(caCommonName)) /Library/Keychains/System.keychain").status == 0,
+        let certPresent = await commandRunner.run(
+            "security find-certificate -c \(Self.quoted(caCommonName)) /Library/Keychains/System.keychain")
+        let port = await commandRunner.run("nc -z -G 1 127.0.0.1 443")
+        let nodeEnv = await commandRunner.run("launchctl getenv NODE_EXTRA_CA_CERTS")
+        return InstallStatus(
+            caTrusted: certPresent.status == 0,
             hostsEntry: HostsFile.isPresent(in: Self.readHosts(hostsPath)),
-            portListening: Self.shell("nc -z -G 1 127.0.0.1 443").status == 0,
-            nodeCAEnv: !Self.shell("launchctl getenv NODE_EXTRA_CA_CERTS").output
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            portListening: port.status == 0,
+            nodeCAEnv: !nodeEnv.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         )
     }
 
     /// Points new processes at the CA for Node clients. Unprivileged, so toggling it never prompts.
-    public func applyNodeCAEnv() throws {
+    public func applyNodeCAEnv() async throws {
         let command = Self.nodeCAEnvCommand(caPEMURL: caPEMURL)
-        let status = Self.shell(command).status
-        guard status == 0 else {
-            throw InstallError.commandFailed(command: command, status: status)
+        let result = await commandRunner.run(command)
+        guard result.succeeded else {
+            throw InstallError.commandFailed(command: command, status: result.status)
         }
     }
 
@@ -209,27 +325,14 @@ public final class Installer: @unchecked Sendable {
     private static func quoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
-
-    private static func shell(_ command: String) -> (status: Int32, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", command]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
-            return (-1, "")
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
-    }
 }
 
 extension Installer {
     public convenience init(ca: CertAuthority, runner: PrivilegedRunner, hostsPath: String = "/etc/hosts") {
-        self.init(caPEMURL: ca.caCertificatePEMURL, runner: runner, hostsPath: hostsPath)
+        self.init(
+            caPEMURL: ca.caCertificatePEMURL,
+            runner: runner,
+            commandRunner: ShellCommandRunner(),
+            hostsPath: hostsPath)
     }
 }
