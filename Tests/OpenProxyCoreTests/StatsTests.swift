@@ -1,7 +1,40 @@
 import Foundation
 import Testing
+import SQLite3
 
 @testable import OpenProxyCore
+
+/// Reads one text value straight out of the file, to check what `record` persisted.
+private func scalarText(_ path: String, sql: String) -> String? {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else { return nil }
+    defer { sqlite3_close_v2(db) }
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
+    defer { sqlite3_finalize(stmt) }
+    guard sqlite3_step(stmt) == SQLITE_ROW, let text = sqlite3_column_text(stmt, 0) else { return nil }
+    return String(cString: text)
+}
+
+/// Writes a `requests` table in the schema of a build that predates `endpoint_tag`.
+private func writeLegacyDatabase(_ path: String) {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
+          let db else { return }
+    defer { sqlite3_close_v2(db) }
+    let create = """
+        CREATE TABLE requests (
+            time REAL NOT NULL, path TEXT NOT NULL, model TEXT, sort TEXT NOT NULL,
+            tier TEXT NOT NULL, actual_tier TEXT, provider TEXT, status INTEGER NOT NULL,
+            ttfb_ms INTEGER NOT NULL, retries INTEGER NOT NULL, used_fallback INTEGER NOT NULL,
+            skipped_reason TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, cost_usd REAL)
+        """
+    sqlite3_exec(db, create, nil, nil, nil)
+    sqlite3_exec(db, """
+        INSERT INTO requests (time, path, sort, tier, status, ttfb_ms, retries, used_fallback)
+        VALUES (0, '/api/v1/chat/completions', 'balanced', 'auto', 200, 5, 0, 0)
+        """, nil, nil, nil)
+}
 
 @Suite("Stats")
 struct StatsTests {
@@ -103,5 +136,38 @@ struct StatsTests {
             promptTokens: 3_000_000_000, completionTokens: 3_000_000_000, costUSD: 1))
 
         #expect(store.summary(since: .distantPast).total == 1)
+    }
+
+    @Test func recordsEndpointTag() throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let store = try StatsStore(path: url.path)
+        store.record(RequestRecord(
+            time: Date(), path: "/api/v1/chat/completions", model: "deepseek/deepseek-v4.1-flash",
+            sort: .smartPrice, tier: .auto, endpointTag: "deepinfra/fp8", status: 200, ttfbMs: 4,
+            retries: 0))
+
+        #expect(scalarText(url.path, sql: "SELECT endpoint_tag FROM requests LIMIT 1") == "deepinfra/fp8")
+    }
+
+    @Test func migratesEndpointsColumnOnAnOlderDatabase() throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        writeLegacyDatabase(url.path)
+
+        // Opening an older file must add the column without touching the existing rows.
+        let store = try StatsStore(path: url.path)
+        store.record(record(provider: "openai"))
+        store.record(RequestRecord(
+            time: Date(), path: "/api/v1/chat/completions", model: "m", sort: .smartPrice, tier: .auto,
+            endpointTag: "deepinfra/fp8", status: 200, ttfbMs: 1, retries: 0))
+
+        #expect(store.summary(since: .distantPast).total == 3) // legacy row + two new ones
+        // The legacy row and the plain record have no tag; only the Smart-price row does.
+        #expect(scalarText(url.path, sql: "SELECT COUNT(*) FROM requests WHERE endpoint_tag IS NOT NULL") == "1")
+        #expect(scalarText(
+            url.path, sql: "SELECT endpoint_tag FROM requests WHERE endpoint_tag IS NOT NULL")
+            == "deepinfra/fp8")
     }
 }

@@ -39,6 +39,8 @@ public final class ProxyServer: @unchecked Sendable {
     private let ca: CertAuthority
     private let upstream: UpstreamClient
     private let catalog: EndpointCatalog
+    /// Per-model Smart-price leader memory, so hysteresis survives across requests.
+    private let leaders = EndpointLeaders()
     private let stats: StatsStore
     private let settings: @Sendable () -> Settings
     private let group: EventLoopGroup
@@ -151,8 +153,18 @@ public final class ProxyServer: @unchecked Sendable {
             // Missing Authorization makes the catalog return nil without a fetch.
             availability = await catalog.availability(model: model, authorization: authorization)
         }
+        // Smart price needs the model's endpoints unless the id already pins a variant/preset.
+        var smartPrice: SmartPriceInjection?
+        if isRewritable, settings.enabled, Rewriter.rewritablePaths.contains(path),
+           settings.sort == .smartPrice, let model,
+           !model.contains(":"), !model.hasPrefix("@preset/") {
+            smartPrice = await smartPriceInjection(
+                model: model, authorization: authorization, tier: settings.tier)
+        }
         let rewrite = isRewritable
-            ? Rewriter.rewrite(path: path, body: body, settings: settings, availability: availability)
+            ? Rewriter.rewrite(
+                path: path, body: body, settings: settings, availability: availability,
+                smartPrice: smartPrice)
             : RewriteResult(body: body, model: model)
 
         let method = requestHead.method.rawValue
@@ -235,6 +247,22 @@ public final class ProxyServer: @unchecked Sendable {
                facts: tap.finish())
     }
 
+    /// Ranks the model's endpoints (leader memory included) and, on failure, tells the
+    /// rewriter why so it can fail open and record the reason.
+    private func smartPriceInjection(
+        model: String, authorization: String?, tier: TierMode
+    ) async -> SmartPriceInjection {
+        guard let endpoints = await catalog.endpoints(model: model, authorization: authorization) else {
+            return SmartPriceInjection(unavailableReason: "no_endpoint_data")
+        }
+        let ranking = await leaders.rank(model: model, endpoints: endpoints, tier: tier)
+        guard ranking.leader != nil else {
+            return SmartPriceInjection(unavailableReason: "no_eligible_endpoint")
+        }
+        return SmartPriceInjection(
+            order: ranking.order, quantizations: EndpointRanking.allowedQuantizations)
+    }
+
     /// Runs one upstream send with a first-byte timeout, surfacing a `FlexTimeout`
     /// that the Flex policy can treat as a failed attempt.
     private func sendUpstream(_ request: UpstreamRequest, timeout: TimeInterval) async throws -> UpstreamResponse {
@@ -315,7 +343,8 @@ public final class ProxyServer: @unchecked Sendable {
     ) {
         stats.record(RequestRecord(
             time: started, path: path, model: rewrite.model, sort: settings.sort, tier: settings.tier,
-            actualTier: facts.actualTier, provider: facts.provider, status: status, ttfbMs: ttfbMs,
+            actualTier: facts.actualTier, provider: facts.provider, endpointTag: rewrite.endpointTag,
+            status: status, ttfbMs: ttfbMs,
             retries: retries, usedFallback: usedFallback,
             skippedReason: rewrite.skipped["service_tier"] ?? rewrite.skipped.values.first,
             promptTokens: facts.promptTokens, completionTokens: facts.completionTokens,
@@ -350,6 +379,19 @@ public final class ProxyServer: @unchecked Sendable {
         _ leaf: (certificatePEM: String, privateKeyPEM: String)
     ) throws -> NIOSSLContext {
         try NIOSSLContext(configuration: serverTLSConfiguration(leaf))
+    }
+}
+
+/// Serializes the pure ranking with the per-model leader state, so concurrent requests
+/// for the same model cannot interleave a read-modify-write and lose the hysteresis.
+actor EndpointLeaders {
+    private var leaders: [String: String] = [:]
+
+    func rank(model: String, endpoints: [Endpoint], tier: TierMode) -> Ranking {
+        let ranking = EndpointRanking.rank(
+            endpoints: endpoints, tier: tier, previousLeader: leaders[model])
+        leaders[model] = ranking.leader
+        return ranking
     }
 }
 

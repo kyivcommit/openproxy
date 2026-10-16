@@ -9,6 +9,8 @@ public struct RequestRecord: Sendable {
     public var tier: TierMode
     public var actualTier: String?
     public var provider: String?
+    /// The Smart-price endpoint tag the proxy pinned for the request, when it injected one.
+    public var endpointTag: String?
     public var status: Int
     public var ttfbMs: Int
     public var retries: Int
@@ -20,7 +22,7 @@ public struct RequestRecord: Sendable {
 
     public init(
         time: Date, path: String, model: String? = nil, sort: SortMode, tier: TierMode,
-        actualTier: String? = nil, provider: String? = nil, status: Int, ttfbMs: Int,
+        actualTier: String? = nil, provider: String? = nil, endpointTag: String? = nil, status: Int, ttfbMs: Int,
         retries: Int, usedFallback: Bool = false, skippedReason: String? = nil,
         promptTokens: Int? = nil, completionTokens: Int? = nil, costUSD: Double? = nil
     ) {
@@ -31,6 +33,7 @@ public struct RequestRecord: Sendable {
         self.tier = tier
         self.actualTier = actualTier
         self.provider = provider
+        self.endpointTag = endpointTag
         self.status = status
         self.ttfbMs = ttfbMs
         self.retries = retries
@@ -100,6 +103,7 @@ public final class StatsStore: @unchecked Sendable {
                     tier TEXT NOT NULL,
                     actual_tier TEXT,
                     provider TEXT,
+                    endpoint_tag TEXT,
                     status INTEGER NOT NULL,
                     ttfb_ms INTEGER NOT NULL,
                     retries INTEGER NOT NULL,
@@ -110,10 +114,32 @@ public final class StatsStore: @unchecked Sendable {
                     cost_usd REAL
                 )
                 """)
+            try migrate()
         } catch {
             sqlite3_close_v2(handle)
             throw error
         }
+    }
+
+    /// Adds columns introduced after a database was first created, so an existing
+    /// `stats.sqlite` from an earlier build keeps its rows.
+    private func migrate() throws {
+        if !hasColumn("endpoint_tag") {
+            try execute("ALTER TABLE requests ADD COLUMN endpoint_tag TEXT")
+        }
+    }
+
+    private func hasColumn(_ name: String) -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(requests)", -1, &stmt, nil) == SQLITE_OK,
+              let stmt else {
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let text = sqlite3_column_text(stmt, 1), String(cString: text) == name { return true }
+        }
+        return false
     }
 
     deinit { sqlite3_close_v2(db) }
@@ -138,9 +164,9 @@ public final class StatsStore: @unchecked Sendable {
     private func insert(_ r: RequestRecord) throws {
         let sql = """
             INSERT INTO requests
-                (time, path, model, sort, tier, actual_tier, provider, status, ttfb_ms,
+                (time, path, model, sort, tier, actual_tier, provider, endpoint_tag, status, ttfb_ms,
                  retries, used_fallback, skipped_reason, prompt_tokens, completion_tokens, cost_usd)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
             """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
@@ -154,15 +180,16 @@ public final class StatsStore: @unchecked Sendable {
         bindText(stmt, 5, r.tier.rawValue)
         bindText(stmt, 6, r.actualTier)
         bindText(stmt, 7, r.provider)
+        bindText(stmt, 8, r.endpointTag)
         // int64 everywhere: tokens and durations can exceed Int32.max and `Int32(...)` would trap.
-        sqlite3_bind_int64(stmt, 8, Int64(r.status))
-        sqlite3_bind_int64(stmt, 9, Int64(r.ttfbMs))
-        sqlite3_bind_int64(stmt, 10, Int64(r.retries))
-        sqlite3_bind_int64(stmt, 11, r.usedFallback ? 1 : 0)
-        bindText(stmt, 12, r.skippedReason)
-        bindInt(stmt, 13, r.promptTokens)
-        bindInt(stmt, 14, r.completionTokens)
-        if let cost = r.costUSD { sqlite3_bind_double(stmt, 15, cost) } else { sqlite3_bind_null(stmt, 15) }
+        sqlite3_bind_int64(stmt, 9, Int64(r.status))
+        sqlite3_bind_int64(stmt, 10, Int64(r.ttfbMs))
+        sqlite3_bind_int64(stmt, 11, Int64(r.retries))
+        sqlite3_bind_int64(stmt, 12, r.usedFallback ? 1 : 0)
+        bindText(stmt, 13, r.skippedReason)
+        bindInt(stmt, 14, r.promptTokens)
+        bindInt(stmt, 15, r.completionTokens)
+        if let cost = r.costUSD { sqlite3_bind_double(stmt, 16, cost) } else { sqlite3_bind_null(stmt, 16) }
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw StatsError.openFailed(lastError)
         }

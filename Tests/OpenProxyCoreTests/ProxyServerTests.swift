@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import Security
+import SQLite3
 import NIOCore
 import NIOPosix
 import NIOSSL
@@ -68,6 +69,8 @@ private final class FakeEndpointsFetcher: EndpointsFetcher, @unchecked Sendable 
         if hasPriority { endpoints.append(["service_tier": "priority"]) }
         self.data = try! JSONSerialization.data(withJSONObject: ["data": ["endpoints": endpoints]])
     }
+
+    init(data: Data) { self.data = data }
 
     func fetch(modelId: String, authorization: String?) async throws -> Data {
         lock.withLock { _calls.append(modelId) }
@@ -299,6 +302,7 @@ private func startHarness(
     settings: Settings,
     replies: [FakeReply],
     fetcher: FakeEndpointsFetcher = FakeEndpointsFetcher(hasFlex: true),
+    statsStore: StatsStore? = nil,
     maxBodyBytes: Int = 32 * 1024 * 1024,
     maxQueuedRequests: Int = 8,
     maxQueuedBytes: Int = 64 * 1024 * 1024
@@ -310,7 +314,7 @@ private func startHarness(
     let caPEM = try String(contentsOf: ca.caCertificatePEMURL)
 
     let upstream = FakeUpstreamClient(replies)
-    let stats = try StatsStore(path: ":memory:")
+    let stats = try statsStore ?? StatsStore(path: ":memory:")
     let server = ProxyServer(
         config: ProxyConfig(
             bindHost: "127.0.0.1", port: 0, maxBodyBytes: maxBodyBytes,
@@ -341,13 +345,15 @@ private func withServer(
     settings: Settings = Settings(),
     replies: [FakeReply],
     fetcher: FakeEndpointsFetcher = FakeEndpointsFetcher(hasFlex: true),
+    statsStore: StatsStore? = nil,
     maxBodyBytes: Int = 32 * 1024 * 1024,
     maxQueuedRequests: Int = 8,
     maxQueuedBytes: Int = 64 * 1024 * 1024,
     _ body: (Harness) async throws -> Void
 ) async throws {
     let harness = try await startHarness(
-        settings: settings, replies: replies, fetcher: fetcher, maxBodyBytes: maxBodyBytes,
+        settings: settings, replies: replies, fetcher: fetcher, statsStore: statsStore,
+        maxBodyBytes: maxBodyBytes,
         maxQueuedRequests: maxQueuedRequests, maxQueuedBytes: maxQueuedBytes)
     do {
         try await body(harness)
@@ -495,6 +501,35 @@ private func json(_ data: Data) -> [String: Any] {
     (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
 }
 
+private func scalarText(_ path: String, sql: String) -> String? {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else { return nil }
+    defer { sqlite3_close_v2(db) }
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
+    defer { sqlite3_finalize(stmt) }
+    guard sqlite3_step(stmt) == SQLITE_ROW, let text = sqlite3_column_text(stmt, 0) else { return nil }
+    return String(cString: text)
+}
+
+/// One endpoint in the `/endpoints` shape. Cost arguments are USD per million tokens.
+private func endpointJSON(
+    _ tag: String, prompt: Double, completion: Double = 0,
+    quant: String = "fp8", tier: String? = nil, uptime: Double? = 100
+) -> [String: Any] {
+    var endpoint: [String: Any] = [
+        "tag": tag, "provider_name": tag, "quantization": quant,
+        "pricing": ["prompt": prompt / 1_000_000, "completion": completion / 1_000_000],
+    ]
+    if let tier { endpoint["service_tier"] = tier }
+    if let uptime { endpoint["uptime_last_30m"] = uptime }
+    return endpoint
+}
+
+private func endpointsJSON(_ endpoints: [[String: Any]]) -> Data {
+    try! JSONSerialization.data(withJSONObject: ["data": ["endpoints": endpoints]])
+}
+
 private let chatPath = "/api/v1/chat/completions"
 
 // MARK: - Tests
@@ -549,6 +584,82 @@ struct ProxyServerTests {
             #expect(json(harness.upstream.requests[0].body)["model"] as? String == "openai/gpt-5:nitro")
             #expect(harness.stats.summary(since: .distantPast).total == 1)  // one record per request
         }
+    }
+
+    // MARK: - Smart price
+
+    @Test func smartPriceInjectsEndpointOrderAndRecordsTag() async throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let stats = try StatsStore(path: url.path)
+        let endpoints = endpointsJSON([
+            endpointJSON("open-inference/fp4", prompt: 0.036, completion: 0.6435, quant: "fp4"),
+            endpointJSON("deepinfra/fp8", prompt: 0.14, completion: 0.42),
+            endpointJSON("morph/fp8", prompt: 0.04, completion: 0.7),
+        ])
+        try await withServer(
+            settings: Settings(sort: .smartPrice), replies: [FakeReply()],
+            fetcher: FakeEndpointsFetcher(data: endpoints), statsStore: stats
+        ) { harness in
+            let body = Data(#"{"model":"deepseek/deepseek-v4.1-flash"}"#.utf8)
+            let response = try await harness.request(
+                "POST", chatPath, body: body, headers: ["Authorization": "Bearer k"])
+            #expect(response.status == 200)
+            let provider = json(harness.upstream.requests[0].body)["provider"] as? [String: Any]
+            #expect(provider?["order"] as? [String] == ["deepinfra/fp8", "morph/fp8"])
+            #expect(provider?["quantizations"] as? [String] == EndpointRanking.allowedQuantizations)
+            #expect(provider?["allow_fallbacks"] as? Bool == true)
+            #expect(await waitUntil({ harness.stats.summary(since: .distantPast).total == 1 }, timeout: 2))
+        }
+        #expect(scalarText(url.path, sql: "SELECT endpoint_tag FROM requests LIMIT 1") == "deepinfra/fp8")
+    }
+
+    @Test func smartPriceDefersToClientProviderOrder() async throws {
+        let endpoints = endpointsJSON([endpointJSON("deepinfra/fp8", prompt: 0.14, completion: 0.42)])
+        try await withServer(
+            settings: Settings(sort: .smartPrice), replies: [FakeReply()],
+            fetcher: FakeEndpointsFetcher(data: endpoints)
+        ) { harness in
+            let body = Data(#"{"model":"m","provider":{"order":["client/x"]}}"#.utf8)
+            _ = try await harness.request("POST", chatPath, body: body)
+            let provider = json(harness.upstream.requests[0].body)["provider"] as? [String: Any]
+            #expect(provider?["order"] as? [String] == ["client/x"])
+            #expect(provider?["quantizations"] == nil) // untouched
+        }
+    }
+
+    @Test func smartPriceFailsOpenWithoutEndpointData() async throws {
+        try await withServer(
+            settings: Settings(sort: .smartPrice), replies: [FakeReply()],
+            fetcher: FakeEndpointsFetcher(data: Data())
+        ) { harness in
+            let body = Data(#"{"model":"m"}"#.utf8)
+            _ = try await harness.request("POST", chatPath, body: body)
+            #expect(harness.upstream.requests[0].body == body)
+        }
+    }
+
+    @Test func smartPriceFailsOpenWithNoEligibleEndpoint() async throws {
+        let endpoints = endpointsJSON([endpointJSON("cheap", prompt: 0.01, quant: "fp4")])
+        try await withServer(
+            settings: Settings(sort: .smartPrice), replies: [FakeReply()],
+            fetcher: FakeEndpointsFetcher(data: endpoints)
+        ) { harness in
+            let body = Data(#"{"model":"m"}"#.utf8)
+            _ = try await harness.request("POST", chatPath, body: body)
+            #expect(harness.upstream.requests[0].body == body)
+        }
+    }
+
+    @Test func leaderMemoryKeepsIncumbentWithinTenPercent() async {
+        let leaders = EndpointLeaders()
+        let incumbent = Endpoint(tag: "incumbent", promptUSDPerMillion: 1, uptimeLast30m: 100)
+        let cheaper = Endpoint(tag: "slightlyCheaper", promptUSDPerMillion: 0.95, uptimeLast30m: 100)
+
+        #expect(await leaders.rank(model: "m", endpoints: [incumbent], tier: .auto).leader == "incumbent")
+        // A later 5%-cheaper endpoint does not flip the remembered leader.
+        #expect(await leaders.rank(
+            model: "m", endpoints: [incumbent, cheaper], tier: .auto).leader == "incumbent")
     }
 
     @Test func rewrittenBodyReframesContentLengthForRealUpstream() async throws {

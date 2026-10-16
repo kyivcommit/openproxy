@@ -6,16 +6,33 @@ public struct RewriteResult: Sendable {
     public var wantsFlex: Bool
     public var applied: [String]
     public var skipped: [String: String]
+    /// The Smart-price endpoint tag pinned for this request, when one was injected.
+    public var endpointTag: String?
 
     public init(
         body: Data, model: String? = nil, wantsFlex: Bool = false,
-        applied: [String] = [], skipped: [String: String] = [:]
+        applied: [String] = [], skipped: [String: String] = [:], endpointTag: String? = nil
     ) {
         self.body = body
         self.model = model
         self.wantsFlex = wantsFlex
         self.applied = applied
         self.skipped = skipped
+        self.endpointTag = endpointTag
+    }
+}
+
+/// The `provider` policy the server computed for a Smart-price request. An empty `order`
+/// means the ranking was unavailable; `unavailableReason` says why (fail-open).
+public struct SmartPriceInjection: Sendable {
+    public var order: [String]
+    public var quantizations: [String]
+    public var unavailableReason: String?
+
+    public init(order: [String] = [], quantizations: [String] = [], unavailableReason: String? = nil) {
+        self.order = order
+        self.quantizations = quantizations
+        self.unavailableReason = unavailableReason
     }
 }
 
@@ -37,7 +54,8 @@ public enum Rewriter {
     }
 
     public static func rewrite(
-        path: String, body: Data, settings: Settings, availability: TierAvailability?
+        path: String, body: Data, settings: Settings, availability: TierAvailability?,
+        smartPrice: SmartPriceInjection? = nil
     ) -> RewriteResult {
         let parsed = parse(body)
         let model = parsed?["model"] as? String
@@ -48,6 +66,7 @@ public enum Rewriter {
         var applied: [String] = []
         var skipped: [String: String] = [:]
         var wantsFlex = false
+        var endpointTag: String?
 
         if let suffix = sortSuffixes[settings.sort] {
             if model.contains(":") || model.hasPrefix("@preset/") {
@@ -57,6 +76,25 @@ public enum Rewriter {
             } else {
                 object["model"] = model + suffix
                 applied.append("sort")
+            }
+        }
+
+        // Smart price routes by an explicit endpoint order, so it adds no model suffix.
+        if settings.sort == .smartPrice {
+            if model.contains(":") || model.hasPrefix("@preset/") {
+                skipped["provider"] = "model_variant"
+            } else if clientControlsRouting(object) {
+                skipped["provider"] = "client_provider"
+            } else if let order = smartPrice?.order, !order.isEmpty {
+                var provider = object["provider"] as? [String: Any] ?? [:]
+                provider["order"] = order
+                provider["quantizations"] = smartPrice?.quantizations ?? []
+                provider["allow_fallbacks"] = true
+                object["provider"] = provider
+                applied.append("provider")
+                endpointTag = order.first
+            } else {
+                skipped["provider"] = smartPrice?.unavailableReason ?? "no_endpoint_data"
             }
         }
 
@@ -94,7 +132,7 @@ public enum Rewriter {
         }
         return RewriteResult(
             body: rewritten, model: object["model"] as? String,
-            wantsFlex: wantsFlex, applied: applied, skipped: skipped)
+            wantsFlex: wantsFlex, applied: applied, skipped: skipped, endpointTag: endpointTag)
     }
 
     public static func stripServiceTier(from body: Data) -> Data {
@@ -110,5 +148,11 @@ public enum Rewriter {
     private static func clientControlsProvider(_ object: [String: Any]) -> Bool {
         guard let provider = object["provider"] as? [String: Any] else { return false }
         return provider["order"] != nil || provider["sort"] != nil || provider["only"] != nil
+    }
+
+    /// Smart price also defers to a client `provider.quantizations`.
+    private static func clientControlsRouting(_ object: [String: Any]) -> Bool {
+        guard let provider = object["provider"] as? [String: Any] else { return false }
+        return provider["quantizations"] != nil || clientControlsProvider(object)
     }
 }

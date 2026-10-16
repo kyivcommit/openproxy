@@ -21,6 +21,9 @@ private func payload(model: String = "openai/gpt-5", extra: [String: Any] = [:])
 
 private let fullAvailability = TierAvailability(hasFlex: true, hasPriority: true)
 
+private let smartInjection = SmartPriceInjection(
+    order: ["deepinfra/fp8", "atlas-cloud/fp8"], quantizations: EndpointRanking.allowedQuantizations)
+
 @Suite("Rewriter")
 struct RewriterTests {
     @Test func rewritablePathsMatchSpec() {
@@ -37,7 +40,8 @@ struct RewriterTests {
             path: chatPath,
             body: payload(),
             settings: Settings(sort: sort, tier: tier),
-            availability: fullAvailability)
+            availability: fullAvailability,
+            smartPrice: smartInjection)
 
         let suffix = switch sort {
         case .balanced: ""
@@ -270,5 +274,118 @@ struct RewriterTests {
     @Test func stripServiceTierOnInvalidJSONReturnsInput() {
         let input = Data("not json".utf8)
         #expect(Rewriter.stripServiceTier(from: input) == input)
+    }
+
+    // MARK: - Smart price
+
+    @Test func smartPriceInjectsProviderOrderAndNoSuffix() {
+        let result = Rewriter.rewrite(
+            path: chatPath, body: payload(),
+            settings: Settings(sort: .smartPrice, tier: .auto), availability: nil,
+            smartPrice: smartInjection)
+
+        let body = decode(result.body)
+        #expect(body["model"] as? String == "openai/gpt-5")
+        let provider = body["provider"] as? [String: Any]
+        #expect(provider?["order"] as? [String] == ["deepinfra/fp8", "atlas-cloud/fp8"])
+        #expect(provider?["quantizations"] as? [String] == EndpointRanking.allowedQuantizations)
+        #expect(provider?["allow_fallbacks"] as? Bool == true)
+        #expect(result.endpointTag == "deepinfra/fp8")
+        #expect(result.applied.contains("provider"))
+        #expect(result.skipped.isEmpty)
+    }
+
+    @Test func smartPriceKeepsOtherProviderFields() {
+        let input = payload(extra: ["provider": ["data_collection": "deny"]])
+        let result = Rewriter.rewrite(
+            path: chatPath, body: input,
+            settings: Settings(sort: .smartPrice, tier: .auto), availability: nil,
+            smartPrice: smartInjection)
+
+        let provider = decode(result.body)["provider"] as? [String: Any]
+        #expect(provider?["data_collection"] as? String == "deny")
+        #expect(provider?["order"] != nil)
+    }
+
+    @Test(arguments: ["order", "sort", "only", "quantizations"])
+    func smartPriceDefersToClientRoutingKeys(key: String) {
+        let value: Any = (key == "sort") ? "price" : ["provider-a"]
+        let input = payload(extra: ["provider": [key: value]])
+        let result = Rewriter.rewrite(
+            path: chatPath, body: input,
+            settings: Settings(sort: .smartPrice, tier: .auto), availability: nil,
+            smartPrice: smartInjection)
+
+        #expect(result.body == input) // untouched
+        #expect(result.skipped["provider"] == "client_provider")
+        #expect(result.endpointTag == nil)
+        #expect(!result.applied.contains("provider"))
+    }
+
+    @Test(arguments: ["openai/gpt-5:nitro", "openai/gpt-5:free", "@preset/large-context"])
+    func smartPriceSkipsModelWithVariantOrPreset(model: String) {
+        let input = payload(model: model)
+        let result = Rewriter.rewrite(
+            path: chatPath, body: input,
+            settings: Settings(sort: .smartPrice, tier: .auto), availability: nil,
+            smartPrice: smartInjection)
+
+        #expect(result.body == input)
+        #expect(result.skipped["provider"] == "model_variant")
+        #expect(result.endpointTag == nil)
+    }
+
+    @Test func smartPriceFailOpenWhenNoEndpointData() {
+        let input = payload()
+        let result = Rewriter.rewrite(
+            path: chatPath, body: input,
+            settings: Settings(sort: .smartPrice, tier: .auto), availability: nil,
+            smartPrice: SmartPriceInjection(unavailableReason: "no_endpoint_data"))
+
+        #expect(result.body == input)
+        #expect(result.skipped["provider"] == "no_endpoint_data")
+    }
+
+    @Test func smartPriceFailOpenWhenNoEligibleEndpoint() {
+        let input = payload()
+        let result = Rewriter.rewrite(
+            path: chatPath, body: input,
+            settings: Settings(sort: .smartPrice, tier: .auto), availability: nil,
+            smartPrice: SmartPriceInjection(unavailableReason: "no_eligible_endpoint"))
+
+        #expect(result.body == input)
+        #expect(result.skipped["provider"] == "no_eligible_endpoint")
+    }
+
+    @Test func smartPriceWithoutInjectionRecordsNoEndpointData() {
+        let input = payload()
+        let result = Rewriter.rewrite(
+            path: chatPath, body: input,
+            settings: Settings(sort: .smartPrice, tier: .auto), availability: nil)
+
+        #expect(result.body == input)
+        #expect(result.skipped["provider"] == "no_endpoint_data")
+    }
+
+    @Test func smartPriceStillAppliesTier() {
+        let result = Rewriter.rewrite(
+            path: chatPath, body: payload(),
+            settings: Settings(sort: .smartPrice, tier: .flex), availability: fullAvailability,
+            smartPrice: smartInjection)
+
+        let body = decode(result.body)
+        #expect(body["service_tier"] as? String == "flex")
+        #expect(body["provider"] != nil)
+        #expect(result.wantsFlex)
+    }
+
+    @Test func smartPriceDoesNotSuppressSuffixSortsCase() {
+        // Smart price is not a suffix mode: even the retry body keeps no `:floor`.
+        let result = Rewriter.rewrite(
+            path: chatPath, body: payload(),
+            settings: Settings(sort: .price, tier: .auto), availability: nil,
+            smartPrice: smartInjection)
+        #expect(decode(result.body)["model"] as? String == "openai/gpt-5:floor")
+        #expect(decode(result.body)["provider"] == nil)
     }
 }
