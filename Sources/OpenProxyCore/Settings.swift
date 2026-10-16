@@ -24,6 +24,20 @@ public struct FlexPolicy: Codable, Equatable, Sendable {
         self.firstByteTimeout = firstByteTimeout
         self.nonStreamingTimeout = nonStreamingTimeout
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case fallback, attempts, firstByteTimeout, nonStreamingTimeout
+    }
+
+    /// Custom decoding: `didSet` does not run during `init(from:)`, so clamp
+    /// `attempts` here, and default any missing key (older settings files).
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.fallback = try container.decodeIfPresent(Bool.self, forKey: .fallback) ?? true
+        self.attempts = min(max(try container.decodeIfPresent(Int.self, forKey: .attempts) ?? 2, 1), 5)
+        self.firstByteTimeout = try container.decodeIfPresent(TimeInterval.self, forKey: .firstByteTimeout) ?? 30
+        self.nonStreamingTimeout = try container.decodeIfPresent(TimeInterval.self, forKey: .nonStreamingTimeout) ?? 120
+    }
 }
 
 public struct Settings: Codable, Equatable, Sendable {

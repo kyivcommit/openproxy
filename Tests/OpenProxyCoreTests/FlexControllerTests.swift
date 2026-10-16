@@ -143,6 +143,33 @@ struct FlexControllerTests {
         #expect(sender.timeoutsCancelled == 1)
     }
 
+    @Test func fallbackTimeoutCancelsUpstreamAndRethrows() async throws {
+        let policy = FlexPolicy(fallback: true, attempts: 1)
+        let sender = ScriptedSender([.timeout, .timeout])
+        await #expect(throws: FlexTimeout.self) {
+            try await run(sender, policy: policy)
+        }
+        #expect(sender.timeoutsCancelled == 2)  // flex attempt + timed-out plain fallback
+    }
+
+    @Test func cancellationAfterSendStopsBeforeRetry() async throws {
+        let sender = ScriptedSender([.respond(429), .respond(200)])
+        let task = Task {
+            try await FlexController.run(
+                policy: FlexPolicy(fallback: true, attempts: 3),
+                streaming: true, flexBody: flexBody, plainBody: plainBody
+            ) { body, timeout in
+                let response = try await sender.send(body, timeout)
+                // Simulate cancellation arriving while the response is in flight.
+                withUnsafeCurrentTask { $0?.cancel() }
+                return response
+            }
+        }
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(sender.bodies == [flexBody])           // no retry, no fallback
+        #expect(sender.responses[0].cancelled)         // in-flight response closed
+    }
+
     @Test func streamingUsesFirstByteTimeout() async throws {
         let policy = FlexPolicy(fallback: true, attempts: 2, firstByteTimeout: 5, nonStreamingTimeout: 99)
         let sender = ScriptedSender([.respond(200)])

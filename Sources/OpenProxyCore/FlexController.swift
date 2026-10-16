@@ -47,16 +47,24 @@ public enum FlexController {
         send: @Sendable (Data, TimeInterval) async throws -> R
     ) async throws -> FlexOutcome<R> {
         let timeout = streaming ? policy.firstByteTimeout : policy.nonStreamingTimeout
+        // Clamp defensively: `1...0` would trap if an out-of-range policy ever arrived.
+        let attempts = min(max(policy.attempts, 1), 5)
         var lastResponse: R?
         var lastTimeout: FlexTimeout?
 
-        for attempt in 1...policy.attempts {
+        for attempt in 1...attempts {
             do {
                 let response = try await send(flexBody, timeout)
+                // Cancel-and-throw before any further send so a cancelled task
+                // cannot launch a retry or fallback.
+                if Task.isCancelled {
+                    response.cancel()
+                    throw CancellationError()
+                }
                 // shortcut: capacity is detected by status only (429/503); body-based
                 // detection is deferred until OpenRouter's error shapes are pinned down.
                 if response.status == 429 || response.status == 503 {
-                    if attempt < policy.attempts {
+                    if attempt < attempts {
                         response.cancel()
                         continue
                     }
@@ -73,11 +81,16 @@ public enum FlexController {
 
         if policy.fallback {
             lastResponse?.cancel()
-            let response = try await send(plainBody, timeout)
-            return FlexOutcome(response: response, usedFallback: true, attempts: policy.attempts + 1)
+            do {
+                let response = try await send(plainBody, timeout)
+                return FlexOutcome(response: response, usedFallback: true, attempts: attempts + 1)
+            } catch let timedOut as FlexTimeout {
+                timedOut.cancelTimedOutUpstream()
+                throw timedOut
+            }
         }
         if let response = lastResponse {
-            return FlexOutcome(response: response, usedFallback: false, attempts: policy.attempts)
+            return FlexOutcome(response: response, usedFallback: false, attempts: attempts)
         }
         throw lastTimeout ?? FlexTimeout()
     }

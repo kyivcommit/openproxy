@@ -26,6 +26,18 @@ struct SettingsTests {
         #expect(policy.attempts == 3)
     }
 
+    @Test func decodedAttemptsAreClamped() throws {
+        let low = try JSONDecoder().decode(FlexPolicy.self, from: Data(#"{"attempts":0}"#.utf8))
+        #expect(low.attempts == 1)
+        let high = try JSONDecoder().decode(FlexPolicy.self, from: Data(#"{"attempts":9}"#.utf8))
+        #expect(high.attempts == 5)
+    }
+
+    @Test func decodedPolicyToleratesMissingKeys() throws {
+        let policy = try JSONDecoder().decode(FlexPolicy.self, from: Data("{}".utf8))
+        #expect(policy == FlexPolicy())
+    }
+
     @Test func roundTripThroughFile() throws {
         let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: url) }
