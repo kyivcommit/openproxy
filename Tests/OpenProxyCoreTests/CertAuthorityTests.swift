@@ -269,7 +269,79 @@ struct CertAuthorityTests {
         #expect(process.terminationStatus == 0, "openssl -x509_strict verify failed: \(log)")
     }
 
+    @Test func legacyCAWithoutSKIIsRegenerated() async throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // An on-disk CA from the version before this fix: no SKI, so it cannot be patched in place.
+        let legacy = try Self.makeLegacyCA()
+        try legacy.certificatePEM.write(
+            to: directory.appending(path: "ca.pem"), atomically: true, encoding: .utf8)
+        try legacy.privateKeyPEM.write(
+            to: directory.appending(path: "ca.key"), atomically: true, encoding: .utf8)
+
+        let authority = CertAuthority(directory: directory)
+        try authority.loadOrCreate()
+
+        #expect(authority.didRotateLegacyCA)
+        let rotatedPEM = try String(contentsOf: authority.caCertificatePEMURL)
+        #expect(rotatedPEM != legacy.certificatePEM)
+        #expect(try String(contentsOf: directory.appending(path: "ca.key")) != legacy.privateKeyPEM)
+        let rotated = try Certificate(pemEncoded: rotatedPEM)
+        let rotatedSKI = try #require(try rotated.extensions.subjectKeyIdentifier)
+
+        // The regenerated CA signs fresh, correct leaves that name it in their AKI.
+        let leaf = try authority.leaf()
+        let leafCertificate = try Certificate(pemEncoded: leaf.certificatePEM)
+        #expect(try leafCertificate.extensions.authorityKeyIdentifier?.keyIdentifier == rotatedSKI.keyIdentifier)
+        var verifier = Verifier(rootCertificates: CertificateStore([rotated])) {
+            RFC5280Policy()
+            ServerIdentityPolicy(serverHostname: "openrouter.ai", serverIP: nil)
+        }
+        guard case .validCertificate = await verifier.validate(leaf: leafCertificate, intermediates: CertificateStore()) else {
+            Issue.record("the rotated CA did not verify its new leaf")
+            return
+        }
+    }
+
+    @Test func reloadOfModernCADoesNotRotate() throws {
+        let directory = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let first = CertAuthority(directory: directory)
+        try first.loadOrCreate()
+        #expect(first.didRotateLegacyCA == false)
+
+        let second = CertAuthority(directory: directory)
+        try second.loadOrCreate()
+        #expect(second.didRotateLegacyCA == false)
+    }
+
     // MARK: - Helpers
+
+    /// Reproduces the pre-SKI/AKI CA an older openproxy install left on disk, so the migration
+    /// path can be exercised. It deliberately omits both key-identifier extensions.
+    static func makeLegacyCA(now: Date = Date()) throws -> (certificatePEM: String, privateKeyPEM: String) {
+        let key = P256.Signing.PrivateKey()
+        let privateKey = Certificate.PrivateKey(key)
+        let name = try DistinguishedName { CommonName("OpenProxy Local CA") }
+        let certificate = try Certificate(
+            version: .v3,
+            serialNumber: Certificate.SerialNumber(),
+            publicKey: Certificate.PublicKey(key.publicKey),
+            notValidBefore: now.addingTimeInterval(-60),
+            notValidAfter: now.addingTimeInterval(10 * 365 * 86_400),
+            issuer: name,
+            subject: name,
+            signatureAlgorithm: .ecdsaWithSHA256,
+            extensions: Certificate.Extensions {
+                Critical(BasicConstraints.isCertificateAuthority(maxPathLength: 0))
+                Critical(KeyUsage(keyCertSign: true, cRLSign: true))
+                Critical(NameConstraints(permittedDNSDomains: ["openrouter.ai"]))
+            },
+            issuerPrivateKey: privateKey
+        )
+        return (try certificate.serializeAsPEM().pemString, try privateKey.serializeAsPEM().pemString)
+    }
 
     static func makeTempDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appending(path: "openproxy-ca-\(UUID().uuidString)")

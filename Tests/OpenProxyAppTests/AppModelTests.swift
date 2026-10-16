@@ -293,6 +293,18 @@ struct AppModelTests {
         #expect(model.warnings.contains { $0.contains("settings") })
     }
 
+    @Test func legacyCARegenerationBecomesWarning() throws {
+        // Item 2: a legacy CA is rotated on load; the app must tell the user their trusted copy is stale.
+        let h = try Harness()
+        let model = AppModel(
+            settingsStore: h.settingsStore, stats: h.stats, installer: h.installer,
+            server: h.server, loginItem: h.loginItem, quitDecision: h.quitDecision,
+            caWasRegenerated: true)
+
+        #expect(h.model().warnings.isEmpty)
+        #expect(model.warnings.contains { $0.contains("Uninstall") })
+    }
+
     @Test func menuVisibilityDrivesPeriodicRefresh() async throws {
         let h = try Harness()
         // Default cadence is 5 s; the test uses a fast one instead of sleeping for it.

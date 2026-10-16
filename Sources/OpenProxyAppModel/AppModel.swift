@@ -92,6 +92,7 @@ public final class AppModel {
         server: ProxyServerControlling,
         loginItem: LoginItemRegistering,
         quitDecision: QuitDecision,
+        caWasRegenerated: Bool = false,
         refreshInterval: Duration = .seconds(5)
     ) {
         self.settingsStore = settingsStore
@@ -104,6 +105,9 @@ public final class AppModel {
         self.currentSettings = settingsStore.settings
         self.status = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
         self.summary = StatsSummary()
+        if caWasRegenerated {
+            warn("The local CA was regenerated because it predates this version; the trusted copy is stale. Run Uninstall, then Install again.")
+        }
     }
 
     public func start() async {

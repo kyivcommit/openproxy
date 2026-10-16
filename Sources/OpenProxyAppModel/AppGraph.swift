@@ -37,7 +37,8 @@ public enum AppGraph {
 
         return AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
-            server: server, loginItem: SMAppServiceLoginItem(), quitDecision: quitDecision)
+            server: server, loginItem: SMAppServiceLoginItem(), quitDecision: quitDecision,
+            caWasRegenerated: ca.didRotateLegacyCA)
     }
 
     /// The CA key and stats live here, so the directory stays owner-only even if

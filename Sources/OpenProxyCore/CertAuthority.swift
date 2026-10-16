@@ -47,6 +47,11 @@ public final class CertAuthority: @unchecked Sendable {
         directory.appending(path: "ca.pem")
     }
 
+    /// Set by `loadOrCreate` when it found an on-disk CA predating the SKI/AKI extensions
+    /// and had to regenerate it (and therefore its leaf). The app uses this to tell the user
+    /// that the trusted copy of the CA is stale and Install must be repeated.
+    public private(set) var didRotateLegacyCA = false
+
     private var caKeyURL: URL {
         directory.appending(path: "ca.key")
     }
@@ -61,6 +66,21 @@ public final class CertAuthority: @unchecked Sendable {
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: caKeyURL.path)
             let certificate = try Certificate(pemEncoded: String(contentsOf: caCertificatePEMURL))
             let key = try Certificate.PrivateKey(pemEncoded: String(contentsOf: caKeyURL))
+
+            // A CA issued before the SKI/AKI extensions cannot be patched in place — the
+            // extensions live inside the signed certificate — so regenerate the CA and leaf.
+            if try certificate.extensions.subjectKeyIdentifier == nil {
+                let (replacement, replacementKey) = try Self.makeCA(now: Date())
+                try persist(replacement, replacementKey)
+                lock.withLock {
+                    caCertificate = replacement
+                    caPrivateKey = replacementKey
+                    cachedLeaf = nil
+                    didRotateLegacyCA = true
+                }
+                return
+            }
+
             lock.withLock {
                 caCertificate = certificate
                 caPrivateKey = key
@@ -70,13 +90,21 @@ public final class CertAuthority: @unchecked Sendable {
         }
 
         let (certificate, key) = try Self.makeCA(now: Date())
-        try Self.write(try certificate.serializeAsPEM().pemString, to: caCertificatePEMURL, permissions: 0o644)
-        try Self.write(try key.serializeAsPEM().pemString, to: caKeyURL, permissions: 0o600)
+        try persist(certificate, key)
         lock.withLock {
             caCertificate = certificate
             caPrivateKey = key
             cachedLeaf = nil
         }
+    }
+
+    /// Persists a CA pair, replacing any previous one. The old files are removed first so
+    /// `write` creates with the intended mode instead of inheriting a legacy file's mode.
+    private func persist(_ certificate: Certificate, _ key: Certificate.PrivateKey) throws {
+        try? FileManager.default.removeItem(at: caCertificatePEMURL)
+        try? FileManager.default.removeItem(at: caKeyURL)
+        try Self.write(try certificate.serializeAsPEM().pemString, to: caCertificatePEMURL, permissions: 0o644)
+        try Self.write(try key.serializeAsPEM().pemString, to: caKeyURL, permissions: 0o600)
     }
 
     /// Returns the current leaf certificate and key, issuing a new one if none is cached or the
