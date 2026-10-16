@@ -119,4 +119,144 @@ struct InstallerTests {
         #expect(appleScript.contains("\\\"hi\\\""))
         #expect(appleScript.contains("\\\\ bye"))
     }
+
+    // MARK: - Finding (a): stop at the first error, never mask it with flushcache
+
+    @Test func installScriptStopsAtFirstErrorAndOrdersSteps() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).install()
+
+        let script = try #require(runner.scripts.first)
+        // Without `set -e` the always-succeeding trailing flushcache made the whole script
+        // report success even when security/hosts failed; the script must abort at step one.
+        #expect(script.hasPrefix("set -e\n"))
+        let security = try #require(script.range(of: "security add-trusted-cert"))
+        let hostsReplace = try #require(script.range(of: "mv \"$tmp\" \"$hosts\""))
+        let flush = try #require(script.range(of: "dscacheutil -flushcache"))
+        #expect(security.lowerBound < hostsReplace.lowerBound)
+        #expect(hostsReplace.lowerBound < flush.lowerBound)
+    }
+
+    // MARK: - Finding (b): hosts edit runs privileged, re-reads, replaces atomically
+
+    @Test func installDoesNotEmbedStaleHostsSnapshot() async throws {
+        let hostsPath = try makeHostsFile("STALE-SENTINEL-98765\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).install()
+
+        let script = try #require(runner.scripts.first)
+        #expect(!script.contains("STALE-SENTINEL-98765"))
+        // Re-reads /etc/hosts as root and swaps in a temp file instead of truncating it.
+        #expect(script.contains("cat \"$hosts\" > \"$tmp\""))
+        #expect(script.contains("mktemp"))
+        #expect(script.contains("mv \"$tmp\" \"$hosts\""))
+    }
+
+    @Test func uninstallDoesNotEmbedStaleHostsSnapshot() async throws {
+        let hostsPath = try makeHostsFile("STALE-SENTINEL-98765\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).uninstall()
+
+        let script = try #require(runner.scripts.first)
+        #expect(!script.contains("STALE-SENTINEL-98765"))
+        #expect(!script.contains(hostsEntry))
+        #expect(script.contains("sed -E"))
+        #expect(script.contains("mv \"$tmp\" \"$hosts\""))
+    }
+
+    @Test func hostsEditScriptRunsPrivilegedAndNeverTruncatesInPlace() async throws {
+        let hostsPath = try makeHostsFile("")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).install()
+
+        let script = try #require(runner.scripts.first)
+        // The old `printf '%s' <text> > /etc/hosts` wrote "" on a read error; the rewrite
+        // never truncates the real file: it writes a temp and moves it into place.
+        #expect(!script.contains("> \(shellQuoted(hostsPath))"))
+        #expect(script.contains(">> \"$tmp\""))
+    }
+
+    @Test func hostsEditScriptIsAtomicIdempotentAndFailsClosed() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "hosts-exec-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let hostsPath = dir.appending(path: "hosts").path
+        try Data("127.0.0.1 localhost\n".utf8).write(to: URL(fileURLWithPath: hostsPath))
+
+        let add = "set -e\n" + Installer.hostsEditScript(hostsPath: hostsPath, adding: true)
+        try runShell(add)
+        try runShell(add) // idempotent
+        var text = try String(contentsOfFile: hostsPath, encoding: .utf8)
+        #expect(text.components(separatedBy: hostsEntry).count - 1 == 1)
+
+        let remove = "set -e\n" + Installer.hostsEditScript(hostsPath: hostsPath, adding: false)
+        try runShell(remove)
+        text = try String(contentsOfFile: hostsPath, encoding: .utf8)
+        #expect(text == "127.0.0.1 localhost\n")
+
+        // A failed read aborts before the atomic replace and leaves no file behind.
+        let missing = dir.appending(path: "does-not-exist").path
+        #expect(throws: (any Error).self) {
+            try runShell("set -e\n" + Installer.hostsEditScript(hostsPath: missing, adding: true))
+        }
+        #expect(!FileManager.default.fileExists(atPath: missing))
+    }
+
+    // MARK: - Quoting: spaces and single quotes must survive the AppleScript/shell layers
+
+    @Test func quotesPathsWithSpacesAndSingleQuotes() {
+        let path = "/tmp/a b'c/ca.pem"
+        let command = Installer.nodeCAEnvCommand(caPEMURL: URL(fileURLWithPath: path))
+        #expect(command == "launchctl setenv NODE_EXTRA_CA_CERTS '/tmp/a b'\\''c/ca.pem'")
+
+        let wrapped = OsascriptRunner.appleScript(forShellScript: command)
+        #expect(wrapped.hasPrefix("do shell script "))
+        #expect(wrapped.hasSuffix(" with administrator privileges"))
+        // AppleScript doubles the backslash so the shell still sees the original `'\''`.
+        #expect(wrapped.contains("'/tmp/a b'\\\\''c/ca.pem'"))
+    }
+
+    @Test func installQuotesCaAndHostsPathsWithSpacesAndSingleQuotes() async throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "a b'c-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let hostsPath = dir.appending(path: "my hosts").path
+        try Data("127.0.0.1 localhost\n".utf8).write(to: URL(fileURLWithPath: hostsPath))
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let runner = RecordingRunner()
+        let caPath = "/tmp/a b'c/ca.pem"
+
+        try await Installer(
+            caPEMURL: URL(fileURLWithPath: caPath), runner: runner, hostsPath: hostsPath
+        ).install()
+
+        let script = try #require(runner.scripts.first)
+        #expect(script.contains(shellQuoted(caPath)))
+        #expect(script.contains(shellQuoted(hostsPath)))
+    }
+}
+
+/// The POSIX single-quote escaping the installer must produce for arbitrary paths.
+private func shellQuoted(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+private func runShell(_ script: String) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", script]
+    process.standardError = FileHandle.nullDevice
+    try process.run()
+    process.waitUntilExit()
+    if process.terminationStatus != 0 {
+        throw InstallError.commandFailed(command: script, status: process.terminationStatus)
+    }
 }
