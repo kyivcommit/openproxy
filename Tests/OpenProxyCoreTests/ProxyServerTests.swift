@@ -912,6 +912,20 @@ struct ProxyServerTests {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    @Test func tlsMinimumVersionIs12OnServerAndClient() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-tls-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let ca = CertAuthority(directory: directory)
+        try ca.loadOrCreate()
+
+        let serverConfig = try ProxyServer.serverTLSConfiguration(ca.leaf())
+        #expect(serverConfig.minimumTLSVersion == .tlsv12)
+        let client = NIOUpstreamClient(resolver: StaticResolver(addresses: []))
+        #expect(client.minimumTLSVersion == .tlsv12)
+    }
+
     @Test func nonLoopbackPeerRejected() throws {        let foreign = try SocketAddress(ipAddress: "10.0.0.1", port: 1234)
         let loopback = try SocketAddress(ipAddress: "127.0.0.1", port: 1234)
         #expect(!ProxyServer.isAllowedPeer(foreign, allowNonLoopback: false))

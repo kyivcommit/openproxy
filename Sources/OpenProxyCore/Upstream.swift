@@ -191,6 +191,7 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
         self.port = port
         self.allowLoopback = allowLoopback
         var tls = TLSConfiguration.makeClientConfiguration()
+        tls.minimumTLSVersion = .tlsv12
         if let trustRoots {
             // A caller-supplied trust anchor is expected to be a valid certificate; a
             // conversion failure would only be possible from a programming error.
@@ -202,6 +203,9 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
         self.localAddresses = Self.localAddresses()
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     }
+
+    /// Test seam: the TLS floor this client enforces.
+    var minimumTLSVersion: TLSVersion { tlsConfiguration.minimumTLSVersion }
 
     public func send(_ request: UpstreamRequest) async throws -> UpstreamResponse {
         let answers = try await resolver.resolve(host)

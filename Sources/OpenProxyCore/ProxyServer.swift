@@ -297,15 +297,22 @@ public final class ProxyServer: @unchecked Sendable {
         return object["stream"] as? Bool == true
     }
 
-    private static func makeSSLContext(
+    static func serverTLSConfiguration(
         _ leaf: (certificatePEM: String, privateKeyPEM: String)
-    ) throws -> NIOSSLContext {
+    ) throws -> TLSConfiguration {
         let certificate = try NIOSSLCertificate(bytes: Array(leaf.certificatePEM.utf8), format: .pem)
         let key = try NIOSSLPrivateKey(bytes: Array(leaf.privateKeyPEM.utf8), format: .pem)
         var tls = TLSConfiguration.makeServerConfiguration(
             certificateChain: [.certificate(certificate)], privateKey: .privateKey(key))
         tls.applicationProtocols = ["http/1.1"]
-        return try NIOSSLContext(configuration: tls)
+        tls.minimumTLSVersion = .tlsv12
+        return tls
+    }
+
+    private static func makeSSLContext(
+        _ leaf: (certificatePEM: String, privateKeyPEM: String)
+    ) throws -> NIOSSLContext {
+        try NIOSSLContext(configuration: serverTLSConfiguration(leaf))
     }
 }
 
