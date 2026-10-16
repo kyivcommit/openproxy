@@ -238,12 +238,46 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
     /// can never live there, and dialing one would loop back into this proxy.
     func isForbidden(_ address: String) -> Bool {
         if allowLoopback { return false }
-        return NIOUpstreamClient.isLoopback(address) || localAddresses.contains(address)
+        return NIOUpstreamClient.isForbiddenAddress(address) || localAddresses.contains(address)
     }
 
-    static func isLoopback(_ address: String) -> Bool {
-        address.hasPrefix("127.") || address.hasPrefix("::ffff:127.")
-            || address == "::1" || address == "0:0:0:0:0:0:0:1"
+    /// Refuses address literals that cannot be the real OpenRouter: unspecified,
+    /// loopback, link-local, multicast, reserved, and IPv4-mapped/compatible
+    /// forms of them. Anything that fails to parse is refused too.
+    static func isForbiddenAddress(_ address: String) -> Bool {
+        // Drop an IPv6 zone id ("fe80::1%en0") before parsing.
+        let host = address.split(separator: "%", maxSplits: 1).first.map(String.init) ?? address
+        var v4 = in_addr()
+        if inet_pton(AF_INET, host, &v4) == 1 {
+            return isForbiddenIPv4(withUnsafeBytes(of: v4) { Array($0) })
+        }
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, host, &v6) == 1 {
+            return isForbiddenIPv6(withUnsafeBytes(of: v6) { Array($0) })
+        }
+        return true
+    }
+
+    private static func isForbiddenIPv4(_ b: [UInt8]) -> Bool {
+        if b[0] == 0 { return true }                            // 0.0.0.0/8 "this network"
+        if b[0] == 127 { return true }                          // 127.0.0.0/8 loopback
+        if b[0] == 169 && b[1] == 254 { return true }           // 169.254.0.0/16 link-local
+        if (b[0] & 0xf0) == 224 { return true }                 // 224.0.0.0/4 multicast
+        if (b[0] & 0xf0) == 240 { return true }                 // 240.0.0.0/4 reserved + broadcast
+        return false
+    }
+
+    private static func isForbiddenIPv6(_ b: [UInt8]) -> Bool {
+        if b.allSatisfy({ $0 == 0 }) { return true }            // ::
+        if b[0] == 0xfe && (b[1] & 0xc0) == 0x80 { return true }  // fe80::/10 link-local
+        if b[0] == 0xff { return true }                         // ff00::/8 multicast
+        // IPv4-compatible (::/96) and IPv4-mapped (::ffff:0:0/96) forms carry
+        // an IPv4 address in the last four bytes; inherit its verdict.
+        if b[0..<10].allSatisfy({ $0 == 0 }),
+           (b[10] == 0 && b[11] == 0) || (b[10] == 0xff && b[11] == 0xff) {
+            return isForbiddenIPv4(Array(b[12..<16]))
+        }
+        return false
     }
 
     static func localAddresses() -> Set<String> {

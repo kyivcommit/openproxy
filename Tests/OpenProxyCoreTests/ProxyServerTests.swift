@@ -745,6 +745,20 @@ struct ProxyServerTests {
         #expect(!ProxyServer.isAllowedPeer(nil, allowNonLoopback: false))
     }
 
+    @Test(arguments: [
+        "0.0.0.0", "127.0.0.1", "127.5.0.1", "169.254.1.1", "224.0.0.1",
+        "255.255.255.255", "240.0.0.1", "::", "::1", "fe80::1", "fe80::1%en0",
+        "::ffff:127.0.0.1", "ff02::1", "not-an-ip", "999.1.1.1",
+    ])
+    func forbiddenAddressRejected(address: String) {
+        #expect(NIOUpstreamClient.isForbiddenAddress(address))
+    }
+
+    @Test(arguments: ["1.2.3.4", "8.8.8.8", "2606:4700:4700::1111", "2001:4860:4860::8888"])
+    func publicAddressAllowed(address: String) {
+        #expect(!NIOUpstreamClient.isForbiddenAddress(address))
+    }
+
     @Test func nioUpstreamClientRejectsLoopbackResolverAnswer() async {
         let client = NIOUpstreamClient(resolver: StaticResolver(addresses: ["127.0.0.1"]))
         await #expect(throws: UpstreamError.self) {
