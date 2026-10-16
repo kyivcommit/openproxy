@@ -38,7 +38,7 @@ public final class ProxyServer: @unchecked Sendable {
     private let config: ProxyConfig
     private let ca: CertAuthority
     private let upstream: UpstreamClient
-    private let catalog: TierCatalog
+    private let catalog: EndpointCatalog
     private let stats: StatsStore
     private let settings: @Sendable () -> Settings
     private let group: EventLoopGroup
@@ -56,7 +56,7 @@ public final class ProxyServer: @unchecked Sendable {
         config: ProxyConfig = ProxyConfig(),
         ca: CertAuthority,
         upstream: UpstreamClient,
-        catalog: TierCatalog,
+        catalog: EndpointCatalog,
         stats: StatsStore,
         settings: @escaping @Sendable () -> Settings
     ) {
@@ -139,7 +139,7 @@ public final class ProxyServer: @unchecked Sendable {
         let model = Rewriter.model(in: body)
 
         // The policy applies only to POSTs to the rewritable paths; everything else
-        // passes through byte-for-byte and never triggers a TierCatalog lookup.
+        // passes through byte-for-byte and never triggers an EndpointCatalog lookup.
         let isRewritable = requestHead.method == .POST
         // Only consult the catalog when the policy could actually inject a tier.
         let needsAvailability = isRewritable

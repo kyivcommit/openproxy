@@ -69,7 +69,7 @@ private final class FakeEndpointsFetcher: EndpointsFetcher, @unchecked Sendable 
         self.data = try! JSONSerialization.data(withJSONObject: ["data": ["endpoints": endpoints]])
     }
 
-    func fetch(modelId: String, authorization: String) async throws -> Data {
+    func fetch(modelId: String, authorization: String?) async throws -> Data {
         lock.withLock { _calls.append(modelId) }
         return data
     }
@@ -317,7 +317,7 @@ private func startHarness(
             maxQueuedRequests: maxQueuedRequests, maxQueuedBytes: maxQueuedBytes),
         ca: ca,
         upstream: upstream,
-        catalog: TierCatalog(fetcher: fetcher),
+        catalog: EndpointCatalog(fetcher: fetcher),
         stats: stats,
         settings: { settings })
     try await server.start()
@@ -378,7 +378,7 @@ private func withCustomUpstream(
         config: ProxyConfig(bindHost: "127.0.0.1", port: 0),
         ca: ca,
         upstream: upstream,
-        catalog: TierCatalog(fetcher: FakeEndpointsFetcher(hasFlex: true)),
+        catalog: EndpointCatalog(fetcher: FakeEndpointsFetcher(hasFlex: true)),
         stats: stats,
         settings: { settings })
     try await server.start()
@@ -1164,7 +1164,7 @@ struct ProxyServerTests {
             config: ProxyConfig(bindHost: "127.0.0.1", port: 0),
             ca: ca,
             upstream: FakeUpstreamClient([FakeReply()]),
-            catalog: TierCatalog(fetcher: FakeEndpointsFetcher(hasFlex: false)),
+            catalog: EndpointCatalog(fetcher: FakeEndpointsFetcher(hasFlex: false)),
             stats: try StatsStore(path: ":memory:"),
             settings: { Settings() })
         do {

@@ -119,7 +119,7 @@ private final class RecordingHandler: ChannelInboundHandler {
 }
 
 struct NoopEndpointsFetcher: EndpointsFetcher {
-    func fetch(modelId: String, authorization: String) async throws -> Data { Data() }
+    func fetch(modelId: String, authorization: String?) async throws -> Data { Data() }
 }
 
 /// ProxyServer wired to the real `NIOUpstreamClient` and a loopback TLS upstream,
@@ -167,7 +167,7 @@ func withWireServer(
             port: upstream.port,
             trustRoots: [upstream.caCertificate],
             allowLoopback: true),
-        catalog: TierCatalog(fetcher: NoopEndpointsFetcher()),
+        catalog: EndpointCatalog(fetcher: NoopEndpointsFetcher()),
         stats: stats,
         settings: { settings })
     try await server.start()

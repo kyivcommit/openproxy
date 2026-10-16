@@ -26,7 +26,10 @@ public enum AppGraph {
         try ca.loadOrCreate()
 
         let upstream = NIOUpstreamClient(resolver: DoHResolver())
-        let catalog = TierCatalog(fetcher: UpstreamEndpointsFetcher(client: upstream))
+        // TTL follows the UI setting (pollMinutes), read per lookup, so changing it needs no restart.
+        let catalog = EndpointCatalog(
+            fetcher: UpstreamEndpointsFetcher(client: upstream),
+            ttl: { [settingsStore] in TimeInterval(settingsStore.settings.pollMinutes * 60) })
         let installer = Installer(ca: ca, runner: OsascriptRunner())
         let server = ProxyServer(
             ca: ca,
@@ -55,11 +58,14 @@ public enum AppGraph {
 struct UpstreamEndpointsFetcher: EndpointsFetcher {
     let client: UpstreamClient
 
-    func fetch(modelId: String, authorization: String) async throws -> Data {
+    func fetch(modelId: String, authorization: String?) async throws -> Data {
+        // No key is needed for /endpoints, so only forward the header when the client sent one.
+        var headers: [(String, String)] = [("Accept", "application/json")]
+        if let authorization { headers.append(("Authorization", authorization)) }
         let response = try await client.send(UpstreamRequest(
             method: "GET",
             path: "/api/v1/models/\(modelId)/endpoints",
-            headers: [("Authorization", authorization), ("Accept", "application/json")],
+            headers: headers,
             body: Data()))
         guard response.status == 200 else { throw EndpointsFetchError.badStatus(response.status) }
         var data = Data()
