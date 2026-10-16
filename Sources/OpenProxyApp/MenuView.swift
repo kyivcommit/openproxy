@@ -37,6 +37,10 @@ struct MenuView: View {
                 Divider()
                 unreachableBlock(untrustedCA)
             }
+            if let notice = model.installNotice {
+                Divider()
+                installNoticeBlock(notice)
+            }
             if !model.warnings.isEmpty {
                 Divider()
                 warningBlock
@@ -152,6 +156,24 @@ struct MenuView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
             Button("Uninstall") { Task { await model.uninstall() } }
+        }
+    }
+
+    /// A one-time, dismissible info line (not a warning): restart long-running clients
+    /// after Install so they load the new CA.
+    private func installNoticeBlock(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text("ℹ︎ \(message)")
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button {
+                model.dismissInstallNotice()
+            } label: {
+                Image(systemName: "xmark.circle")
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
         }
     }
 

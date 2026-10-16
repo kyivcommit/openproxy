@@ -592,4 +592,45 @@ struct AppModelTests {
         #expect(model.warnings.contains { $0.key == .nodeEnv })
     }
 
+    // MARK: - Item 3: one-time restart notice after Install
+
+    @Test func successfulInstallShowsRestartNotice() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.install()
+
+        #expect(model.installNotice?.contains("opencode service restart") == true)
+    }
+
+    @Test func failedInstallShowsNoRestartNotice() async throws {
+        let h = try Harness()
+        h.runner.error = InstallError.runnerFailed("user cancelled")
+        let model = h.model()
+
+        await model.install()
+
+        #expect(model.installNotice == nil)
+    }
+
+    @Test func dismissInstallNoticeClearsIt() async throws {
+        let h = try Harness()
+        let model = h.model()
+        await model.install()
+
+        model.dismissInstallNotice()
+
+        #expect(model.installNotice == nil)
+    }
+
+    @Test func uninstallClearsInstallNotice() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        await model.install()
+        #expect(model.installNotice != nil)
+
+        await model.uninstall()
+
+        #expect(model.installNotice == nil)
+    }
 }
