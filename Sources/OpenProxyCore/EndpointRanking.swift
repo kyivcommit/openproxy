@@ -1,8 +1,11 @@
 import Foundation
 
 extension Endpoint {
-    /// What Smart price sorts by: the sum of the input and output price, USD per million tokens.
-    public var costUSDPerMillion: Double { promptUSDPerMillion + completionUSDPerMillion }
+    /// What Smart price sorts by: the more expensive side (input or output), USD per million tokens.
+    public var costKeyUSDPerMillion: Double { max(promptUSDPerMillion, completionUSDPerMillion) }
+
+    /// Input plus output price; the first tie-break when the cost key is equal.
+    public var combinedUSDPerMillion: Double { promptUSDPerMillion + completionUSDPerMillion }
 }
 
 public struct Ranking: Equatable, Sendable {
@@ -20,11 +23,9 @@ public struct Ranking: Equatable, Sendable {
 /// Pure Smart-price ranking (design addendum steps 2–4): filter, group by tier, sort by
 /// cost, then apply the per-model hysteresis. No I/O, so it is trivially testable.
 public enum EndpointRanking {
-    /// Endpoints with any of these quantizations are never chosen (they trade quality for price).
-    public static let excludedQuantizations: Set<String> = ["fp4", "mxfp4", "nvfp4", "int4", "fp6", "int8"]
-
-    /// The `provider.quantizations` allow-list we inject alongside the order.
-    public static let allowedQuantizations = ["bf16", "fp16", "fp32", "fp8", "unknown"]
+    /// The only quantization Smart price keeps: an endpoint that is not quantized at all.
+    /// Everything with a declared precision (fp4, fp8, fp16, bf16, …) trades quality for price.
+    public static let allowedQuantizations = ["unknown"]
 
     /// An endpoint with a reported uptime below this is skipped; a null uptime is unknown, not bad.
     public static let minimumUptime = 90.0
@@ -54,7 +55,7 @@ public enum EndpointRanking {
         let leader: Endpoint
         if let previousLeader,
            let previous = ordered.first(where: { $0.tag == previousLeader }),
-           best.costUSDPerMillion > previous.costUSDPerMillion * hysteresisFactor {
+           best.costKeyUSDPerMillion > previous.costKeyUSDPerMillion * hysteresisFactor {
             leader = previous
         } else {
             leader = best
@@ -67,18 +68,20 @@ public enum EndpointRanking {
 
     static func isEligible(_ endpoint: Endpoint) -> Bool {
         guard !endpoint.tag.isEmpty else { return false }
-        if let quantization = endpoint.quantization?.lowercased(),
-           excludedQuantizations.contains(quantization) {
-            return false
-        }
+        // Only endpoints with no declared precision stay; "unknown" (or absent) means unquantized.
+        let quantization = endpoint.quantization?.lowercased()
+        guard quantization == nil || quantization == "unknown" else { return false }
         if let uptime = endpoint.uptimeLast30m, uptime < minimumUptime { return false }
         return true
     }
 
-    /// Cost ascending; ties: higher uptime, then tag.
+    /// Cost key ascending; ties: lower input+output, then higher uptime, then tag.
     static func isCheaper(_ a: Endpoint, _ b: Endpoint) -> Bool {
-        if a.costUSDPerMillion != b.costUSDPerMillion {
-            return a.costUSDPerMillion < b.costUSDPerMillion
+        if a.costKeyUSDPerMillion != b.costKeyUSDPerMillion {
+            return a.costKeyUSDPerMillion < b.costKeyUSDPerMillion
+        }
+        if a.combinedUSDPerMillion != b.combinedUSDPerMillion {
+            return a.combinedUSDPerMillion < b.combinedUSDPerMillion
         }
         let aUptime = a.uptimeLast30m ?? 0
         let bUptime = b.uptimeLast30m ?? 0

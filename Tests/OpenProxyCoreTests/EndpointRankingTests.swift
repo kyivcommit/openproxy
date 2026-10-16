@@ -13,8 +13,9 @@ struct EndpointRankingTests {
         return try #require(EndpointCatalog.parseEndpoints(try Data(contentsOf: url)))
     }
 
+    /// Unquantized by default: that is the only quantization Smart price keeps.
     func endpoint(
-        _ tag: String, quant: String? = "fp8", tier: String? = nil,
+        _ tag: String, quant: String? = "unknown", tier: String? = nil,
         prompt: Double, completion: Double = 0, uptime: Double? = 100
     ) -> Endpoint {
         Endpoint(
@@ -22,38 +23,37 @@ struct EndpointRankingTests {
             promptUSDPerMillion: prompt, completionUSDPerMillion: completion, uptimeLast30m: uptime)
     }
 
-    @Test func realFixturePicksCheapestNonQuantizedEndpoint() throws {
+    @Test func realFixtureKeepsOnlyUnquantizedEndpoints() throws {
         let ranking = EndpointRanking.rank(endpoints: try Self.fixture(), tier: .auto)
 
-        // The bug the feature fixes: OpenInference (fp4) is cheapest by input price alone.
-        #expect(ranking.leader == "deepinfra/fp8")
-        #expect(ranking.order.first == "deepinfra/fp8")
-        #expect(!ranking.order.contains("open-inference/fp4"))
-        #expect(!ranking.order.contains(where: { $0.hasSuffix("/fp4") }))
+        // Only endpoints with no declared precision stay; the fp8 providers are gone too.
+        #expect(ranking.leader == "alibaba")
+        #expect(ranking.order.first == "alibaba")
+        #expect(ranking.order == ["alibaba", "deepseek", "relace", "phala", "cloudflare"])
+        #expect(!ranking.order.contains(where: { $0.contains("fp") || $0.contains("int") }))
     }
 
-    @Test func realFixtureFlexRanksOnlyFlexEndpoints() throws {
+    @Test func realFixtureFlexHasNoEligibleEndpoint() throws {
+        // The only flex endpoint is fp8, so Flex must fail open rather than route to it.
         let ranking = EndpointRanking.rank(endpoints: try Self.fixture(), tier: .flex)
-        #expect(ranking.leader == "deepinfra/fp8/flex")
-        #expect(ranking.order == ["deepinfra/fp8/flex"])
+        #expect(ranking == Ranking())
+        #expect(ranking.leader == nil)
     }
 
-    @Test func realFixturePriorityPrefersPriorityEndpoints() throws {
+    @Test func realFixturePriorityFallsBackToStandardEndpoints() throws {
+        // The priority endpoints are fp8 / below the uptime floor, so only standard ones remain.
         let ranking = EndpointRanking.rank(endpoints: try Self.fixture(), tier: .priority)
-        // baseten/fast is cheaper but reports 86.7% uptime, below the 90% floor.
-        #expect(ranking.leader == "deepinfra/fp8/priority")
-        #expect(ranking.order.first == "deepinfra/fp8/priority")
+        #expect(ranking.leader == "alibaba")
+        #expect(!ranking.order.contains("deepinfra/fp8/priority"))
         #expect(!ranking.order.contains("baseten/fast"))
-        // Standard endpoints follow the priority one.
-        #expect(ranking.order.contains("deepinfra/fp8"))
     }
 
-    @Test func defaultTierRanksStandardEndpointsOnly() throws {
+    @Test func realFixtureDefaultMatchesAuto() throws {
         let ranking = EndpointRanking.rank(endpoints: try Self.fixture(), tier: .default)
-        #expect(ranking.leader == "deepinfra/fp8")
+        #expect(ranking.leader == "alibaba")
     }
 
-    @Test func excludedQuantizationsAreSkipped() {
+    @Test func declaredPrecisionsAreSkipped() {
         let endpoints = [
             endpoint("fp4", quant: "fp4", prompt: 0.01),
             endpoint("int4", quant: "int4", prompt: 0.01),
@@ -61,17 +61,18 @@ struct EndpointRankingTests {
             endpoint("int8", quant: "int8", prompt: 0.01),
             endpoint("mxfp4", quant: "mxfp4", prompt: 0.01),
             endpoint("nvfp4", quant: "nvfp4", prompt: 0.01),
-            endpoint("fp8", quant: "fp8", prompt: 1),
-            endpoint("unknown", quant: "unknown", prompt: 2),
-            endpoint("bf16", quant: "bf16", prompt: 3),
+            endpoint("fp8", quant: "fp8", prompt: 0.01),
+            endpoint("bf16", quant: "bf16", prompt: 0.01),
+            endpoint("nullQuant", quant: nil, prompt: 2),
+            endpoint("unknown", quant: "unknown", prompt: 1),
         ]
         let ranking = EndpointRanking.rank(endpoints: endpoints, tier: .auto)
-        #expect(ranking.leader == "fp8")
-        #expect(Set(ranking.order) == ["fp8", "unknown", "bf16"])
+        #expect(ranking.leader == "unknown")
+        #expect(Set(ranking.order) == ["unknown", "nullQuant"])
     }
 
     @Test func allowedQuantizationsConstant() {
-        #expect(EndpointRanking.allowedQuantizations == ["bf16", "fp16", "fp32", "fp8", "unknown"])
+        #expect(EndpointRanking.allowedQuantizations == ["unknown"])
     }
 
     @Test func lowUptimeExcludedButNullAllowed() {
@@ -81,27 +82,27 @@ struct EndpointRankingTests {
             endpoint("unknownUptime", prompt: 2, uptime: nil),
         ]
         let ranking = EndpointRanking.rank(endpoints: endpoints, tier: .auto)
-        #expect(ranking.leader == "atThreshold") // cheaper of the two survivors by cost
+        #expect(ranking.leader == "atThreshold") // cheaper of the two survivors by cost key
         #expect(!ranking.order.contains("low"))
         #expect(ranking.order.contains("unknownUptime"))
     }
 
-    @Test func costIsPromptPlusCompletion() {
+    @Test func costKeyIsTheMoreExpensiveSide() {
         let endpoints = [
-            endpoint("cheapInput", prompt: 0.1, completion: 5), // 5.1
-            endpoint("cheapOutput", prompt: 1, completion: 1), // 2.0
+            endpoint("cheapInput", prompt: 0.1, completion: 5), // key 5
+            endpoint("balanced", prompt: 1.5, completion: 2), // key 2
         ]
-        #expect(EndpointRanking.rank(endpoints: endpoints, tier: .auto).leader == "cheapOutput")
+        #expect(EndpointRanking.rank(endpoints: endpoints, tier: .auto).leader == "balanced")
     }
 
-    @Test func tiesBreakByUptimeThenTag() {
+    @Test func tiesBreakBySumThenUptimeThenTag() {
         let endpoints = [
-            endpoint("b", prompt: 1, uptime: 100),
-            endpoint("a", prompt: 1, uptime: 100),
-            endpoint("high", prompt: 1, uptime: 99.5),
+            endpoint("b", prompt: 1, uptime: 100), // key 1, sum 1
+            endpoint("a", prompt: 1, uptime: 100), // key 1, sum 1
+            endpoint("high", prompt: 1, uptime: 99.5), // key 1, sum 1, lower uptime
+            endpoint("lowerSum", prompt: 1, completion: 0.1), // same key 1, higher sum 1.1, appends last
         ]
-        // Same cost: higher uptime wins, then the tag.
-        #expect(EndpointRanking.rank(endpoints: endpoints, tier: .auto).order == ["a", "b", "high"])
+        #expect(EndpointRanking.rank(endpoints: endpoints, tier: .auto).order == ["a", "b", "high", "lowerSum"])
     }
 
     @Test func hysteresisKeepsLeaderWithinTenPercent() {

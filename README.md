@@ -21,10 +21,10 @@ macOS 14+ only.
 OpenRouter's own `:floor` (the **Price** sort) ranks endpoints by **input** price alone and does not filter quantization. For `deepseek/deepseek-v4.1-flash` it picks an fp4 endpoint even though an fp8 one is cheaper on output. **Smart price** ranks the model's endpoints itself and pins the winner with `provider.order`:
 
 1. Fetch the model's endpoint list (`GET /api/v1/models/{id}/endpoints`, no key needed). It is cached per model for **Refresh endpoint data every N min** (1–60, default 10): a cached list is served at once and refreshed in the background when it is older than the TTL.
-2. Keep the endpoints whose `quantization` is not in `{fp4, mxfp4, nvfp4, int4, fp6, int8}` (`unknown`, `bf16`, `fp16`, `fp32`, `fp8` stay) and whose `uptime_last_30m` is null or at least 90.
+2. Keep only endpoints that are **unquantized**: `quantization` must be `unknown` or absent. Anything with a declared precision (`fp4`, `mxfp4`, `nvfp4`, `int4`, `fp6`, `int8`, `fp8`, `fp16`, `bf16`, `fp32`, …) is dropped. Also drop endpoints whose `uptime_last_30m` is below 90.
 3. Group by the Tier setting: Auto/Default → standard endpoints; Priority → priority first, then standard; Flex → flex endpoints only.
-4. Sort by `pricing.prompt + pricing.completion` (USD per million tokens); ties go to the higher uptime, then the name.
-5. Inject `provider: {order: [<top 5 endpoint tags>], quantizations: ["bf16","fp16","fp32","fp8","unknown"], allow_fallbacks: true}` and add **no** model suffix. The previously chosen endpoint keeps its place unless a new one is at least 10% cheaper, which keeps prompt caching warm.
+4. Sort by `max(pricing.prompt, pricing.completion)` in USD per million tokens — the more expensive side decides. Ties go to the lower `prompt + completion`, then higher uptime, then name.
+5. Inject `provider: {order: [<top 5 endpoint tags>], quantizations: ["unknown"], allow_fallbacks: true}` and add **no** model suffix. The previously chosen endpoint keeps its place unless a new one is at least 10% cheaper, which keeps prompt caching warm.
 6. Skip the whole thing when the client sent `provider.order|sort|only|quantizations` or the model id has a `:variant`/`@preset/`. On any failure the request is forwarded unchanged, and the reason (`no_endpoint_data` or `no_eligible_endpoint`) is recorded in the stats.
 
 The `order` values are the endpoint tags from the `/endpoints` response (`provider[/variant][/region][/tier]`, e.g. `deepinfra/fp8/flex`), which is exactly what OpenRouter's provider `order` accepts. The endpoint Smart price chose is recorded with each request in the stats.

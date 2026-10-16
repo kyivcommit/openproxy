@@ -515,12 +515,13 @@ private func scalarText(_ path: String, sql: String) -> String? {
 /// One endpoint in the `/endpoints` shape. Cost arguments are USD per million tokens.
 private func endpointJSON(
     _ tag: String, prompt: Double, completion: Double = 0,
-    quant: String = "fp8", tier: String? = nil, uptime: Double? = 100
+    quant: String? = "unknown", tier: String? = nil, uptime: Double? = 100
 ) -> [String: Any] {
     var endpoint: [String: Any] = [
-        "tag": tag, "provider_name": tag, "quantization": quant,
+        "tag": tag, "provider_name": tag,
         "pricing": ["prompt": prompt / 1_000_000, "completion": completion / 1_000_000],
     ]
+    if let quant { endpoint["quantization"] = quant }
     if let tier { endpoint["service_tier"] = tier }
     if let uptime { endpoint["uptime_last_30m"] = uptime }
     return endpoint
@@ -593,9 +594,9 @@ struct ProxyServerTests {
         defer { try? FileManager.default.removeItem(at: url) }
         let stats = try StatsStore(path: url.path)
         let endpoints = endpointsJSON([
-            endpointJSON("open-inference/fp4", prompt: 0.036, completion: 0.6435, quant: "fp4"),
-            endpointJSON("deepinfra/fp8", prompt: 0.14, completion: 0.42),
-            endpointJSON("morph/fp8", prompt: 0.04, completion: 0.7),
+            endpointJSON("cheap-fp8", prompt: 0.01, completion: 0.2, quant: "fp8"), // excluded
+            endpointJSON("best-unquantized", prompt: 0.5, completion: 0.6), // key 0.6
+            endpointJSON("second-unquantized", prompt: 0.3, completion: 0.9), // key 0.9
         ])
         try await withServer(
             settings: Settings(sort: .smartPrice), replies: [FakeReply()],
@@ -606,16 +607,16 @@ struct ProxyServerTests {
                 "POST", chatPath, body: body, headers: ["Authorization": "Bearer k"])
             #expect(response.status == 200)
             let provider = json(harness.upstream.requests[0].body)["provider"] as? [String: Any]
-            #expect(provider?["order"] as? [String] == ["deepinfra/fp8", "morph/fp8"])
-            #expect(provider?["quantizations"] as? [String] == EndpointRanking.allowedQuantizations)
+            #expect(provider?["order"] as? [String] == ["best-unquantized", "second-unquantized"])
+            #expect(provider?["quantizations"] as? [String] == ["unknown"])
             #expect(provider?["allow_fallbacks"] as? Bool == true)
             #expect(await waitUntil({ harness.stats.summary(since: .distantPast).total == 1 }, timeout: 2))
         }
-        #expect(scalarText(url.path, sql: "SELECT endpoint_tag FROM requests LIMIT 1") == "deepinfra/fp8")
+        #expect(scalarText(url.path, sql: "SELECT endpoint_tag FROM requests LIMIT 1") == "best-unquantized")
     }
 
     @Test func smartPriceDefersToClientProviderOrder() async throws {
-        let endpoints = endpointsJSON([endpointJSON("deepinfra/fp8", prompt: 0.14, completion: 0.42)])
+        let endpoints = endpointsJSON([endpointJSON("deepinfra", prompt: 0.14, completion: 0.42)])
         try await withServer(
             settings: Settings(sort: .smartPrice), replies: [FakeReply()],
             fetcher: FakeEndpointsFetcher(data: endpoints)
