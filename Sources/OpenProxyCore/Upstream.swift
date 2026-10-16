@@ -88,7 +88,6 @@ public final class DoHResolver: HostResolver, @unchecked Sendable {
         var ttl: TimeInterval?
     }
 
-    private let endpoint: URL
     private let now: @Sendable () -> Date
     private let maxStale: TimeInterval
     private let fetch: @Sendable (String) async throws -> Record
@@ -107,7 +106,6 @@ public final class DoHResolver: HostResolver, @unchecked Sendable {
         maxStale: TimeInterval,
         fetch: (@Sendable (String) async throws -> Record)? = nil
     ) {
-        self.endpoint = endpoint
         self.now = now
         self.maxStale = maxStale
         let configuration = URLSessionConfiguration.ephemeral
