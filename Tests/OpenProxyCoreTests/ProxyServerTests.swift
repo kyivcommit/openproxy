@@ -199,7 +199,8 @@ private struct Harness: @unchecked Sendable {
 private func startHarness(
     settings: Settings,
     replies: [FakeReply],
-    fetcher: FakeEndpointsFetcher = FakeEndpointsFetcher(hasFlex: true)
+    fetcher: FakeEndpointsFetcher = FakeEndpointsFetcher(hasFlex: true),
+    maxBodyBytes: Int = 32 * 1024 * 1024
 ) async throws -> Harness {
     let directory = FileManager.default.temporaryDirectory.appending(path: "openproxy-proxy-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -210,7 +211,7 @@ private func startHarness(
     let upstream = FakeUpstreamClient(replies)
     let stats = try StatsStore(path: ":memory:")
     let server = ProxyServer(
-        config: ProxyConfig(bindHost: "127.0.0.1", port: 0),
+        config: ProxyConfig(bindHost: "127.0.0.1", port: 0, maxBodyBytes: maxBodyBytes),
         ca: ca,
         upstream: upstream,
         catalog: TierCatalog(fetcher: fetcher),
@@ -237,9 +238,11 @@ private func withServer(
     settings: Settings = Settings(),
     replies: [FakeReply],
     fetcher: FakeEndpointsFetcher = FakeEndpointsFetcher(hasFlex: true),
+    maxBodyBytes: Int = 32 * 1024 * 1024,
     _ body: (Harness) async throws -> Void
 ) async throws {
-    let harness = try await startHarness(settings: settings, replies: replies, fetcher: fetcher)
+    let harness = try await startHarness(
+        settings: settings, replies: replies, fetcher: fetcher, maxBodyBytes: maxBodyBytes)
     do {
         try await body(harness)
     } catch {
@@ -832,6 +835,15 @@ struct ProxyServerTests {
             #expect(!head.contains("proxy-authenticate"))
             #expect(!head.contains("keep-alive"))
             try? await channel.close().get()
+        }
+    }
+
+    @Test func oversizedRequestBodyIsRejectedWith413() async throws {
+        try await withServer(replies: [FakeReply()], maxBodyBytes: 64) { harness in
+            let response = try await harness.request(
+                "POST", chatPath, body: Data(repeating: 0x41, count: 1024))
+            #expect(response.status == 413)
+            #expect(harness.upstream.requests.isEmpty)
         }
     }
 

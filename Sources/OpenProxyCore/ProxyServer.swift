@@ -8,13 +8,19 @@ public struct ProxyConfig: Sendable {
     public var bindHost = "0.0.0.0"
     public var port = 443
     public var allowNonLoopbackPeers = false
+    /// Largest request body buffered for rewriting; larger requests get a 413.
+    public var maxBodyBytes = 32 * 1024 * 1024
 
     public init() {}
 
-    public init(bindHost: String, port: Int, allowNonLoopbackPeers: Bool = false) {
+    public init(
+        bindHost: String, port: Int, allowNonLoopbackPeers: Bool = false,
+        maxBodyBytes: Int = 32 * 1024 * 1024
+    ) {
         self.bindHost = bindHost
         self.port = port
         self.allowNonLoopbackPeers = allowNonLoopbackPeers
+        self.maxBodyBytes = maxBodyBytes
     }
 }
 
@@ -31,6 +37,8 @@ public final class ProxyServer: @unchecked Sendable {
     private var channel: Channel?
 
     public private(set) var boundPort = 0
+
+    var maxBodyBytes: Int { config.maxBodyBytes }
 
     public init(
         config: ProxyConfig = ProxyConfig(),
@@ -250,7 +258,7 @@ public final class ProxyServer: @unchecked Sendable {
         try await channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer))).get()
     }
 
-    private func writeError(status: Int, message: String, channel: Channel) async {
+    func writeError(status: Int, message: String, channel: Channel) async {
         let body = Data(#"{"error":"\#(message)"}"#.utf8)
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: "application/json")
@@ -312,6 +320,7 @@ private final class ProxyConnectionHandler: ChannelInboundHandler, @unchecked Se
     private var body = ByteBuffer()
     private var pending: [Request] = []
     private var current: Task<Void, Never>?
+    private var exceededBodyLimit = false
 
     init(server: ProxyServer) { self.server = server }
 
@@ -320,6 +329,14 @@ private final class ProxyConnectionHandler: ChannelInboundHandler, @unchecked Se
         case .head(let head):
             self.head = head
             self.body.clear()
+            self.exceededBodyLimit = false
+            if let server = self.server,
+               let length = head.headers.first(name: "Content-Length").flatMap(Int.init),
+               length > server.maxBodyBytes {
+                exceededBodyLimit = true
+                rejectTooLarge(context: context, server: server)
+                return
+            }
             // Release a waiting client before it sends the body; otherwise the
             // client blocks forever and the request never completes.
             if head.headers.first(name: "Expect")?.lowercased() == "100-continue" {
@@ -329,11 +346,28 @@ private final class ProxyConnectionHandler: ChannelInboundHandler, @unchecked Se
                     promise: nil)
             }
         case .body(var buffer):
+            guard !exceededBodyLimit, let server = self.server else { return }
+            // Chunked bodies have no Content-Length, so cap as bytes accumulate.
+            if body.readableBytes + buffer.readableBytes > server.maxBodyBytes {
+                exceededBodyLimit = true
+                body.clear()
+                rejectTooLarge(context: context, server: server)
+                return
+            }
             self.body.writeBuffer(&buffer)
         case .end:
             guard let head = self.head, let server = self.server else { return }
+            guard !exceededBodyLimit else { return }
             pending.append(Request(head: head, body: Data(body.readableBytesView)))
             pump(channel: context.channel, server: server)
+        }
+    }
+
+    private func rejectTooLarge(context: ChannelHandlerContext, server: ProxyServer) {
+        let channel = context.channel
+        Task {
+            await server.writeError(status: 413, message: "request body too large", channel: channel)
+            try? await channel.close().get()
         }
     }
 
