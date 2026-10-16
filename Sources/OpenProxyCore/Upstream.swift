@@ -118,17 +118,31 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
     private let port: Int
     private let tlsConfiguration: TLSConfiguration
     private let localAddresses: Set<String>
+    private let allowLoopback: Bool
     private let group: EventLoopGroup
 
-    public init(
+    public convenience init(
         resolver: HostResolver,
         host: String = "openrouter.ai",
         port: Int = 443,
         trustRoots: [Certificate]? = nil
     ) {
+        self.init(resolver: resolver, host: host, port: port, trustRoots: trustRoots, allowLoopback: false)
+    }
+
+    /// `allowLoopback` is a test hook: it lets the wire tests point the real client at a
+    /// loopback TLS server. Production callers use the public init, which never allows it.
+    init(
+        resolver: HostResolver,
+        host: String,
+        port: Int,
+        trustRoots: [Certificate]?,
+        allowLoopback: Bool
+    ) {
         self.resolver = resolver
         self.host = host
         self.port = port
+        self.allowLoopback = allowLoopback
         var tls = TLSConfiguration.makeClientConfiguration()
         if let trustRoots {
             // A caller-supplied trust anchor is expected to be a valid certificate; a
@@ -195,7 +209,8 @@ public final class NIOUpstreamClient: UpstreamClient, @unchecked Sendable {
     /// Loopback and the machine's own interface addresses are refused: OpenRouter
     /// can never live there, and dialing one would loop back into this proxy.
     func isForbidden(_ address: String) -> Bool {
-        NIOUpstreamClient.isLoopback(address) || localAddresses.contains(address)
+        if allowLoopback { return false }
+        return NIOUpstreamClient.isLoopback(address) || localAddresses.contains(address)
     }
 
     static func isLoopback(_ address: String) -> Bool {

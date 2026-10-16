@@ -77,7 +77,7 @@ private final class FakeEndpointsFetcher: EndpointsFetcher, @unchecked Sendable 
     var calls: [String] { lock.withLock { _calls } }
 }
 
-private struct StaticResolver: HostResolver {
+struct StaticResolver: HostResolver {
     let addresses: [String]
     func resolve(_ host: String) async throws -> [String] { addresses }
 }
@@ -86,7 +86,7 @@ private struct StaticResolver: HostResolver {
 
 /// Trusts the test CA without hostname pinning (the client dials 127.0.0.1 while
 /// the leaf is issued for openrouter.ai).
-private class TrustDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
+class TrustDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
     let anchors: [SecCertificate]
 
     init(caPEM: String) {
@@ -269,6 +269,21 @@ struct ProxyServerTests {
             #expect(response.status == 200)
             #expect(json(harness.upstream.requests[0].body)["model"] as? String == "openai/gpt-5:nitro")
             #expect(harness.stats.summary(since: .distantPast).total == 1)  // one record per request
+        }
+    }
+
+    @Test func rewrittenBodyReframesContentLengthForRealUpstream() async throws {
+        let settings = Settings(enabled: true, sort: .throughput)
+        try await withWireServer(settings: settings) { wire in
+            let body = Data(#"{"model":"openai/gpt-5"}"#.utf8)
+            let response = try await wire.request("POST", chatPath, body: body)
+            #expect(response.status == 200)
+            let received = try #require(wire.upstream.received.first)
+            let rewritten = received.body
+            #expect(json(rewritten)["model"] as? String == "openai/gpt-5:nitro")
+            #expect(rewritten.count != body.count)  // the rewrite changed the length
+            #expect(received.header("content-length") == String(rewritten.count))
+            #expect(received.header("transfer-encoding") == nil)
         }
     }
 

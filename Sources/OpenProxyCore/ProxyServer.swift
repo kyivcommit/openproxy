@@ -121,9 +121,18 @@ public final class ProxyServer: @unchecked Sendable {
             ? Rewriter.rewrite(path: path, body: body, settings: settings, availability: availability)
             : RewriteResult(body: body, model: model)
 
-        let headers: [(String, String)] = requestHead.headers.map { ($0.name, $0.value) }
         let method = requestHead.method.rawValue
-
+        // Framing is ours: the client's Content-Length describes its body, not the
+        // rewritten one, and we always forward a fixed-length (buffered) body.
+        let declaresBody = requestHead.headers.contains {
+            let name = $0.name.lowercased()
+            return name == "content-length" || name == "transfer-encoding"
+        }
+        let baseHeaders = requestHead.headers.compactMap { header -> (String, String)? in
+            let name = header.name.lowercased()
+            return (name == "content-length" || name == "transfer-encoding")
+                ? nil : (header.name, header.value)
+        }
         let response: UpstreamResponse
         var retries = 0
         var usedFallback = false
@@ -135,7 +144,9 @@ public final class ProxyServer: @unchecked Sendable {
                     flexBody: rewrite.body, plainBody: plain
                 ) { [self] body, timeout in
                     try await sendUpstream(
-                        UpstreamRequest(method: method, path: requestHead.uri, headers: headers, body: body),
+                        Self.upstreamRequest(
+                            method: method, uri: requestHead.uri, baseHeaders: baseHeaders,
+                            declaresBody: declaresBody, body: body),
                         timeout: timeout)
                 }
                 response = outcome.response
@@ -143,7 +154,9 @@ public final class ProxyServer: @unchecked Sendable {
                 usedFallback = outcome.usedFallback
             } else {
                 response = try await upstream.send(
-                    UpstreamRequest(method: method, path: requestHead.uri, headers: headers, body: rewrite.body))
+                    Self.upstreamRequest(
+                        method: method, uri: requestHead.uri, baseHeaders: baseHeaders,
+                        declaresBody: declaresBody, body: rewrite.body))
             }
         } catch {
             await writeError(status: 502, message: "upstream unavailable", channel: channel)
@@ -194,6 +207,17 @@ public final class ProxyServer: @unchecked Sendable {
     }
 
     // MARK: - Response writing
+
+    /// Builds the forward request with our own framing: the buffered body's
+    /// Content-Length, and no client Transfer-Encoding.
+    private static func upstreamRequest(
+        method: String, uri: String, baseHeaders: [(String, String)],
+        declaresBody: Bool, body: Data
+    ) -> UpstreamRequest {
+        var headers = baseHeaders
+        if declaresBody || !body.isEmpty { headers.append(("Content-Length", String(body.count))) }
+        return UpstreamRequest(method: method, path: uri, headers: headers, body: body)
+    }
 
     private func writeResponseHead(_ response: UpstreamResponse, channel: Channel) {
         var headers = HTTPHeaders()
