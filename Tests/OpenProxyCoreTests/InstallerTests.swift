@@ -18,6 +18,34 @@ private enum TestCA {
     }()
 
     static var pemURL: URL { directory.appending(path: "ca.pem") }
+    static var pem: String { (try? String(contentsOf: pemURL, encoding: .utf8)) ?? "" }
+}
+
+/// A decoy certificate whose CN merely contains "OpenProxy Local CA" — the case a substring
+/// `find-certificate -c` match would wrongly sweep. Generated once with openssl; `nil` when
+/// openssl is absent (which also disables the sweep tests).
+private let decoyCAPEM: String? = {
+    guard let openssl = opensslPath else { return nil }
+    let dir = FileManager.default.temporaryDirectory.appending(path: "openproxy-decoy-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let key = dir.appending(path: "ca.key")
+    let out = dir.appending(path: "ca.pem")
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: openssl)
+    process.arguments = ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+                         "-keyout", key.path, "-out", out.path, "-subj", "/CN=OpenProxy Local CA Extra"]
+    process.standardError = FileHandle.nullDevice
+    guard (try? process.run()) != nil else { return nil }
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else { return nil }
+    return try? String(contentsOf: out, encoding: .utf8)
+}()
+
+/// One certificate the fake `security` reports, with the SHA-1 hash it announces for it.
+private struct FakeCert {
+    let hash: String
+    let pem: String
 }
 
 private final class RecordingRunner: PrivilegedRunner, @unchecked Sendable {
@@ -61,6 +89,8 @@ struct InstallerTests {
     ) -> Installer {
         Installer(caPEMURL: TestCA.pemURL, runner: runner, commandRunner: commandRunner, hostsPath: hostsPath)
     }
+
+    private func exactCert(hash: String) -> FakeCert { FakeCert(hash: hash, pem: TestCA.pem) }
 
     private func makeHostsFile(_ content: String) throws -> String {
         let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).hosts")
@@ -209,7 +239,10 @@ struct InstallerTests {
         let script = try #require(runner.scripts.first)
         #expect(script.contains("security find-certificate -a -Z -c 'OpenProxy Local CA'"))
         #expect(script.contains("SHA-1 hash:"))
-        #expect(script.contains("for hash in $hashes"))
+        // Each candidate hash is validated and its subject confirmed exactly before deletion.
+        #expect(script.contains("/^[0-9A-Fa-f]{40}$/"))
+        #expect(script.contains("openssl x509 -in"))
+        #expect(script.contains("while read -r hash"))
         #expect(script.contains("security delete-certificate -Z \"$hash\""))
         #expect(!script.contains("security delete-certificate -c"))
     }
@@ -660,49 +693,92 @@ struct InstallerTests {
 
     // MARK: - Item 6: execute the SHA-1 sweep against a fake `security`
 
-    @Test func sweepDeletesNothingWhenNoCertificatesMatch() throws {
-        let result = try runSweep(hashes: [])
+    private static let exactHash = "0C10AB995387345EDCE2A606EA3C358B9B3DD671"
+    private static let otherHash = "B7A17CC40DA10BD0DD54F8A35B4FF98F5D46DCD7"
+
+    @Test(.enabled(if: opensslPath != nil))
+    func sweepDeletesNothingWhenNoCertificatesMatch() throws {
+        let result = try runSweep(certs: [])
         #expect(result.status == 0)
         #expect(result.deletes.isEmpty)
     }
 
-    @Test func sweepDeletesSingleMatchByHash() throws {
-        let result = try runSweep(hashes: ["AAAA"])
+    @Test(.enabled(if: opensslPath != nil))
+    func sweepDeletesSingleMatchByHash() throws {
+        let result = try runSweep(certs: [self.exactCert(hash: Self.exactHash)])
         #expect(result.status == 0)
         #expect(result.deletes.count == 1)
-        #expect(result.deletes.first?.contains("-Z AAAA") == true)
+        #expect(result.deletes.first?.contains("-Z \(Self.exactHash)") == true)
     }
 
-    @Test func sweepDeletesEachMatchingCertificateByHash() throws {
-        let result = try runSweep(hashes: ["AAAA", "BBBB"])
+    @Test(.enabled(if: opensslPath != nil))
+    func sweepDeletesEachMatchingCertificateByHash() throws {
+        let result = try runSweep(certs: [
+            self.exactCert(hash: Self.exactHash),
+            self.exactCert(hash: Self.otherHash),
+        ])
         #expect(result.status == 0)
         #expect(result.deletes.count == 2)
-        #expect(result.deletes.contains { $0.contains("-Z AAAA") })
-        #expect(result.deletes.contains { $0.contains("-Z BBBB") })
+        #expect(result.deletes.contains { $0.contains("-Z \(Self.exactHash)") })
+        #expect(result.deletes.contains { $0.contains("-Z \(Self.otherHash)") })
     }
 
-    @Test func sweepUsesTrustFlagForLoginKeychainOnly() throws {
-        let login = try runSweep(hashes: ["AAAA"], removeTrustSettings: true)
-        #expect(login.deletes.first?.contains("delete-certificate -t -Z AAAA") == true)
-        let system = try runSweep(hashes: ["AAAA"], removeTrustSettings: false)
-        #expect(system.deletes.first?.contains("delete-certificate -Z AAAA") == true)
+    @Test(.enabled(if: opensslPath != nil))
+    func sweepSkipsCertWithMerelySimilarCommonName() throws {
+        // `find-certificate -c` is a substring match: a decoy "OpenProxy Local CA Extra"
+        // must not be swept, only a certificate whose subject CN is exactly ours.
+        let decoy = try #require(decoyCAPEM)
+        let result = try runSweep(certs: [
+            self.exactCert(hash: Self.exactHash),
+            FakeCert(hash: Self.otherHash, pem: decoy),
+        ])
+        #expect(result.status == 0)
+        #expect(result.deletes.contains { $0.contains("-Z \(Self.exactHash)") })
+        #expect(result.deletes.allSatisfy { !$0.contains(Self.otherHash) })
+    }
+
+    @Test(.enabled(if: opensslPath != nil))
+    func sweepSkipsUnvalidatedHash() throws {
+        // A crafted label line must not inject an arbitrary hash into the loop.
+        let result = try runSweep(certs: [
+            FakeCert(hash: "not-a-40-hex-hash", pem: TestCA.pem),
+            self.exactCert(hash: Self.exactHash),
+        ])
+        #expect(result.deletes.allSatisfy { !$0.contains("not-a-40-hex-hash") })
+        #expect(result.deletes.contains { $0.contains("-Z \(Self.exactHash)") })
+    }
+
+    @Test(.enabled(if: opensslPath != nil))
+    func sweepUsesTrustFlagForLoginKeychainOnly() throws {
+        let cert = self.exactCert(hash: Self.exactHash)
+        let login = try runSweep(certs: [cert], removeTrustSettings: true)
+        #expect(login.deletes.first?.contains("delete-certificate -t -Z \(Self.exactHash)") == true)
+        let system = try runSweep(certs: [cert], removeTrustSettings: false)
+        #expect(system.deletes.first?.contains("delete-certificate -Z \(Self.exactHash)") == true)
         #expect(system.deletes.first?.contains("-t ") == false)
     }
 
-    @Test func sweepKeepsGoingWhenADeleteFails() throws {
+    @Test(.enabled(if: opensslPath != nil))
+    func sweepKeepsGoingWhenADeleteFails() throws {
         // Best-effort: a failing delete must not abort the loop or fail the script.
-        let result = try runSweep(hashes: ["AAAA", "BBBB"], deleteStatus: 1)
+        let result = try runSweep(certs: [
+            self.exactCert(hash: Self.exactHash),
+            self.exactCert(hash: Self.otherHash),
+        ], deleteStatus: 1)
         #expect(result.status == 0)
         #expect(result.deletes.count == 2)
     }
+
 }
 
 /// Executes `Installer.deleteCertificatesScript` under `/bin/sh` with a fake `security`
-/// executable first in `PATH`, so the sweep's real shell behaviour (hash parsing, the
-/// per-hash loop, the trust flag, `|| true`) is exercised, not just the script text.
+/// executable first in `PATH`, so the sweep's real shell behaviour (hash validation, the exact
+/// subject match, the trust flag, `|| true`) is exercised, not just the script text. The fake
+/// reproduces the real `find-certificate -a -Z -c <CN> -p` shape: a hash line immediately
+/// before each certificate's PEM block.
 /// Returns the script's exit status and the arguments of every `delete-certificate` call.
 private func runSweep(
-    hashes: [String],
+    certs: [FakeCert],
     keychain: String = "login.keychain-db",
     removeTrustSettings: Bool = false,
     deleteStatus: Int32 = 0
@@ -713,11 +789,14 @@ private func runSweep(
     defer { try? FileManager.default.removeItem(at: dir) }
 
     let log = dir.appending(path: "deletes.log")
-    let hashLines = hashes.map { "SHA-1 hash: \($0)" }.joined(separator: "\n")
+    // Real `find-certificate -p` output always ends each PEM block with a newline, so the next
+    // `SHA-1 hash:` starts on its own line.
+    let blocks = certs.map { "SHA-1 hash: \($0.hash)\n\($0.pem.hasSuffix("\n") ? $0.pem : $0.pem + "\n")" }
+        .joined(separator: "")
     let fake = """
     #!/bin/sh
     case "$1" in
-      find-certificate) printf '%s\\n' \(shellQuoted(hashLines));;
+      find-certificate) printf '%s\\n' \(shellQuoted(blocks));;
       delete-certificate) printf '%s\\n' "$*" >> \(shellQuoted(log.path)); exit \(deleteStatus);;
     esac
     """

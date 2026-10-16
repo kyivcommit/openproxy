@@ -363,19 +363,39 @@ public final class Installer: @unchecked Sendable {
         return failures.isEmpty ? nil : failures.joined(separator: "; ")
     }
 
-    /// Deletes every certificate with our common name by its SHA-1 hash. `security
-    /// delete-certificate -c <CN>` fails with "ambiguous" when two CAs share the CN — the
-    /// normal reinstall case — so each match returned by `find-certificate` is deleted by hash.
+    /// Deletes every certificate whose subject common name is exactly ours, by its SHA-1 hash.
+    /// `security delete-certificate -c <CN>` fails with "ambiguous" when two CAs share the CN —
+    /// the normal reinstall case — and `find-certificate -c` is only a substring match, so a
+    /// decoy "OpenProxy Local CA Extra" would be swept too. So each candidate hash is validated
+    /// (`^[0-9A-Fa-f]{40}$`) and its subject confirmed exactly with openssl before deletion.
     /// Best-effort (`|| true`): a keychain without our cert must not fail the caller. On the
     /// login keychain `removeTrustSettings` adds `-t` so the per-user trust settings are
     /// removed with the certificate, not orphaned.
     static func deleteCertificatesScript(commonName: String, keychain: String, removeTrustSettings: Bool = false) -> String {
         let trustFlag = removeTrustSettings ? "-t " : ""
         return """
-        hashes=$(security find-certificate -a -Z -c \(quoted(commonName)) \(keychain) 2>/dev/null | awk '/SHA-1 hash:/ { print $NF }')
-        for hash in $hashes; do
+        sweep_dir=$(mktemp -d "${TMPDIR:-/tmp}/openproxy-sweep.XXXXXX")
+        security find-certificate -a -Z -c \(quoted(commonName)) -p \(keychain) 2>/dev/null \
+        | awk -v cn=\(quoted(commonName)) -v dir="$sweep_dir" '
+          /^SHA-1 hash:/ { h = $NF; next }
+          /^-----BEGIN CERTIFICATE-----/ { pem = $0 "\\n"; inblock = 1; next }
+          inblock { pem = pem $0 "\\n" }
+          /^-----END CERTIFICATE-----/ {
+            inblock = 0
+            if (h ~ /^[0-9A-Fa-f]{40}$/) {
+              f = dir "/" h ".pem"
+              printf "%s", pem > f; close(f)
+              cmd = "openssl x509 -in " f " -noout -subject -nameopt RFC2253 2>/dev/null"
+              if ((cmd | getline s) > 0) { sub(/^subject=/, "", s); if (s == "CN=" cn) print h }
+              close(cmd)
+            }
+            pem = ""
+          }
+          ' \
+        | while read -r hash; do
             security delete-certificate \(trustFlag)-Z "$hash" \(keychain) || true
-        done
+          done
+        rm -rf "$sweep_dir"
         """
     }
 
