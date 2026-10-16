@@ -259,6 +259,42 @@ private func openRawTLSChannel(port: Int, group: EventLoopGroup) async throws ->
         .connect(host: "127.0.0.1", port: port).get()
 }
 
+/// Same as `openRawTLSChannel` but appends a monitor that records every byte the
+/// server sends, so a test can read the raw response stream.
+private func openRawTLSChannel(
+    port: Int, group: EventLoopGroup, monitor: Bool
+) async throws -> (Channel, ByteMonitor) {
+    var tls = TLSConfiguration.makeClientConfiguration()
+    tls.certificateVerification = .none
+    let context = try NIOSSLContext(configuration: tls)
+    let monitor = ByteMonitor()
+    let channel = try await ClientBootstrap(group: group)
+        .channelInitializer { channel in
+            do {
+                try channel.pipeline.syncOperations.addHandler(
+                    NIOSSLClientHandler(context: context, serverHostname: "openrouter.ai"))
+                try channel.pipeline.syncOperations.addHandler(monitor)
+                return channel.eventLoop.makeSucceededVoidFuture()
+            } catch {
+                return channel.eventLoop.makeFailedFuture(error)
+            }
+        }
+        .connect(host: "127.0.0.1", port: port).get()
+    return (channel, monitor)
+}
+
+final class ByteMonitor: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    private let lock = NSLock()
+    private var _received = Data()
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        lock.withLock { _received.append(Data(unwrapInboundIn(data).readableBytesView)) }
+    }
+
+    var received: Data { lock.withLock { _received } }
+}
+
 private func writePipelinedRequests(
     _ requests: [(path: String, body: Data)], on channel: Channel
 ) async throws {
@@ -463,6 +499,33 @@ struct ProxyServerTests {
             let upstreamCancelled = await waitUntil(
                 { harness.upstream.cancels.contains { $0.cancelled } }, timeout: 1)
             #expect(upstreamCancelled)
+        }
+    }
+
+    @Test func expect100ContinueIsAnsweredAndStrippedUpstream() async throws {
+        let body = Data(#"{"model":"x"}"#.utf8)
+        try await withServer(replies: [FakeReply(status: 200, body: Data("ok".utf8))]) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let (channel, monitor) = try await openRawTLSChannel(port: harness.port, group: group, monitor: true)
+
+            var head = channel.allocator.buffer(capacity: 256)
+            head.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                    + "Expect: 100-continue\r\nContent-Length: \(body.count)\r\n\r\n")
+            try await channel.writeAndFlush(head).get()
+
+            // The client waits for 100 before sending the body; the proxy must release it.
+            #expect(await waitUntil({ monitor.received.range(of: Data("100 Continue".utf8)) != nil }, timeout: 2))
+            var bodyBuffer = channel.allocator.buffer(capacity: body.count)
+            bodyBuffer.writeBytes(body)
+            try await channel.writeAndFlush(bodyBuffer).get()
+
+            #expect(await waitUntil({ monitor.received.range(of: Data("200 OK".utf8)) != nil }, timeout: 2))
+            let received = try #require(harness.upstream.requests.first)
+            #expect(received.body == body)
+            #expect(!received.headers.contains { $0.0.lowercased() == "expect" })
+            try await channel.close().get()
         }
     }
 

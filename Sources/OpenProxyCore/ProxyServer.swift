@@ -130,7 +130,9 @@ public final class ProxyServer: @unchecked Sendable {
         }
         let baseHeaders = requestHead.headers.compactMap { header -> (String, String)? in
             let name = header.name.lowercased()
-            return (name == "content-length" || name == "transfer-encoding")
+            // `expect` is consumed here (we answered 100 ourselves); forwarding it
+            // would make the upstream wait for a continuation that never comes.
+            return (name == "content-length" || name == "transfer-encoding" || name == "expect")
                 ? nil : (header.name, header.value)
         }
         let response: UpstreamResponse
@@ -306,6 +308,14 @@ private final class ProxyConnectionHandler: ChannelInboundHandler, @unchecked Se
         case .head(let head):
             self.head = head
             self.body.clear()
+            // Release a waiting client before it sends the body; otherwise the
+            // client blocks forever and the request never completes.
+            if head.headers.first(name: "Expect")?.lowercased() == "100-continue" {
+                context.writeAndFlush(
+                    NIOAny(HTTPServerResponsePart.head(
+                        HTTPResponseHead(version: .http1_1, status: .continue))),
+                    promise: nil)
+            }
         case .body(var buffer):
             self.body.writeBuffer(&buffer)
         case .end:
