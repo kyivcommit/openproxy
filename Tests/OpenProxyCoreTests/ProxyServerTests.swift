@@ -242,6 +242,8 @@ private func withServer(
 
 private struct TimeoutError: Error {}
 
+private struct TestFailure: Error {}
+
 private func openRawTLSChannel(port: Int, group: EventLoopGroup) async throws -> Channel {
     var tls = TLSConfiguration.makeClientConfiguration()
     tls.certificateVerification = .none
@@ -287,12 +289,18 @@ final class ByteMonitor: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
     private let lock = NSLock()
     private var _received = Data()
+    private var _closed = false
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         lock.withLock { _received.append(Data(unwrapInboundIn(data).readableBytesView)) }
     }
 
+    func channelInactive(context: ChannelHandlerContext) {
+        lock.withLock { _closed = true }
+    }
+
     var received: Data { lock.withLock { _received } }
+    var closed: Bool { lock.withLock { _closed } }
 }
 
 private func writePipelinedRequests(
@@ -627,6 +635,37 @@ struct ProxyServerTests {
         }
         await upstream.stop()
         try? FileManager.default.removeItem(at: directory)
+    }
+
+    @Test func upstreamBodyErrorClosesDownstream() async throws {
+        let reply = FakeReply(
+            status: 200, headers: [("content-type", "text/event-stream")],
+            stream: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield(Data("partial".utf8))
+                    continuation.finish(throwing: TestFailure())
+                }
+            })
+        try await withServer(replies: [reply]) { harness in
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { group.shutdownGracefully(queue: .global()) { _ in } }
+            let (channel, monitor) = try await openRawTLSChannel(
+                port: harness.port, group: group, monitor: true)
+            let body = Data(#"{"model":"x","stream":true}"#.utf8)
+            var buffer = channel.allocator.buffer(capacity: 256)
+            buffer.writeString(
+                "POST \(chatPath) HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                    + "Content-Length: \(body.count)\r\n\r\n")
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(buffer).get()
+
+            #expect(await waitUntil({ monitor.received.range(of: Data("partial".utf8)) != nil }, timeout: 2))
+            // A failed upstream body must not end with a clean terminator: the
+            // proxy closes the connection so the client sees a truncated response.
+            #expect(await waitUntil({ monitor.closed }, timeout: 2))
+            #expect(monitor.received.range(of: Data("0\r\n\r\n".utf8)) == nil)
+            try? await channel.close().get()
+        }
     }
 
     @Test func nonLoopbackPeerRejected() throws {        let foreign = try SocketAddress(ipAddress: "10.0.0.1", port: 1234)

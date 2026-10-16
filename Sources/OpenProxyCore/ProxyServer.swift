@@ -169,6 +169,7 @@ public final class ProxyServer: @unchecked Sendable {
 
         let ttfbMs = Int(Date().timeIntervalSince(started) * 1000)
         writeResponseHead(response, channel: channel)
+        var finalStatus = response.status
         do {
             try await withTaskCancellationHandler {
                 for try await chunk in response.body {
@@ -181,10 +182,13 @@ public final class ProxyServer: @unchecked Sendable {
             }
             try? await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
         } catch {
-            // The client is gone or the upstream died mid-stream; nothing left to send.
+            // The upstream body failed after the head: no clean terminator is
+            // possible, so close the connection and record the failure.
+            if !(error is CancellationError) && !Task.isCancelled { finalStatus = 502 }
+            channel.close(promise: nil)
         }
         record(started: started, path: path, rewrite: rewrite, settings: settings,
-               status: response.status, retries: retries, usedFallback: usedFallback, ttfbMs: ttfbMs)
+               status: finalStatus, retries: retries, usedFallback: usedFallback, ttfbMs: ttfbMs)
     }
 
     /// Runs one upstream send with a first-byte timeout, surfacing a `FlexTimeout`
