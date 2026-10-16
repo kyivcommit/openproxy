@@ -44,6 +44,7 @@ struct RewriterTests {
         case .throughput: ":nitro"
         case .price: ":floor"
         case .exacto: ":exacto"
+        case .smartPrice: ""
         }
         let expectedModel = "openai/gpt-5" + suffix
         let expectedTier: String? = switch tier {

@@ -14,6 +14,38 @@ struct SettingsTests {
         #expect(settings.flex.attempts == 2)
         #expect(settings.flex.firstByteTimeout == 30)
         #expect(settings.flex.nonStreamingTimeout == 120)
+        #expect(settings.pollMinutes == 10)
+    }
+
+    @Test func smartPriceIsASortMode() {
+        #expect(SortMode.allCases.contains(.smartPrice))
+        #expect(SortMode.smartPrice.rawValue == "smartPrice")
+        #expect(SortMode.smartPrice.displayName == "Smart price")
+    }
+
+    @Test func pollMinutesClamped() {
+        var settings = Settings()
+        settings.pollMinutes = 0
+        #expect(settings.pollMinutes == 1)
+        settings.pollMinutes = 90
+        #expect(settings.pollMinutes == 60)
+        settings.pollMinutes = 15
+        #expect(settings.pollMinutes == 15)
+    }
+
+    @Test func decodedPollMinutesAreClamped() throws {
+        let low = try JSONDecoder().decode(Settings.self, from: Data(#"{"pollMinutes":0}"#.utf8))
+        #expect(low.pollMinutes == 1)
+        let high = try JSONDecoder().decode(Settings.self, from: Data(#"{"pollMinutes":900}"#.utf8))
+        #expect(high.pollMinutes == 60)
+    }
+
+    @Test func decodedSettingsTolerateMissingKeys() throws {
+        // An older settings.json has no pollMinutes (and may predate flex).
+        let settings = try JSONDecoder().decode(Settings.self, from: Data(#"{"sort":"price"}"#.utf8))
+        #expect(settings.pollMinutes == 10)
+        #expect(settings.sort == .price)
+        #expect(settings == Settings(enabled: true, sort: .price, tier: .auto, flex: FlexPolicy(), pollMinutes: 10))
     }
 
     @Test func attemptsClamped() {
@@ -47,6 +79,7 @@ struct SettingsTests {
         settings.sort = .throughput
         settings.tier = .flex
         settings.flex.attempts = 4
+        settings.pollMinutes = 30
         store.settings = settings
         try store.save()
 

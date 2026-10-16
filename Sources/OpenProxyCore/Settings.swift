@@ -1,7 +1,12 @@
 import Foundation
 
 public enum SortMode: String, Codable, CaseIterable, Sendable {
-    case balanced, throughput, price, exacto
+    case balanced, throughput, price, exacto, smartPrice
+
+    /// Picker label; "Smart price" does not fall out of `rawValue.capitalized`.
+    public var displayName: String {
+        self == .smartPrice ? "Smart price" : rawValue.capitalized
+    }
 }
 
 public enum TierMode: String, Codable, CaseIterable, Sendable {
@@ -45,14 +50,37 @@ public struct Settings: Codable, Equatable, Sendable {
     public var sort = SortMode.balanced
     public var tier = TierMode.auto
     public var flex = FlexPolicy()
+    /// Endpoint-catalog TTL in minutes: how often a cached model's endpoint list is refreshed.
+    public var pollMinutes = 10 {
+        didSet { pollMinutes = min(max(pollMinutes, 1), 60) }
+    }
 
     public init() {}
 
-    public init(enabled: Bool = true, sort: SortMode = .balanced, tier: TierMode = .auto, flex: FlexPolicy = FlexPolicy()) {
+    public init(
+        enabled: Bool = true, sort: SortMode = .balanced, tier: TierMode = .auto,
+        flex: FlexPolicy = FlexPolicy(), pollMinutes: Int = 10
+    ) {
         self.enabled = enabled
         self.sort = sort
         self.tier = tier
         self.flex = flex
+        self.pollMinutes = min(max(pollMinutes, 1), 60)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled, sort, tier, flex, pollMinutes
+    }
+
+    /// Custom decoding: `didSet` does not run during `init(from:)`, so clamp
+    /// `pollMinutes` here, and default any missing key (older settings files).
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        self.sort = try container.decodeIfPresent(SortMode.self, forKey: .sort) ?? .balanced
+        self.tier = try container.decodeIfPresent(TierMode.self, forKey: .tier) ?? .auto
+        self.flex = try container.decodeIfPresent(FlexPolicy.self, forKey: .flex) ?? FlexPolicy()
+        self.pollMinutes = min(max(try container.decodeIfPresent(Int.self, forKey: .pollMinutes) ?? 10, 1), 60)
     }
 }
 
