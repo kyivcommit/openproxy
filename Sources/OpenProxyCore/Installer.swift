@@ -418,6 +418,15 @@ public final class Installer: @unchecked Sendable {
         )
     }
 
+    /// Path to the CA certificate PEM, for the copyable Node line.
+    public var caPEMPath: String { caPEMURL.path }
+
+    /// The shell line Node clients need in their profile. The app only copies it; it never
+    /// writes any shell profile.
+    public static func nodeCAExportLine(caPEMPath: String) -> String {
+        "export NODE_EXTRA_CA_CERTS=\"\(caPEMPath)\""
+    }
+
     /// Points new processes at the CA for Node clients. Unprivileged, so toggling it never prompts.
     public func applyNodeCAEnv() async throws {
         let command = Self.nodeCAEnvCommand(caPEMURL: caPEMURL)

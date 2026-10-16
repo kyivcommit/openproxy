@@ -102,7 +102,24 @@ struct MenuView: View {
             statusRow("Hosts entry", model.status.hostsEntry)
             statusRow("Port 443 listening", model.status.portListening)
             statusRow("Node CA env", model.status.nodeCAEnv)
+            nodeCAActions
             Text("Autostart: \(model.loginItemStatus.label)").font(.caption)
+        }
+    }
+
+    /// Finding: the Node row showed a cross with no action. These two buttons are the
+    /// offered fix; the app never edits a shell profile.
+    private var nodeCAActions: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Button("Copy Node CA line") { model.copyNodeCALine() }
+                Button("Set for GUI apps") { Task { await model.setNodeCAEnvForGUIApps() } }
+            }
+            .font(.caption)
+            Text("Terminal sessions need the export line in your shell profile; running clients must be restarted.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

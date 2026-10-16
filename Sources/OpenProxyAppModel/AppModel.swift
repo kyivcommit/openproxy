@@ -37,6 +37,7 @@ public enum WarningKey: Hashable, Sendable {
     case uninstall
     case quit
     case autostart
+    case nodeEnv
 }
 
 public struct Warning: Equatable, Sendable, Identifiable {
@@ -120,6 +121,7 @@ public final class AppModel {
     private let server: ProxyServerControlling
     private let loginItem: LoginItemRegistering
     private let quitDecision: QuitDecision
+    private let pasteboard: PasteboardWriting
 
     public init(
         settingsStore: SettingsStore,
@@ -128,6 +130,7 @@ public final class AppModel {
         server: ProxyServerControlling,
         loginItem: LoginItemRegistering,
         quitDecision: QuitDecision,
+        pasteboard: PasteboardWriting = NSPasteboardWriter(),
         caWasRegenerated: Bool = false,
         refreshInterval: Duration = .seconds(5)
     ) {
@@ -137,6 +140,7 @@ public final class AppModel {
         self.server = server
         self.loginItem = loginItem
         self.quitDecision = quitDecision
+        self.pasteboard = pasteboard
         self.refreshInterval = refreshInterval
         self.currentSettings = settingsStore.settings
         self.status = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
@@ -230,6 +234,23 @@ public final class AppModel {
         if status.caTrusted && status.hostsEntry {
             clearWarnings([.legacyCA])
         }
+    }
+
+    /// Puts the `export NODE_EXTRA_CA_CERTS=…` line on the pasteboard for the user's shell
+    /// profile. The app never edits a profile itself.
+    public func copyNodeCALine() {
+        pasteboard.copy(Installer.nodeCAExportLine(caPEMPath: installer.caPEMPath))
+    }
+
+    /// Sets `NODE_EXTRA_CA_CERTS` for GUI apps launched from now on. Running processes keep
+    /// their old environment, which is why the menu tells the user to restart them.
+    public func setNodeCAEnvForGUIApps() async {
+        do {
+            try await installer.applyNodeCAEnv()
+        } catch {
+            warn(.nodeEnv, "Could not set NODE_EXTRA_CA_CERTS: \(error).")
+        }
+        await refresh()
     }
 
     /// Called by the menu on appear/disappear: refresh once right away, then on

@@ -42,13 +42,26 @@ private final class FakeRunner: PrivilegedRunner, @unchecked Sendable {
 
 /// An unprivileged command runner that records commands and succeeds by default, so the
 /// login-keychain trust phase in `Installer` never touches a real keychain in tests.
+/// `errorOnContains` makes one command fail, for the Node-env error path.
 private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
+    var errorOnContains: String?
     private(set) var commands: [String] = []
 
     func run(_ command: String) async -> CommandResult {
         commands.append(command)
+        if let errorOnContains, command.contains(errorOnContains) {
+            return CommandResult(status: 1, standardError: "denied")
+        }
         return CommandResult(status: 0)
     }
+}
+
+/// Records what would go on the clipboard, so tests never touch the real pasteboard.
+@MainActor
+private final class FakePasteboard: PasteboardWriting {
+    private(set) var copied: [String] = []
+
+    func copy(_ string: String) { copied.append(string) }
 }
 
 private struct PortInUse: Error {}
@@ -93,6 +106,7 @@ private struct Harness {
     let server: FakeServer
     let loginItem: FakeLoginItem
     let quitDecision: FakeQuitDecision
+    let pasteboard: FakePasteboard
 
     init(hostsText: String? = nil) throws {
         let directory = FileManager.default.temporaryDirectory
@@ -117,13 +131,14 @@ private struct Harness {
         self.server = FakeServer()
         self.loginItem = FakeLoginItem()
         self.quitDecision = FakeQuitDecision()
+        self.pasteboard = FakePasteboard()
     }
 
     func model(refreshInterval: Duration = .seconds(5)) -> AppModel {
         AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: loginItem, quitDecision: quitDecision,
-            refreshInterval: refreshInterval)
+            pasteboard: pasteboard, refreshInterval: refreshInterval)
     }
 
     /// Bounded polling helper: returns false after `timeout` so a missing
@@ -542,6 +557,39 @@ struct AppModelTests {
         await model.refresh()
 
         #expect(model.warnings.contains { $0.key == .legacyCA })
+    }
+
+    // MARK: - Item 2: Node CA env actions
+
+    @Test func copyNodeCALinePutsExportOnPasteboard() throws {
+        let h = try Harness()
+        let model = h.model()
+
+        model.copyNodeCALine()
+
+        #expect(h.pasteboard.copied == ["export NODE_EXTRA_CA_CERTS=\"\(h.installer.caPEMPath)\""])
+    }
+
+    @Test func setNodeCAEnvForGUIAppsRunsLaunchctl() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.setNodeCAEnvForGUIApps()
+
+        #expect(h.commandRunner.commands.contains {
+            $0.contains("launchctl setenv NODE_EXTRA_CA_CERTS")
+        })
+        #expect(model.warnings.isEmpty)
+    }
+
+    @Test func setNodeCAEnvFailureBecomesWarning() async throws {
+        let h = try Harness()
+        h.commandRunner.errorOnContains = "launchctl setenv"
+        let model = h.model()
+
+        await model.setNodeCAEnvForGUIApps()
+
+        #expect(model.warnings.contains { $0.key == .nodeEnv })
     }
 
 }
