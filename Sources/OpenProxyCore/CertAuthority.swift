@@ -1,6 +1,7 @@
 import Foundation
 import X509
 import Crypto
+import SwiftASN1
 
 /// A local CA constrained to `openrouter.ai`, plus short-lived leaf certificates for it.
 ///
@@ -15,6 +16,14 @@ public final class CertAuthority: @unchecked Sendable {
     private static let commonName = "OpenProxy Local CA"
     private static let leafValidity: TimeInterval = 90 * 86_400
     private static let renewalWindow: TimeInterval = 30 * 86_400
+    /// Forbid every IP SAN. Without these the `permitted DNS:openrouter.ai` constraint is
+    /// bypassed by a leaf carrying an IP SAN; a stolen `ca.key` could then sign an IP leaf
+    /// that Security.framework and OpenSSL both accept. The mask is the CIDR network mask,
+    /// so an all-zero mask covers the whole address space (`0.0.0.0/0` and `::/0`).
+    private static let excludedIPRanges: [ASN1OctetString] = [
+        ASN1OctetString(contentBytes: [0, 0, 0, 0, 0, 0, 0, 0]),  // 0.0.0.0/0
+        ASN1OctetString(contentBytes: ArraySlice([UInt8](repeating: 0, count: 32))),  // ::/0
+    ]
 
     private let directory: URL
     private let lock = NSLock()
@@ -97,7 +106,9 @@ public final class CertAuthority: @unchecked Sendable {
             extensions: Certificate.Extensions {
                 Critical(BasicConstraints.isCertificateAuthority(maxPathLength: 0))
                 Critical(KeyUsage(keyCertSign: true, cRLSign: true))
-                Critical(NameConstraints(permittedDNSDomains: [hostname]))
+                Critical(NameConstraints(
+                    permittedDNSDomains: [hostname],
+                    excludedIPRanges: excludedIPRanges))
             },
             issuerPrivateKey: privateKey
         )
