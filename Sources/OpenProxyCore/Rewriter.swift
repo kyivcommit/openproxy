@@ -89,7 +89,8 @@ public enum Rewriter {
                 var provider = object["provider"] as? [String: Any] ?? [:]
                 provider["order"] = order
                 provider["quantizations"] = smartPrice?.quantizations ?? []
-                provider["allow_fallbacks"] = true
+                // A client that explicitly set allow_fallbacks (even false) keeps its choice.
+                if provider["allow_fallbacks"] == nil { provider["allow_fallbacks"] = true }
                 object["provider"] = provider
                 applied.append("provider")
                 endpointTag = order.first

@@ -307,6 +307,18 @@ struct RewriterTests {
         #expect(provider?["order"] != nil)
     }
 
+    @Test func smartPriceKeepsClientAllowFallbacksFalse() {
+        let input = payload(extra: ["provider": ["allow_fallbacks": false]])
+        let result = Rewriter.rewrite(
+            path: chatPath, body: input,
+            settings: Settings(sort: .smartPrice, tier: .auto), availability: nil,
+            smartPrice: smartInjection)
+
+        let provider = decode(result.body)["provider"] as? [String: Any]
+        #expect(provider?["allow_fallbacks"] as? Bool == false)
+        #expect(provider?["order"] != nil)
+    }
+
     @Test(arguments: ["order", "sort", "only", "quantizations"])
     func smartPriceDefersToClientRoutingKeys(key: String) {
         let value: Any = (key == "sort") ? "price" : ["provider-a"]
