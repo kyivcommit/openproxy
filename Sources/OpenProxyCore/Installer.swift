@@ -52,15 +52,49 @@ public struct ShellCommandRunner: CommandRunning {
         } catch {
             return CommandResult(status: -1, standardError: String(describing: error))
         }
-        // Read both pipes before waiting so a full pipe buffer can never deadlock the child.
-        let outData = out.fileHandleForReading.readDataToEndOfFile()
-        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        // Drain stdout and stderr concurrently: reading stdout to EOF first deadlocks when
+        // the child fills the 64 KiB stderr pipe buffer and blocks before writing stdout.
+        // The blocking reads run on GCD threads, not the cooperative pool, so waiting on the
+        // child cannot starve other concurrently running async work.
+        let (outData, errData) = await withCheckedContinuation {
+            (continuation: CheckedContinuation<(Data, Data), Never>) in
+            let collector = PipeCollector()
+            let group = DispatchGroup()
+            let outHandle = out.fileHandleForReading
+            let errHandle = err.fileHandleForReading
+            group.enter()
+            DispatchQueue.global().async {
+                collector.setStdout(outHandle.readDataToEndOfFile())
+                group.leave()
+            }
+            group.enter()
+            DispatchQueue.global().async {
+                collector.setStderr(errHandle.readDataToEndOfFile())
+                group.leave()
+            }
+            group.notify(queue: .global()) {
+                continuation.resume(returning: (collector.stdout, collector.stderr))
+            }
+        }
         process.waitUntilExit()
         return CommandResult(
             status: process.terminationStatus,
             standardOutput: String(decoding: outData, as: UTF8.self),
             standardError: String(decoding: errData, as: UTF8.self))
     }
+}
+
+/// Holds the stdout/stderr bytes `ShellCommandRunner` drains on two background reads.
+private final class PipeCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var outData = Data()
+    private var errData = Data()
+
+    func setStdout(_ data: Data) { lock.withLock { outData = data } }
+    func setStderr(_ data: Data) { lock.withLock { errData = data } }
+
+    var stdout: Data { lock.withLock { outData } }
+    var stderr: Data { lock.withLock { errData } }
 }
 
 /// The production privileged runner: `osascript -e 'do shell script … with administrator privileges'`

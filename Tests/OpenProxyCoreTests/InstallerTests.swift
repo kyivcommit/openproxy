@@ -425,6 +425,25 @@ struct InstallerTests {
         #expect(String(describing: InstallError.runnerFailed("boom")) == "boom")
     }
 
+    // MARK: - Item 4: drain stdout and stderr concurrently
+
+    @Test func shellCommandRunnerDrainsBothPipesWithoutDeadlock() async {
+        // A child that fills the stderr pipe buffer (>64 KiB) before writing stdout
+        // deadlocks a runner that reads stdout to EOF before stderr.
+        let result = await ShellCommandRunner().run(
+            "yes err | head -c 100000 >&2; yes out | head -c 100000")
+        #expect(result.status == 0)
+        #expect(result.standardError.count == 100000)
+        #expect(result.standardOutput.count == 100000)
+    }
+
+    @Test func shellCommandRunnerCapturesSmallOutputAndStatus() async {
+        let result = await ShellCommandRunner().run("printf 'hello'; printf 'oops' >&2; exit 3")
+        #expect(result.status == 3)
+        #expect(result.standardOutput == "hello")
+        #expect(result.standardError == "oops")
+    }
+
     // MARK: - Hosts edit: stop at the first error, never mask it with flushcache
 
     @Test func installScriptStopsAtFirstErrorAndOrdersSteps() async throws {
