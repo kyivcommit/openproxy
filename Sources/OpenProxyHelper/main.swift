@@ -11,34 +11,32 @@ private let helperLog = Logger(subsystem: "dev.openproxy.helper", category: "hel
 @main
 enum OpenProxyHelper {
     static func main() {
-        let delegate = HelperDelegate()
-        let listener = NSXPCListener(machServiceName: HelperConstants.machServiceName)
-        // Gate connections by the app that actually shipped this helper: pin the Team ID too
-        // when the build is signed, so a local process cannot re-sign itself with our identifier.
-        let signing = Bundle.main.executableURL.map(HelperRequirement.appSigningInfo)
-            ?? (identifier: nil, teamIdentifier: nil)
+        // Gate connections by the app that actually shipped this helper. Fail closed: a
+        // requirement built without a readable signature, or without the Team ID of a
+        // non-ad-hoc signature, would accept a process that only copied our identifier.
+        let signing = Bundle.main.executableURL.map(HelperRequirement.appSigningInfo) ?? .unreadable
         helperLog.log("app identifier: \(signing.identifier ?? "<none>", privacy: .public)")
         helperLog.log("team identifier: \(signing.teamIdentifier ?? "<none>", privacy: .public)")
         let requirement: String
-        switch (signing.identifier, signing.teamIdentifier) {
-        case let (identifier?, team?):
-            do {
-                requirement = try HelperConstants.requirement(
-                    forAppIdentifier: identifier, teamIdentifier: team)
+        switch HelperRequirement.decision(
+            identifier: signing.identifier,
+            teamIdentifier: signing.teamIdentifier,
+            isAdhoc: signing.isAdhoc,
+            readFailed: signing.readFailed
+        ) {
+        case .requirement(let built):
+            requirement = built
+            if signing.isAdhoc {
+                helperLog.log("helper requirement mode: ad-hoc, identifier-only")
+            } else {
                 helperLog.log("helper requirement mode: signed, Team ID pinned")
-            } catch {
-                helperLog.error("invalid Team ID \(team, privacy: .public): \(String(describing: error), privacy: .public); falling back to identifier-only")
-                requirement = (try? HelperConstants.requirement(forAppIdentifier: identifier))
-                    ?? HelperConstants.connectionRequirement
             }
-        case let (identifier?, nil):
-            requirement = (try? HelperConstants.requirement(forAppIdentifier: identifier))
-                ?? HelperConstants.connectionRequirement
-            helperLog.log("helper requirement mode: ad-hoc, identifier-only")
-        case (nil, _):
-            requirement = HelperConstants.connectionRequirement
-            helperLog.log("helper requirement mode: fallback constant (no parent app identifier)")
+        case .refusal(let reason):
+            helperLog.error("refusing to listen: \(reason, privacy: .public)")
+            exit(1)
         }
+        let delegate = HelperDelegate()
+        let listener = NSXPCListener(machServiceName: HelperConstants.machServiceName)
         listener.setConnectionCodeSigningRequirement(requirement)
         listener.delegate = delegate
         listener.resume()
