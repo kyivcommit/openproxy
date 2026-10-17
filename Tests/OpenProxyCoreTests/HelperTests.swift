@@ -22,6 +22,26 @@ struct HelperRegistrationTests {
         #expect(try HelperConstants.requirement(forAppIdentifier: "dev.openproxy.app") == "identifier \"dev.openproxy.app\"")
     }
 
+    @Test func requirementPinsTheTeamIdentifierForSignedBuilds() throws {
+        #expect(try HelperConstants.requirement(
+            forAppIdentifier: "dev.openproxy.app", teamIdentifier: "ABCDE12345")
+            == "identifier \"dev.openproxy.app\" and anchor apple generic and certificate leaf[subject.OU] = \"ABCDE12345\"")
+    }
+
+    @Test func requirementRejectsAnInvalidTeamIdentifier() {
+        for bad in ["", "short", "ABCDE1234", "ABCDE123456", "ABCDE-2345", "ABCDE1234;", "ABCDE 2345"] {
+            #expect(throws: HelperConstants.RequirementError.invalidTeamIdentifier) {
+                try HelperConstants.requirement(forAppIdentifier: "dev.openproxy.app", teamIdentifier: bad)
+            }
+        }
+    }
+
+    @Test func requirementWithoutATeamIdentifierStaysIdentifierOnly() throws {
+        #expect(try HelperConstants.requirement(
+            forAppIdentifier: "dev.openproxy.app", teamIdentifier: nil)
+            == "identifier \"dev.openproxy.app\"")
+    }
+
     @Test func requirementEscapesQuotesAndBackslashes() throws {
         #expect(try HelperConstants.requirement(forAppIdentifier: "a\"b\\c") == "identifier \"a\\\"b\\\\c\"")
     }

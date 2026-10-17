@@ -16,17 +16,39 @@ public enum HelperConstants {
 
     public enum RequirementError: Error, Equatable, Sendable {
         case emptyIdentifier
+        case invalidTeamIdentifier
     }
 
-    /// Builds the code-signing requirement that pins one bundle identifier, e.g.
-    /// `identifier "dev.openproxy.app"`. Quotes and backslashes are escaped so a
-    /// crafted identifier cannot break out of the string literal; an empty id is rejected.
-    public static func requirement(forAppIdentifier identifier: String) throws -> String {
+    /// Builds the code-signing requirement for the helper's only client. Ad-hoc builds pin the
+    /// bundle identifier alone; a signed build also pins the Team ID, so a local process cannot
+    /// sign itself with our identifier and talk to the daemon. Quotes and backslashes are
+    /// escaped so a crafted value cannot break out of the string literal.
+    public static func requirement(
+        forAppIdentifier identifier: String,
+        teamIdentifier: String? = nil
+    ) throws -> String {
         guard !identifier.isEmpty else { throw RequirementError.emptyIdentifier }
-        let escaped = identifier
+        let escapedIdentifier = escaped(identifier)
+        guard let teamIdentifier else {
+            return "identifier \"\(escapedIdentifier)\""
+        }
+        guard isPlausibleTeamIdentifier(teamIdentifier) else {
+            throw RequirementError.invalidTeamIdentifier
+        }
+        return "identifier \"\(escapedIdentifier)\" and anchor apple generic "
+            + "and certificate leaf[subject.OU] = \"\(escaped(teamIdentifier))\""
+    }
+
+    /// Apple Team IDs are 10 alphanumerics; anything else is rejected so a crafted value cannot
+    /// widen the requirement.
+    static func isPlausibleTeamIdentifier(_ value: String) -> Bool {
+        value.count == 10 && value.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) }
+    }
+
+    private static func escaped(_ value: String) -> String {
+        value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
-        return "identifier \"\(escaped)\""
     }
 }
 

@@ -47,7 +47,7 @@ Later launches add the hosts line back silently. **Quit** removes it again witho
 
 If macOS cannot show the trust dialog, trust the CA manually in Keychain Access: **login** keychain → `OpenProxy Local CA` → *Get Info* → *Always Trust*. The certificate lives in the login keychain; the private key stays in `~/Library/Application Support/openproxy/ca.key` (mode 600).
 
-Notes for ad-hoc builds: macOS ties the helper approval to its code signature, so after **rebuilding** the app the helper may stop answering ("The OpenProxy helper is not responding"). Switch OpenProxy off and on again in Login Items (with Touch ID) to refresh it. A signed release build does not have this churn.
+Notes for ad-hoc builds: macOS ties the helper approval to its code signature, so after **rebuilding** the app the helper may stop answering ("The OpenProxy helper is not responding"). Switch OpenProxy off and on again in Login Items (with Touch ID) to refresh it. A signed release build does not have this churn, and it also pins the Team ID in the helper's code-signing requirement (ad-hoc builds can only pin the bundle identifier).
 
 ### Client trust
 
@@ -126,7 +126,7 @@ CI (`.github/workflows/ci.yml`) builds, tests and packages on macOS.
 - Trust is **per-user**: the CA is trusted and stored only in your login keychain, not system-wide, and the private key is a file (`ca.key`, mode 600) under `~/Library/Application Support/openproxy/`. The CA is name-constrained to `openrouter.ai`, but anyone who can read the key could impersonate that one host to this Mac. Treat the directory as sensitive.
 - `Authorization` headers are forwarded to OpenRouter only and never logged or stored.
 - While the hosts entry is present and the app is not running (for example after a crash; autostart restarts it), `openrouter.ai` is unreachable from this Mac.
-- The root helper accepts connections only from a process signed with the OpenProxy app's own signing identifier and can only add or remove the one managed hosts line. With ad-hoc signing that identifier is not a strong secret: any local process can sign itself with it, so the worst case is toggling that single hosts line.
+- The root helper accepts connections only from a process signed with the OpenProxy app's own signing identifier (and, for a signed release build, the same Team ID) and can only add or remove the one managed hosts line. With ad-hoc signing that identifier is not a strong secret: any local process can sign itself with it, so the worst case is toggling that single hosts line.
 
 ## License
 

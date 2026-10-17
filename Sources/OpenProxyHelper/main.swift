@@ -13,11 +13,32 @@ enum OpenProxyHelper {
     static func main() {
         let delegate = HelperDelegate()
         let listener = NSXPCListener(machServiceName: HelperConstants.machServiceName)
-        // Gate connections by the app that actually shipped this helper, not a hard-coded id.
-        let identifier = Bundle.main.executableURL.flatMap(HelperRequirement.appIdentifier)
-        helperLog.log("app identifier: \(identifier ?? "<none>", privacy: .public)")
-        let requirement = identifier.flatMap { try? HelperConstants.requirement(forAppIdentifier: $0) }
-            ?? HelperConstants.connectionRequirement
+        // Gate connections by the app that actually shipped this helper: pin the Team ID too
+        // when the build is signed, so a local process cannot re-sign itself with our identifier.
+        let signing = Bundle.main.executableURL.map(HelperRequirement.appSigningInfo)
+            ?? (identifier: nil, teamIdentifier: nil)
+        helperLog.log("app identifier: \(signing.identifier ?? "<none>", privacy: .public)")
+        helperLog.log("team identifier: \(signing.teamIdentifier ?? "<none>", privacy: .public)")
+        let requirement: String
+        switch (signing.identifier, signing.teamIdentifier) {
+        case let (identifier?, team?):
+            do {
+                requirement = try HelperConstants.requirement(
+                    forAppIdentifier: identifier, teamIdentifier: team)
+                helperLog.log("helper requirement mode: signed, Team ID pinned")
+            } catch {
+                helperLog.error("invalid Team ID \(team, privacy: .public): \(String(describing: error), privacy: .public); falling back to identifier-only")
+                requirement = (try? HelperConstants.requirement(forAppIdentifier: identifier))
+                    ?? HelperConstants.connectionRequirement
+            }
+        case let (identifier?, nil):
+            requirement = (try? HelperConstants.requirement(forAppIdentifier: identifier))
+                ?? HelperConstants.connectionRequirement
+            helperLog.log("helper requirement mode: ad-hoc, identifier-only")
+        case (nil, _):
+            requirement = HelperConstants.connectionRequirement
+            helperLog.log("helper requirement mode: fallback constant (no parent app identifier)")
+        }
         listener.setConnectionCodeSigningRequirement(requirement)
         listener.delegate = delegate
         listener.resume()
