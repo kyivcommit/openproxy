@@ -141,6 +141,12 @@ public final class ProxyServer: @unchecked Sendable {
         let path = requestHead.uri.split(separator: "?", maxSplits: 1).first.map(String.init) ?? requestHead.uri
         let authorization = requestHead.headers.first(name: "Authorization")
         let model = Rewriter.model(in: body)
+        // An alias id names no model until a response reveals one: resolve it once here so the
+        // tier lookup and the Smart-price ranking both use the same concrete id.
+        var concrete: String?
+        if let model, model.hasPrefix("~") { concrete = await aliases.resolve(model) }
+        /// The model whose endpoints describe this request; nil only for an unresolved alias.
+        let endpointsModel = model?.hasPrefix("~") == true ? concrete : model
 
         // The policy applies only to POSTs to the rewritable paths; everything else
         // passes through byte-for-byte and never triggers an EndpointCatalog lookup.
@@ -151,9 +157,9 @@ public final class ProxyServer: @unchecked Sendable {
             && Rewriter.rewritablePaths.contains(path)
             && (settings.tier == .priority || settings.tier == .flex)
         var availability: TierAvailability?
-        if needsAvailability, let model {
+        if needsAvailability, let endpointsModel {
             // Missing Authorization makes the catalog return nil without a fetch.
-            availability = await catalog.availability(model: model, authorization: authorization)
+            availability = await catalog.availability(model: endpointsModel, authorization: authorization)
         }
         // Smart price needs the model's endpoints unless the id already pins a variant/preset.
         var smartPrice: SmartPriceInjection?
@@ -161,7 +167,7 @@ public final class ProxyServer: @unchecked Sendable {
            settings.sort == .smartPrice, let model,
            !model.contains(":"), !model.hasPrefix("@preset/") {
             smartPrice = await smartPriceInjection(
-                model: model, authorization: authorization, tier: settings.tier)
+                endpointsModel: endpointsModel, authorization: authorization, tier: settings.tier)
         }
         let rewrite = isRewritable
             ? Rewriter.rewrite(
@@ -256,23 +262,20 @@ public final class ProxyServer: @unchecked Sendable {
     }
 
     /// Ranks the model's endpoints (leader memory included) and, on failure, tells the
-    /// rewriter why so it can fail open and record the reason.
+    /// rewriter why so it can fail open and record the reason. `endpointsModel` is nil only
+    /// when the request used an alias no response has resolved yet.
     private func smartPriceInjection(
-        model: String, authorization: String?, tier: TierMode
+        endpointsModel: String?, authorization: String?, tier: TierMode
     ) async -> SmartPriceInjection {
         // An alias only says which model it points at in its response, so rank the concrete
         // id once known; until then the request goes out unchanged (fail-open).
-        var rankModel = model
-        if model.hasPrefix("~") {
-            guard let concrete = await aliases.resolve(model) else {
-                return SmartPriceInjection(unavailableReason: "alias_unresolved")
-            }
-            rankModel = concrete
+        guard let endpointsModel else {
+            return SmartPriceInjection(unavailableReason: "alias_unresolved")
         }
-        guard let endpoints = await catalog.endpoints(model: rankModel, authorization: authorization) else {
+        guard let endpoints = await catalog.endpoints(model: endpointsModel, authorization: authorization) else {
             return SmartPriceInjection(unavailableReason: "no_endpoint_data")
         }
-        let ranking = await leaders.rank(model: rankModel, endpoints: endpoints, tier: tier)
+        let ranking = await leaders.rank(model: endpointsModel, endpoints: endpoints, tier: tier)
         guard ranking.leader != nil else {
             return SmartPriceInjection(unavailableReason: "no_eligible_endpoint")
         }
