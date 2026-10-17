@@ -374,11 +374,12 @@ public final class AppModel {
             do {
                 try await installer.setHostsEntry(present: false)
                 quitDecision.terminate()
+                return
             } catch {
-                warn(.quit, "Quit was cancelled: the root helper could not restore access to "
-                    + "openrouter.ai: \(error). Fix it, then quit again.")
+                // A failing helper must not trap the user in the app: fall through to the
+                // confirmation popup, which still guards the routed hosts entry.
+                warn(.quit, "The root helper could not restore access to openrouter.ai: \(error).")
             }
-            return
         }
         if status.hostsEntry {
             switch quitDecision.decide() {

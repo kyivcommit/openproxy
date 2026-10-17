@@ -912,17 +912,24 @@ struct AppModelTests {
         #expect(h.runner.scripts.isEmpty)
     }
 
-    @Test func quitWithHelperEnabledStaysRunningWhenTheUnrouteFails() async throws {
+    @Test func quitWithFailingHelperFallsBackToThePopupInsteadOfTrappingTheUser() async throws {
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
         h.helper.status = .enabled
         h.hostsEditor.error = InstallError.runnerFailed("helper unavailable")
+        h.quitDecision.choice = .cancel
         let model = h.model()
         await model.refresh()
 
         await model.quit()
 
+        #expect(h.quitDecision.decideCount == 1)
         #expect(h.quitDecision.terminateCount == 0)
         #expect(model.warnings.contains { $0.key == .quit })
+
+        h.quitDecision.choice = .quitAnyway
+        await model.quit()
+
+        #expect(h.quitDecision.terminateCount == 1)
     }
 
     // MARK: - Automatic setup
