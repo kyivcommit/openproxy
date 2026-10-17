@@ -13,7 +13,9 @@ public enum AppGraph {
     @MainActor
     public static func makeModel(
         baseDirectory: URL = AppGraph.defaultBaseDirectory,
-        quitDecision: QuitDecision
+        quitDecision: QuitDecision,
+        setupDecision: SetupDecision = NoSetupDecision(),
+        uninstallDecision: UninstallDecision = NoUninstallDecision()
     ) throws -> AppModel {
         // On a clean install this directory does not exist yet, and SQLite cannot
         // create stats.sqlite in a missing directory. Create it owner-only first.
@@ -47,6 +49,10 @@ public enum AppGraph {
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: SMAppServiceLoginItem(), quitDecision: quitDecision,
             helper: SMAppServiceDaemon(),
+            setupDecision: setupDecision,
+            uninstallDecision: uninstallDecision,
+            dataRemover: AppSupportDataRemover(directory: baseDirectory),
+            waiting: RealSetupWaiting(),
             caWasRegenerated: ca.didRotateLegacyCA)
     }
 

@@ -26,10 +26,12 @@ private final class FakeServer: ProxyServerControlling, @unchecked Sendable {
 private final class FakeRunner: PrivilegedRunner, @unchecked Sendable {
     var error: Error?
     var hostsPath: String?
+    var onRun: (() -> Void)?
     private(set) var scripts: [String] = []
 
     func run(script: String) async throws {
         scripts.append(script)
+        onRun?()
         if let error { throw error }
         guard let hostsPath else { return }
         let text = (try? String(contentsOfFile: hostsPath, encoding: .utf8)) ?? ""
@@ -47,6 +49,7 @@ private final class FakeRunner: PrivilegedRunner, @unchecked Sendable {
 private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
     var errorOnContains: String?
     var delay: Duration?
+    var onCommand: ((String) -> Void)?
     private let lock = NSLock()
     private var recorded: [String] = []
     private var current = 0
@@ -60,6 +63,7 @@ private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
         defer { lock.withLock { current -= 1 } }
         if let delay { try? await Task.sleep(for: delay) }
         lock.withLock { recorded.append(command) }
+        onCommand?(command)
         if let errorOnContains, command.contains(errorOnContains) {
             return CommandResult(status: 1, standardError: "denied")
         }
@@ -90,11 +94,14 @@ private final class FakeLoginItem: LoginItemRegistering, @unchecked Sendable {
     var status: LoginItemStatus = .enabled
     /// What `register()` reports on the immediate re-read, even when it throws.
     var statusAfterRegister: LoginItemStatus?
+    var onRegister: (() -> Void)?
+    var onUnregister: (() -> Void)?
     private(set) var registerCount = 0
     private(set) var unregisterCount = 0
 
     func register() throws {
         registerCount += 1
+        onRegister?()
         // SMAppService can throw and still change the status (approval pending).
         if let statusAfterRegister { status = statusAfterRegister }
         if let registerError { throw registerError }
@@ -102,6 +109,7 @@ private final class FakeLoginItem: LoginItemRegistering, @unchecked Sendable {
 
     func unregister() throws {
         unregisterCount += 1
+        onUnregister?()
         if let unregisterError { throw unregisterError }
         status = .notRegistered
     }
@@ -112,12 +120,14 @@ private final class FakeHelper: HelperRegistering, @unchecked Sendable {
     var status: HelperStatus = .notFound
     var registerError: Error?
     var statusAfterRegister: HelperStatus?
+    var onRegister: (() -> Void)?
     private(set) var registerCount = 0
     private(set) var unregisterCount = 0
     private(set) var openApprovalCount = 0
 
     func register() throws {
         registerCount += 1
+        onRegister?()
         if let registerError { throw registerError }
         if let statusAfterRegister { status = statusAfterRegister }
     }
@@ -129,6 +139,7 @@ private final class FakeHelper: HelperRegistering, @unchecked Sendable {
 /// Records the hosts edit the installer would route through the helper.
 private final class FakeHostsEditor: HostsEditing, @unchecked Sendable {
     var error: Error?
+    var onRequest: (() -> Void)?
     private let lock = NSLock()
     private var recorded: [Bool] = []
 
@@ -136,6 +147,7 @@ private final class FakeHostsEditor: HostsEditing, @unchecked Sendable {
 
     func setHostsEntry(present: Bool) async throws {
         lock.withLock { recorded.append(present) }
+        onRequest?()
         if let error { throw error }
     }
 }
@@ -145,6 +157,7 @@ private final class FakeHostsEditor: HostsEditing, @unchecked Sendable {
 @MainActor
 private final class FakeQuitDecision: QuitDecision {
     var choice: QuitChoice = .quitAnyway
+    var onTerminate: (() -> Void)?
     private(set) var decideCount = 0
     private(set) var terminateCount = 0
 
@@ -153,7 +166,59 @@ private final class FakeQuitDecision: QuitDecision {
         return choice
     }
 
-    func terminate() { terminateCount += 1 }
+    func terminate() {
+        terminateCount += 1
+        onTerminate?()
+    }
+}
+
+/// Records the order of setup/uninstall steps so the flows can be asserted in sequence.
+private final class OrderLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+
+    func append(_ event: String) { lock.withLock { events.append(event) } }
+
+    /// First occurrence of each distinct event, in order.
+    var sequence: [String] {
+        var seen: [String] = []
+        for event in lock.withLock({ events }) where !seen.contains(event) { seen.append(event) }
+        return seen
+    }
+}
+
+@MainActor
+private final class FakeSetupDecision: SetupDecision {
+    var confirm = false
+    private(set) var count = 0
+    func confirmSetup() -> Bool { count += 1; return confirm }
+}
+
+@MainActor
+private final class FakeUninstallDecision: UninstallDecision {
+    var confirm = false
+    private(set) var count = 0
+    func confirmUninstall() -> Bool { count += 1; return confirm }
+}
+
+private final class FakeWaiting: SetupWaiting, @unchecked Sendable {
+    var onPoll: (() -> Void)?
+    private(set) var count = 0
+    func waitForNextApprovalPoll() async {
+        count += 1
+        onPoll?()
+    }
+}
+
+private final class FakeDataRemover: AppDataRemoving, @unchecked Sendable {
+    var error: Error?
+    var onRemove: (() -> Void)?
+    private(set) var count = 0
+    func removeAppData() throws {
+        count += 1
+        onRemove?()
+        if let error { throw error }
+    }
 }
 
 @MainActor
@@ -169,6 +234,11 @@ private struct Harness {
     let helper: FakeHelper
     let hostsEditor: FakeHostsEditor
     let quitDecision: FakeQuitDecision
+    let setupDecision: FakeSetupDecision
+    let uninstallDecision: FakeUninstallDecision
+    let waiting: FakeWaiting
+    let dataRemover: FakeDataRemover
+    let orderLog: OrderLog
 
     init(hostsText: String? = nil) throws {
         let directory = FileManager.default.temporaryDirectory
@@ -197,13 +267,44 @@ private struct Harness {
         self.server = FakeServer()
         self.loginItem = FakeLoginItem()
         self.quitDecision = FakeQuitDecision()
+        self.setupDecision = FakeSetupDecision()
+        self.uninstallDecision = FakeUninstallDecision()
+        self.waiting = FakeWaiting()
+        self.dataRemover = FakeDataRemover()
+
+        // Wire the step-order log; each fake appends its own step name as it runs.
+        let orderLog = OrderLog()
+        self.orderLog = orderLog
+        let runner = self.runner
+        runner.onRun = { [orderLog] in
+            let isCA = runner.scripts.last?.contains("delete-certificate") == true
+            orderLog.append(isCA ? "ca" : "hosts")
+        }
+        self.commandRunner.onCommand = { [orderLog] command in
+            if command.contains("verify-cert") || command.contains("add-trusted-cert") {
+                orderLog.append("trust")
+            }
+            if command.contains("setenv") { orderLog.append("nodeenv") }
+        }
+        self.loginItem.onRegister = { [orderLog] in orderLog.append("autostart") }
+        self.loginItem.onUnregister = { [orderLog] in orderLog.append("autostart") }
+        self.helper.onRegister = { [orderLog] in orderLog.append("helper") }
+        self.hostsEditor.onRequest = { [orderLog] in orderLog.append("hosts") }
+        self.quitDecision.onTerminate = { [orderLog] in orderLog.append("quit") }
+        self.dataRemover.onRemove = { [orderLog] in orderLog.append("data") }
     }
 
-    func model(refreshInterval: Duration = .seconds(5)) -> AppModel {
+    func model(maxApprovalPolls: Int = 1, refreshInterval: Duration = .seconds(5)) -> AppModel {
         AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: loginItem, quitDecision: quitDecision,
-            helper: helper, refreshInterval: refreshInterval)
+            helper: helper,
+            setupDecision: setupDecision,
+            uninstallDecision: uninstallDecision,
+            dataRemover: dataRemover,
+            waiting: waiting,
+            maxApprovalPolls: maxApprovalPolls,
+            refreshInterval: refreshInterval)
     }
 
     /// Bounded polling helper: returns false after `timeout` so a missing
@@ -480,10 +581,11 @@ struct AppModelTests {
     }
 
     @Test func installApprovalWarningRendersWithExactlyOnePeriod() async throws {
-        // The approval text ends with a period and the Install wrapper adds one; the rendered
+        // The thrown text ends with a period and the Install wrapper adds one; the rendered
         // warning must not read "press Install again.. The system was not fully changed."
         let h = try Harness()
-        h.helper.status = .requiresApproval
+        h.helper.status = .enabled
+        h.hostsEditor.error = HostsEditingError.timedOut
         let model = h.model()
 
         await model.install()
@@ -513,14 +615,17 @@ struct AppModelTests {
         #expect(model.loginItemStatus == .enabled)
     }
 
-    @Test func installFailureDoesNotRegisterAutostart() async throws {
+    @Test func installFailureLeavesSetupIncomplete() async throws {
+        // The hosts step (d) runs after autostart (c), so a hosts failure leaves autostart
+        // registered but the setup incomplete: the next launch asks again.
         let h = try Harness()
         h.runner.error = InstallError.runnerFailed("boom")
         let model = h.model()
 
         await model.install()
 
-        #expect(h.loginItem.registerCount == 0)
+        #expect(!model.settings.setupComplete)
+        #expect(model.warnings.contains { $0.key == .install })
     }
 
     @Test func uninstallUnregistersAutostart() async throws {
@@ -706,7 +811,7 @@ struct AppModelTests {
 
         // No privileged step ran and the hosts file is left routed as it was.
         #expect(h.runner.scripts.isEmpty)
-        #expect(model.warnings.contains { $0.message.contains("Install was skipped") })
+        #expect(model.warnings.contains { $0.message.contains("Setup was skipped") })
     }
 
     @Test func installDoesNotStartAnAlreadyRunningServer() async throws {
@@ -793,7 +898,7 @@ struct AppModelTests {
 
     @Test func quitWithHelperEnabledRemovesHostsSilentlyWithoutAPrompt() async throws {
         // With the approved helper, quitting must not show the destructive-route popup: it
-        // silently restores access and leaves routeOnLaunch armed for the next launch.
+        // silently restores access; the next launch's setupComplete restore puts it back.
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
         h.helper.status = .enabled
         let model = h.model()
@@ -804,7 +909,6 @@ struct AppModelTests {
         #expect(h.hostsEditor.requests == [false])
         #expect(h.quitDecision.decideCount == 0)
         #expect(h.quitDecision.terminateCount == 1)
-        #expect(model.settings.routeOnLaunch == true)
         #expect(h.runner.scripts.isEmpty)
     }
 
@@ -821,35 +925,85 @@ struct AppModelTests {
         #expect(model.warnings.contains { $0.key == .quit })
     }
 
-    @Test func installArmsAndUninstallDisarmsRouteOnLaunch() async throws {
+    // MARK: - Automatic setup
+
+    @Test func installSetsSetupCompleteAndRoutingActive() async throws {
         let h = try Harness()
         let model = h.model()
 
         await model.install()
-        #expect(model.settings.routeOnLaunch)
 
-        await model.uninstall()
-        #expect(!model.settings.routeOnLaunch)
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
     }
 
-    @Test func launchSilentlyAddsTheHostsEntryWhenArmed() async throws {
+    @Test func setupRunsStepsInOrder() async throws {
+        let h = try Harness()
+        // Register enables the helper, so step (b) is exercised and the hosts edit goes via XPC.
+        h.helper.status = .notRegistered
+        h.helper.statusAfterRegister = .enabled
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.orderLog.sequence == ["trust", "helper", "autostart", "hosts", "nodeenv"])
+    }
+
+    @Test func setupSkipsTheTrustDialogWhenTheCAIsAlreadyTrusted() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.install()
+
+        #expect(!h.commandRunner.commands.contains { $0.contains("add-trusted-cert") })
+    }
+
+    @Test func approvalPendingThenEnabledContinuesAutomatically() async throws {
+        let h = try Harness()
+        h.helper.status = .requiresApproval
+        h.waiting.onPoll = { [weak helper = h.helper] in helper?.status = .enabled }
+        let model = h.model(maxApprovalPolls: 3)
+
+        await model.install()
+
+        #expect(h.helper.openApprovalCount == 1)
+        #expect(h.waiting.count >= 1)
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
+        #expect(h.hostsEditor.requests == [true])
+    }
+
+    @Test func approvalTimeoutLeavesSetupIncomplete() async throws {
+        let h = try Harness()
+        h.helper.status = .requiresApproval
+        let model = h.model(maxApprovalPolls: 2)
+
+        await model.install()
+
+        #expect(!model.settings.setupComplete)
+        #expect(model.warnings.contains { $0.message.contains("Login Items") })
+        #expect(h.loginItem.registerCount == 0)
+    }
+
+    @Test func laterLaunchRestoresRoutingWhenSetupComplete() async throws {
         let h = try Harness()
         h.helper.status = .enabled
         let model = h.model()
-        model.settings.routeOnLaunch = true
+        model.settings.setupComplete = true
 
         await model.start()
 
         #expect(h.hostsEditor.requests == [true])
+        #expect(model.routingState == .active)
         #expect(h.runner.scripts.isEmpty)
     }
 
-    @Test func launchDoesNotAddHostsWhenTheProxyCannotListen() async throws {
+    @Test func launchDoesNotRestoreWhenTheProxyCannotListen() async throws {
         let h = try Harness()
         h.helper.status = .enabled
         h.server.startError = PortInUse()
         let model = h.model()
-        model.settings.routeOnLaunch = true
+        model.settings.setupComplete = true
 
         await model.start()
 
@@ -857,11 +1011,11 @@ struct AppModelTests {
         #expect(h.hostsEditor.requests.isEmpty)
     }
 
-    @Test func launchDoesNotAddHostsWithoutAHelper() async throws {
+    @Test func launchDoesNotRestoreWithoutAHelper() async throws {
         let h = try Harness()
         h.helper.status = .notFound
         let model = h.model()
-        model.settings.routeOnLaunch = true
+        model.settings.setupComplete = true
 
         await model.start()
 
@@ -869,7 +1023,7 @@ struct AppModelTests {
         #expect(h.runner.scripts.isEmpty)
     }
 
-    @Test func launchDoesNotAddHostsWhenNotArmed() async throws {
+    @Test func launchDoesNotRestoreBeforeSetupComplete() async throws {
         let h = try Harness()
         h.helper.status = .enabled
         let model = h.model()
@@ -877,6 +1031,92 @@ struct AppModelTests {
         await model.start()
 
         #expect(h.hostsEditor.requests.isEmpty)
+    }
+
+    // MARK: - Welcome alert
+
+    @Test func firstLaunchAsksWelcomeAndSetupCompletes() async throws {
+        let h = try Harness()
+        h.setupDecision.confirm = true
+        let model = h.model()
+
+        await model.start()
+
+        #expect(h.setupDecision.count == 1)
+        #expect(model.settings.setupComplete)
+    }
+
+    @Test func notNowChangesNothingAndAsksAgainNextLaunch() async throws {
+        let h = try Harness()
+        h.setupDecision.confirm = false
+        let first = h.model()
+        await first.start()
+        #expect(first.settings.setupComplete == false)
+        #expect(h.loginItem.registerCount == 0)
+        #expect(h.hostsEditor.requests.isEmpty)
+
+        h.setupDecision.confirm = true
+        let second = h.model()
+        await second.start()
+
+        #expect(h.setupDecision.count == 2)
+        #expect(second.settings.setupComplete)
+    }
+
+    // MARK: - Uninstall OpenProxy
+
+    @Test func uninstallCancelDoesNothing() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.uninstallDecision.confirm = false
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.uninstallDecision.count == 1)
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(h.quitDecision.terminateCount == 0)
+    }
+
+    @Test func uninstallRunsTheFullTeardownInOrderAndTerminates() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.uninstallDecision.confirm = true
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.orderLog.sequence == ["hosts", "autostart", "ca", "data", "quit"])
+        #expect(h.dataRemover.count == 1)
+        #expect(h.quitDecision.terminateCount == 1)
+        #expect(h.helper.unregisterCount == 1)
+    }
+
+    @Test func uninstallAttemptsHostsFirstEvenWhenALaterStepFails() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.uninstallDecision.confirm = true
+        // The CA teardown's osascript fails.
+        h.runner.error = InstallError.runnerFailed("boom")
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.hostsEditor.requests == [false])
+        #expect(model.warnings.contains { $0.key == .uninstall })
+        #expect(h.quitDecision.terminateCount == 1)
+    }
+
+    @Test func uninstallDataFailureIsAWarningButStillQuits() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.uninstallDecision.confirm = true
+        h.dataRemover.error = InstallError.runnerFailed("locked")
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(model.warnings.contains { $0.message.contains("OpenProxy data") })
+        #expect(h.quitDecision.terminateCount == 1)
     }
 
     @Test func removeCAUnregistersTheHelperAndClearsWarningsOnSuccess() async throws {
@@ -887,7 +1127,6 @@ struct AppModelTests {
         await model.removeCA()
 
         #expect(h.helper.unregisterCount == 1)
-        #expect(!model.settings.routeOnLaunch)
         #expect(model.warnings.isEmpty)
     }
 

@@ -22,7 +22,10 @@ struct OpenProxyApp: App {
             exit(0)
         }
         do {
-            let built = try AppGraph.makeModel(quitDecision: AlertQuitDecision())
+            let built = try AppGraph.makeModel(
+                quitDecision: AlertQuitDecision(),
+                setupDecision: AlertSetupDecision(),
+                uninstallDecision: AlertUninstallDecision())
             _model = State(initialValue: built)
             // Never registers autostart, installs or touches hosts on launch; only the user's
             // Install button does, so OpenProxy only appears in Login Items while installed.

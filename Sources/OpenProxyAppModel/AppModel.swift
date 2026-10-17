@@ -57,7 +57,7 @@ extension InstallStatus {
     public var unreachableWarning: String? {
         guard hostsEntry, !portListening else { return nil }
         return "openrouter.ai is routed to 127.0.0.1 but the proxy is not listening, "
-            + "so all clients are blocked. Press Uninstall to restore access."
+            + "so all clients are blocked."
     }
 
     /// Spec 9: with the hosts entry installed but the CA absent or untrusted, every
@@ -65,7 +65,7 @@ extension InstallStatus {
     public var untrustedCAWarning: String? {
         guard hostsEntry, !caTrusted else { return nil }
         return "openrouter.ai is routed to 127.0.0.1 but the CA is missing or not trusted, "
-            + "so every client's TLS handshake fails. Press Uninstall to restore access, then Install again."
+            + "so every client's TLS handshake fails."
     }
 
     /// The Node-env row text when `NODE_EXTRA_CA_CERTS` is set but no CA is installed (for
@@ -105,6 +105,9 @@ public final class AppModel {
     public private(set) var loginItemStatus: LoginItemStatus = .notRegistered
     /// The root helper's registration state, refreshed with the rest of the status.
     public private(set) var helperStatus: HelperStatus = .notFound
+    /// The compact "Routing:" line: inactive / setting up... / waiting for approval... / active.
+    public private(set) var routingState: RoutingState = .inactive
+    public var routingLabel: String { routingState.label }
 
     /// Derived from `status`, so it stays visible for as long as the danger lasts
     /// (proxy quit/crashed with the hosts entry still routed) and clears itself.
@@ -136,6 +139,11 @@ public final class AppModel {
     private let loginItem: LoginItemRegistering
     private let helper: HelperRegistering
     private let quitDecision: QuitDecision
+    private let setupDecision: SetupDecision
+    private let uninstallDecision: UninstallDecision
+    private let dataRemover: AppDataRemoving
+    private let waiting: SetupWaiting
+    private let maxApprovalPolls: Int
 
     public init(
         settingsStore: SettingsStore,
@@ -145,6 +153,11 @@ public final class AppModel {
         loginItem: LoginItemRegistering,
         quitDecision: QuitDecision,
         helper: HelperRegistering = NoHelperRegistration(),
+        setupDecision: SetupDecision = NoSetupDecision(),
+        uninstallDecision: UninstallDecision = NoUninstallDecision(),
+        dataRemover: AppDataRemoving = NoAppDataRemoving(),
+        waiting: SetupWaiting = ImmediateSetupWaiting(),
+        maxApprovalPolls: Int = 300,
         caWasRegenerated: Bool = false,
         refreshInterval: Duration = .seconds(5)
     ) {
@@ -155,20 +168,25 @@ public final class AppModel {
         self.loginItem = loginItem
         self.helper = helper
         self.quitDecision = quitDecision
+        self.setupDecision = setupDecision
+        self.uninstallDecision = uninstallDecision
+        self.dataRemover = dataRemover
+        self.waiting = waiting
+        self.maxApprovalPolls = maxApprovalPolls
         self.refreshInterval = refreshInterval
         self.currentSettings = settingsStore.settings
         self.status = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
         self.summary = StatsSummary()
         self.helperStatus = helper.status
         if caWasRegenerated {
-            warn(.legacyCA, "The local CA was regenerated because it predates this version; the trusted copy is stale. Run Uninstall, then Install again.")
+            warn(.legacyCA, "The local CA was regenerated because it predates this version; the trusted copy is stale. Uninstall OpenProxy, then launch again.")
         }
     }
 
     public func start() async {
         guard await startServer(ifFailed: "The hosts entry was left unchanged.") else { return }
         await refresh()
-        await restoreRouteOnLaunch()
+        await setupOrRestoreRouting()
     }
 
     public func stop() async {
@@ -191,40 +209,107 @@ public final class AppModel {
         }
     }
 
+    /// First launch: ask once, then run the automatic setup. Later launches: silently restore
+    /// the route when the setup is already complete.
+    private func setupOrRestoreRouting() async {
+        guard settings.setupComplete else {
+            guard setupDecision.confirmSetup() else { return }
+            await install()
+            return
+        }
+        await restoreRouting()
+    }
+
+    /// The automatic setup, in order: CA trust, helper (waiting for approval instead of
+    /// failing), autostart, the hosts entry, then the Node env. `setupComplete` is set only
+    /// when the critical steps succeed.
     public func install() async {
-        // Spec 9 / finding: installing the hosts entry before the proxy listens
-        // would black-hole openrouter.ai for every client, so start first.
-        guard await startServer(ifFailed: "Install was skipped; the hosts entry was left unchanged.") else {
+        guard await startServer(ifFailed: "Setup was skipped; the hosts entry was left unchanged.") else {
             await refresh()
             return
         }
+        routingState = .settingUp
         do {
-            let warnings = try await installer.install()
-            // Arm the silent launch-time restore; only a real Install does this.
-            settings.routeOnLaunch = true
-            // The stale install/uninstall/start/quit warnings are no longer true.
-            clearWarnings(Self.operationWarningKeys)
-            // Autostart is part of being installed: it stays registered until Uninstall/Remove CA.
-            registerLoginItem()
-            // The CA and hosts are in place; only the Node env step can have warned.
-            if let warning = warnings.first {
-                warn(.nodeEnv, warning)
-            } else {
-                clearWarnings([.nodeEnv])
+            // (a) CA trust: verify first, so an already-trusted CA never shows the dialog.
+            try await installer.trustCA()
+
+            // (b) helper: register once; approval is a wait, not a failure.
+            switch installer.helperReadiness() {
+            case .enabled, .unavailable:
+                break
+            case .requiresApproval:
+                installer.openHelperApprovalSettings()
+                routingState = .waitingForApproval
+                guard await waitForHelperApproval() else {
+                    warn(.install, "Timed out waiting for approval in System Settings -> Login Items.")
+                    routingState = .error("waiting for approval timed out")
+                    await refresh()
+                    return
+                }
             }
+
+            // (c) autostart
+            registerLoginItem()
+
+            // (d) hosts entry (helper when enabled, osascript otherwise)
+            try await installer.setHostsEntry(present: true)
+
+            // (e) Node env, best effort: routing already works without it.
+            do {
+                try await installer.applyNodeCAEnv()
+                clearWarnings([.nodeEnv])
+            } catch {
+                warn(.nodeEnv, "Could not set NODE_EXTRA_CA_CERTS: \(error).")
+            }
+
+            settings.setupComplete = true
+            routingState = .active
+            clearWarnings(Self.operationWarningKeys)
         } catch {
             warn(.install, Self.installFailureMessage(error))
+            routingState = .error(String(describing: error))
         }
         await refresh()
     }
 
+    /// Polls the helper status until it becomes enabled, or gives up after the poll budget.
+    private func waitForHelperApproval() async -> Bool {
+        for _ in 0..<maxApprovalPolls {
+            if helper.status == .enabled {
+                helperStatus = .enabled
+                return true
+            }
+            await waiting.waitForNextApprovalPoll()
+            helperStatus = helper.status
+            if helperStatus == .enabled { return true }
+        }
+        return false
+    }
+
+    /// Every later launch: if the CA is trusted, the helper is enabled and the hosts entry is
+    /// missing, re-add it silently. Never runs when the proxy could not bind.
+    private func restoreRouting() async {
+        guard serverRunning else { return }
+        guard status.caTrusted, helperStatus == .enabled, !status.hostsEntry else {
+            if status.hostsEntry { routingState = .active }
+            return
+        }
+        routingState = .settingUp
+        do {
+            try await installer.setHostsEntry(present: true)
+            routingState = .active
+            await refresh()
+        } catch {
+            warn(.install, "Could not restore the openrouter.ai route: \(error).")
+            routingState = .error(String(describing: error))
+        }
+    }
+
+    /// Restores `/etc/hosts` only (no CA teardown). Kept for the Quit fallback popup.
     public func uninstall() async {
         do {
             try await installer.uninstall()
-            // Uninstall disarms the launch-time restore: nothing should route on next launch.
-            settings.routeOnLaunch = false
             clearWarnings(Self.operationWarningKeys)
-            // The hosts entry is gone, so autostart has nothing to restore: turn it off.
             unregisterLoginItem()
         } catch {
             warn(.uninstall, "Uninstall failed: \(error).")
@@ -232,13 +317,11 @@ public final class AppModel {
         await refresh()
     }
 
-    /// Menu "Remove CA...": the full legacy teardown (admin trust, System keychain sweep,
-    /// user-domain trust) plus the helper unregister. Separate from Uninstall, which now
-    /// only restores `/etc/hosts` and leaves the CA.
+    /// The legacy CA teardown (admin trust, System keychain sweep, user-domain trust, helper
+    /// unregister). Used by the full uninstall flow; kept callable for the popup safety net.
     public func removeCA() async {
         do {
             try await installer.removeCA()
-            settings.routeOnLaunch = false
             clearWarnings(Self.operationWarningKeys)
             unregisterLoginItem()
         } catch {
@@ -247,29 +330,49 @@ public final class AppModel {
         await refresh()
     }
 
-    /// Silently re-adds the hosts route on launch when the previous Install armed it, the CA
-    /// is trusted and the approved helper is enabled. Never runs when the proxy could not bind:
-    /// routing to a dead listener would block every client.
-    private func restoreRouteOnLaunch() async {
-        guard settings.routeOnLaunch, status.caTrusted, helperStatus == .enabled,
-              !status.hostsEntry, serverRunning else { return }
+    /// Menu "Uninstall OpenProxy...": confirm, then the full teardown. Restoring `/etc/hosts`
+    /// is attempted first and is never skipped by a later failure; failures become warnings.
+    public func uninstallOpenProxy() async {
+        guard uninstallDecision.confirmUninstall() else { return }
+        routingState = .settingUp
+
+        // 1. Restore /etc/hosts first — the safety-critical step.
         do {
-            try await installer.setHostsEntry(present: true)
-            await refresh()
+            try await installer.setHostsEntry(present: false)
         } catch {
-            warn(.install, "Could not restore the openrouter.ai route: \(error).")
+            warn(.uninstall, "Could not restore /etc/hosts: \(error).")
         }
+
+        // 2. Autostart off.
+        unregisterLoginItem()
+
+        // 3. CA trust + keychains + helper unregister.
+        do {
+            try await installer.removeCA()
+        } catch {
+            warn(.uninstall, "Removing the CA failed: \(error).")
+        }
+
+        // 4. Wipe the app data (ca.pem, ca.key, settings.json, stats.sqlite).
+        do {
+            try dataRemover.removeAppData()
+        } catch {
+            warn(.uninstall, "Could not remove OpenProxy data: \(error).")
+        }
+
+        // 5. Quit.
+        routingState = .inactive
+        quitDecision.terminate()
     }
 
     /// Spec 9 / finding: quitting with the hosts entry installed leaves
     /// `openrouter.ai` routed to a dead proxy, so confirm before terminating.
     public func quit() async {
-        // With the approved helper, quitting silently restores access to openrouter.ai and
-        // leaves routeOnLaunch armed, so the next launch restores routing — no popup needed.
+        // With the approved helper, quitting silently restores access to openrouter.ai; the
+        // next launch's setupComplete restore puts it back — no popup needed.
         if helperStatus == .enabled {
             do {
                 try await installer.setHostsEntry(present: false)
-                settings.routeOnLaunch = true
                 quitDecision.terminate()
             } catch {
                 warn(.quit, "Quit was cancelled: the root helper could not restore access to "
@@ -333,6 +436,10 @@ public final class AppModel {
             // its hosts entry is in place; until then it stays visible.
             if status.caTrusted && status.hostsEntry {
                 clearWarnings([.legacyCA])
+            }
+            // A later launch that already has the route shows it as active without a restore.
+            if settings.setupComplete, status.hostsEntry, routingState == .inactive {
+                routingState = .active
             }
             waiters.forEach { $0.resume() }
         }

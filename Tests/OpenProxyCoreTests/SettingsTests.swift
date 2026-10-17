@@ -94,24 +94,27 @@ struct SettingsTests {
         #expect(SettingsStore(url: url).settings == Settings())
     }
 
-    @Test func routeOnLaunchDefaultsOffAndRoundTrips() throws {
-        // A fresh install must not silently route on launch; only a successful Install arms it.
-        #expect(Settings().routeOnLaunch == false)
+    @Test func setupCompleteDefaultsOffAndRoundTrips() throws {
+        // A fresh install has not been set up yet; only a successful automatic setup sets it.
+        #expect(Settings().setupComplete == false)
 
         let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: url) }
         let store = SettingsStore(url: url)
         var settings = Settings()
-        settings.routeOnLaunch = true
+        settings.setupComplete = true
         store.settings = settings
         try store.save()
-        #expect(SettingsStore(url: url).settings.routeOnLaunch)
+        #expect(SettingsStore(url: url).settings.setupComplete)
     }
 
-    @Test func decodedRouteOnLaunchToleratesMissingKey() throws {
-        // An older settings.json predates routeOnLaunch; decoding must default it off.
-        let settings = try JSONDecoder().decode(Settings.self, from: Data(#"{"sort":"price"}"#.utf8))
-        #expect(settings.routeOnLaunch == false)
+    @Test func decodedSettingsTolerateMissingSetupCompleteAndOldRouteOnLaunch() throws {
+        // An older settings.json predates setupComplete and may still carry routeOnLaunch;
+        // both must decode without failing, defaulting setupComplete off.
+        let settings = try JSONDecoder().decode(
+            Settings.self, from: Data(#"{"sort":"price","routeOnLaunch":true}"#.utf8))
+        #expect(settings.setupComplete == false)
+        #expect(settings.sort == .price)
     }
 
     @Test func tierAvailabilityFields() {

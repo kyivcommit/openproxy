@@ -54,26 +54,27 @@ public struct Settings: Codable, Equatable, Sendable {
     public var pollMinutes = 10 {
         didSet { pollMinutes = min(max(pollMinutes, 1), 60) }
     }
-    /// Armed by a successful Install, cleared by Uninstall: on launch the app silently
-    /// restores the hosts route (via the enabled helper) so a Quit-and-relaunch keeps working.
-    public var routeOnLaunch = false
+    /// True once the automatic first-launch setup (CA trust, helper, autostart, hosts entry,
+    /// Node env) succeeded. Older files without the key default false; a leftover
+    /// `routeOnLaunch` key from before this change is simply ignored.
+    public var setupComplete = false
 
     public init() {}
 
     public init(
         enabled: Bool = true, sort: SortMode = .balanced, tier: TierMode = .auto,
-        flex: FlexPolicy = FlexPolicy(), pollMinutes: Int = 10, routeOnLaunch: Bool = false
+        flex: FlexPolicy = FlexPolicy(), pollMinutes: Int = 10, setupComplete: Bool = false
     ) {
         self.enabled = enabled
         self.sort = sort
         self.tier = tier
         self.flex = flex
         self.pollMinutes = min(max(pollMinutes, 1), 60)
-        self.routeOnLaunch = routeOnLaunch
+        self.setupComplete = setupComplete
     }
 
     private enum CodingKeys: String, CodingKey {
-        case enabled, sort, tier, flex, pollMinutes, routeOnLaunch
+        case enabled, sort, tier, flex, pollMinutes, setupComplete
     }
 
     /// Custom decoding: `didSet` does not run during `init(from:)`, so clamp
@@ -85,7 +86,7 @@ public struct Settings: Codable, Equatable, Sendable {
         self.tier = try container.decodeIfPresent(TierMode.self, forKey: .tier) ?? .auto
         self.flex = try container.decodeIfPresent(FlexPolicy.self, forKey: .flex) ?? FlexPolicy()
         self.pollMinutes = min(max(try container.decodeIfPresent(Int.self, forKey: .pollMinutes) ?? 10, 1), 60)
-        self.routeOnLaunch = try container.decodeIfPresent(Bool.self, forKey: .routeOnLaunch) ?? false
+        self.setupComplete = try container.decodeIfPresent(Bool.self, forKey: .setupComplete) ?? false
     }
 }
 

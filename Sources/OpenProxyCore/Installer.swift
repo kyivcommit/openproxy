@@ -327,12 +327,30 @@ public final class Installer: @unchecked Sendable {
     /// in the menu instead of failing the install.
     @discardableResult
     public func install() async throws -> [String] {
+        try await trustCA()
+
+        // Phase 2: the hosts entry, through the approved root helper when it is available
+        // (no password), otherwise the legacy osascript script.
+        try await setHostsEntry(present: true)
+
+        // Trust and hosts are in place; finally point new processes at the CA so Node clients
+        // started afterwards trust it. Unprivileged and non-fatal: a failure never rolls back
+        // the working routes above, it only surfaces as a warning.
+        do {
+            try await applyNodeCAEnv()
+            return []
+        } catch {
+            return ["Could not set NODE_EXTRA_CA_CERTS: \(error)."]
+        }
+    }
+
+    /// Phase 1 of install, exposed for the automatic setup flow: trust the CA in the login
+    /// keychain. Verify first, so an already-trusted CA never reopens the Certificate Trust
+    /// Settings dialog; only a failing verify runs `add-trusted-cert`, then verifies again.
+    public func trustCA() async throws {
         let trustedCopy = try privateCopyOfCA()
         defer { try? FileManager.default.removeItem(at: trustedCopy.deletingLastPathComponent()) }
 
-        // Verify first: an already-trusted CA must not reopen the Certificate Trust Settings
-        // dialog, and a successful verify is itself the proof that trust is in place. Only an
-        // untrusted CA runs `add-trusted-cert` (which shows the dialog), then verifies again.
         let alreadyTrusted = await commandRunner.run(
             Self.verifyTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
         if !alreadyTrusted.succeeded {
@@ -348,20 +366,6 @@ public final class Installer: @unchecked Sendable {
                     "The CA was added to the login keychain but could not be verified as trusted: "
                         + verify.failureDetail)
             }
-        }
-
-        // Phase 2: the hosts entry, through the approved root helper when it is available
-        // (no password), otherwise the legacy osascript script.
-        try await setHostsEntry(present: true)
-
-        // Trust and hosts are in place; finally point new processes at the CA so Node clients
-        // started afterwards trust it. Unprivileged and non-fatal: a failure never rolls back
-        // the working routes above, it only surfaces as a warning.
-        do {
-            try await applyNodeCAEnv()
-            return []
-        } catch {
-            return ["Could not set NODE_EXTRA_CA_CERTS: \(error)."]
         }
     }
 
@@ -476,28 +480,51 @@ public final class Installer: @unchecked Sendable {
         case osascript
     }
 
-    private func resolveHostsRoute() throws -> HostsRoute {
-        guard let helper else { return .osascript }
+    /// The helper's readiness without throwing, for the automatic setup flow (which waits for
+    /// approval instead of failing). Registers once and re-reads, mirroring `resolveHostsRoute`.
+    public enum HelperReadiness: Equatable, Sendable {
+        case enabled
+        case requiresApproval
+        /// No real bundle (or registration did not enable it): the osascript fallback applies.
+        case unavailable
+    }
+
+    public func helperReadiness() -> HelperReadiness {
+        guard let helper else { return .unavailable }
         switch helper.status {
         case .enabled:
-            return .helper
+            return .enabled
         case .requiresApproval:
-            helper.openApprovalSettings()
-            throw InstallError.runnerFailed(Self.approvalMessage)
+            return .requiresApproval
         case .notRegistered, .notFound, .unknown:
-            // Register once, then re-read the status whether or not it threw. When approval is
-            // pending SMAppService.register() throws "Operation not permitted" yet leaves
-            // status == .requiresApproval, so a thrown register alone is not "no bundle".
+            // SMAppService can throw and still leave .requiresApproval (approval pending), so
+            // re-read the status whether register() threw or not.
             try? helper.register()
             switch helper.status {
             case .enabled:
-                return .helper
+                return .enabled
             case .requiresApproval:
-                helper.openApprovalSettings()
-                throw InstallError.runnerFailed(Self.approvalMessage)
+                return .requiresApproval
             default:
-                return .osascript
+                return .unavailable
             }
+        }
+    }
+
+    /// Opens System Settings -> Login Items so the user can flip the one-time switch.
+    public func openHelperApprovalSettings() {
+        helper?.openApprovalSettings()
+    }
+
+    private func resolveHostsRoute() throws -> HostsRoute {
+        switch helperReadiness() {
+        case .enabled:
+            return .helper
+        case .requiresApproval:
+            helper?.openApprovalSettings()
+            throw InstallError.runnerFailed(Self.approvalMessage)
+        case .unavailable:
+            return .osascript
         }
     }
 
