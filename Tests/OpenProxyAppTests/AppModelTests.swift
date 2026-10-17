@@ -479,6 +479,20 @@ struct AppModelTests {
         #expect(h.loginItem.registerCount == 1)
     }
 
+    @Test func installApprovalWarningRendersWithExactlyOnePeriod() async throws {
+        // The approval text ends with a period and the Install wrapper adds one; the rendered
+        // warning must not read "press Install again.. The system was not fully changed."
+        let h = try Harness()
+        h.helper.status = .requiresApproval
+        let model = h.model()
+
+        await model.install()
+
+        let warning = try #require(model.warnings.first { $0.key == .install })
+        #expect(!warning.message.contains(".."))
+        #expect(warning.message.contains("press Install again. The system was not fully changed."))
+    }
+
     @Test func launchDoesNotRegisterAutostart() async throws {
         // A plain launch must not put OpenProxy in Login Items before the user installs.
         let h = try Harness()

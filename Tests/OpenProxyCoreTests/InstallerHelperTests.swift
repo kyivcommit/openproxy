@@ -354,6 +354,75 @@ struct InstallerHelperRoutingTests {
         #expect(runner.scripts.isEmpty)
     }
 
+    @Test func enabledHelperTimeoutOpensApprovalSettingsWithActionableText() async throws {
+        // The Remove CA -> Install again case: macOS auto-enabled the daemon without recording
+        // its signature, launchd cannot spawn it, and the XPC call times out. The user must
+        // toggle the Login Items switch, so open settings and say so.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        editor.error = HostsEditingError.timedOut
+        let helper = FakeHelper(status: .enabled)
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.openApprovalCount == 1)
+        #expect(editor.requests == [true])
+        #expect(runner.scripts.isEmpty)
+        let message = try #require(thrown?.description)
+        #expect(message.contains("not responding"))
+        #expect(message.contains("turn OpenProxy off and on again"))
+    }
+
+    @Test func enabledHelperConnectionFailureOpensApprovalSettingsWithActionableText() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        editor.error = HostsEditingError.connectionFailed("XPC connection interrupted")
+        let helper = FakeHelper(status: .enabled)
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.openApprovalCount == 1)
+        #expect(runner.scripts.isEmpty)
+        #expect(try #require(thrown?.description).contains("not responding"))
+    }
+
+    @Test func enabledHelperErrorKeepsItsTextAndDoesNotOpenSettings() async throws {
+        // `.helperFailed` means the helper answered: it is running, so Login Items cannot help.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        editor.error = HostsEditingError.helperFailed("could not write /etc/hosts")
+        let helper = FakeHelper(status: .enabled)
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.openApprovalCount == 0)
+        #expect(runner.scripts.isEmpty)
+        let message = try #require(thrown?.description)
+        #expect(message.contains("could not write /etc/hosts"))
+        #expect(!message.contains("not responding"))
+    }
+
     // MARK: - Uninstall
 
     @Test func uninstallRemovesOnlyHostsThroughTheHelperAndLeavesTheCA() async throws {

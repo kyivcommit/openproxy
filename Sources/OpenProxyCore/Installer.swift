@@ -451,6 +451,18 @@ public final class Installer: @unchecked Sendable {
             }
             do {
                 try await hostsEditor.setHostsEntry(present: present)
+            } catch let error as HostsEditingError {
+                switch error {
+                case .timedOut, .connectionFailed:
+                    // The daemon is enabled but launchd could not spawn it (its signature was
+                    // not recorded when macOS auto-enabled it). Only toggling the Login Items
+                    // switch fixes that, so open settings and say so; never use osascript.
+                    helper?.openApprovalSettings()
+                    throw InstallError.runnerFailed(Self.helperNotRespondingMessage)
+                case .helperFailed:
+                    // The helper answered with an error; it is running, so settings will not help.
+                    throw InstallError.runnerFailed(String(describing: error))
+                }
             } catch {
                 throw InstallError.runnerFailed(String(describing: error))
             }
@@ -493,6 +505,12 @@ public final class Installer: @unchecked Sendable {
     static let approvalMessage =
         "OpenProxy needs one-time approval to change /etc/hosts without a password. "
         + "Open System Settings -> Login Items, turn on OpenProxy, then press Install again."
+
+    /// An enabled helper whose signature was not recorded when macOS auto-enabled it (the
+    /// Remove CA -> Install again case): launchd fails to spawn it, so the XPC call times out
+    /// and only toggling the Login Items switch fixes it. Never falls back to osascript.
+    static let helperNotRespondingMessage =
+        "The OpenProxy helper is not responding. In System Settings -> Login Items turn OpenProxy off and on again, then press Install again."
 
     /// The legacy privileged edit: one `osascript` shell script, `set -e` at the front so the
     /// trailing flush can never mask an earlier hosts failure.

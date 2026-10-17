@@ -213,7 +213,7 @@ public final class AppModel {
                 clearWarnings([.nodeEnv])
             }
         } catch {
-            warn(.install, "Install failed: \(error). The system was not fully changed.")
+            warn(.install, Self.installFailureMessage(error))
         }
         await refresh()
     }
@@ -385,6 +385,14 @@ public final class AppModel {
     /// Shown instead of the raw "Operation not permitted" error while approval is pending.
     private static let autostartApprovalMessage =
         "Autostart needs approval in System Settings -> Login Items"
+
+    /// One sentence, one period: the thrown text may already end with a period (the approval
+    /// and helper-not-responding messages do), and the wrapper used to append a second.
+    static func installFailureMessage(_ error: any Error) -> String {
+        var detail = String(describing: error)
+        while detail.hasSuffix(".") { detail.removeLast() }
+        return "Install failed: \(detail). The system was not fully changed."
+    }
 
     /// Turns autostart off, reporting a failure as a warning. Never throws: the hosts entry
     /// has already been restored, so a failed unregister must not undo that or block the flow.
