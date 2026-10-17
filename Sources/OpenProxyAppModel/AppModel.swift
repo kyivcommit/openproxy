@@ -12,7 +12,10 @@ extension ProxyServer: ProxyServerControlling {}
 
 /// What the user chose when quitting with `openrouter.ai` still routed here.
 public enum QuitChoice: Equatable, Sendable {
-    case uninstallAndQuit
+    /// Restore access: remove the hosts entry and autostart, then quit. The CA, its trust,
+    /// the root helper and the local data stay; the menu's Uninstall OpenProxy... removes
+    /// everything.
+    case restoreAccessAndQuit
     case quitAnyway
     case cancel
 }
@@ -433,7 +436,7 @@ public final class AppModel {
             return
         case .quitAnyway:
             break
-        case .uninstallAndQuit:
+        case .restoreAccessAndQuit:
             await uninstall()
             // Terminate only once the hosts entry is confirmed gone: a cancelled or
             // failed uninstall would otherwise leave openrouter.ai pointing at a dead

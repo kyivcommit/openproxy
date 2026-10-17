@@ -830,13 +830,14 @@ struct AppModelTests {
         let model = h.model()
         await model.refresh()
         #expect(model.status.hostsEntry)
-        h.quitDecision.choice = .uninstallAndQuit
+        h.quitDecision.choice = .restoreAccessAndQuit
 
         await model.quit()
 
         #expect(h.quitDecision.decideCount == 1)
         #expect(h.quitDecision.terminateCount == 1)
-        // Uninstall restored /etc/hosts before quitting; the CA is left for Remove CA....
+        // Restoring access restored /etc/hosts before quitting; the CA is left for Uninstall
+        // OpenProxy... in the menu.
         #expect(h.runner.scripts.count == 1)
         #expect(!model.status.hostsEntry)
     }
@@ -961,14 +962,14 @@ struct AppModelTests {
         #expect(model.warnings.contains { $0.key == .quit && $0.message.contains("could not confirm") })
     }
 
-    @Test func uninstallAndQuitStaysRunningWhenHostsRemovalFails() async throws {
+    @Test func restoreAccessAndQuitStaysRunningWhenHostsRemovalFails() async throws {
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
         let model = h.model()
         await model.refresh()
         #expect(model.status.hostsEntry)
         // The admin prompt for the hosts edit is dismissed: hosts is never restored.
         h.runner.error = InstallError.runnerFailed("the administrator prompt was dismissed")
-        h.quitDecision.choice = .uninstallAndQuit
+        h.quitDecision.choice = .restoreAccessAndQuit
 
         await model.quit()
 

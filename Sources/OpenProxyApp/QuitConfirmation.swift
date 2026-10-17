@@ -8,13 +8,14 @@ struct AlertQuitDecision: QuitDecision {
     func decide() -> QuitChoice {
         let alert = NSAlert()
         alert.messageText = "openrouter.ai is still routed to this proxy"
-        alert.informativeText = "Quitting without uninstalling leaves openrouter.ai pointed at "
-            + "127.0.0.1, so every client loses access until the proxy runs again."
-        alert.addButton(withTitle: "Uninstall and quit")
+        alert.informativeText = "Restoring access removes the openrouter.ai hosts entry and turns "
+            + "autostart off; the certificate and the root helper stay, so setup is not repeated. "
+            + "To remove those as well, use Uninstall OpenProxy... in the menu."
+        alert.addButton(withTitle: "Restore access and quit")
         alert.addButton(withTitle: "Quit anyway")
         alert.addButton(withTitle: "Cancel")
         switch alert.runModal() {
-        case .alertFirstButtonReturn: return .uninstallAndQuit
+        case .alertFirstButtonReturn: return .restoreAccessAndQuit
         case .alertSecondButtonReturn: return .quitAnyway
         default: return .cancel
         }
