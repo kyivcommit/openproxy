@@ -469,13 +469,19 @@ public final class Installer: @unchecked Sendable {
         switch helper.status {
         case .enabled:
             return .helper
-        case .notRegistered:
+        case .requiresApproval:
+            helper.openApprovalSettings()
+            throw InstallError.runnerFailed(Self.approvalMessage)
+        case .notRegistered, .notFound, .unknown:
+            // Register once and re-read. SMAppService reports .notFound/.unknown for a daemon
+            // that has never been registered (the live-test bug), so registration is the only
+            // way to reach `.enabled` or to surface the one-time approval prompt. A thrown
+            // register means there is no real bundle (e.g. `swift run`): use osascript.
             do {
                 try helper.register()
             } catch {
-                throw InstallError.runnerFailed("Could not register the OpenProxy helper: \(error).")
+                return .osascript
             }
-            // Re-read after registering: it may be enabled or need the one-time approval.
             switch helper.status {
             case .enabled:
                 return .helper
@@ -485,11 +491,6 @@ public final class Installer: @unchecked Sendable {
             default:
                 return .osascript
             }
-        case .requiresApproval:
-            helper.openApprovalSettings()
-            throw InstallError.runnerFailed(Self.approvalMessage)
-        case .notFound, .unknown:
-            return .osascript
         }
     }
 

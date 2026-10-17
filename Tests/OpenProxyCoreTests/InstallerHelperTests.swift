@@ -186,6 +186,113 @@ struct InstallerHelperRoutingTests {
         #expect(runner.scripts.first?.contains(hostsEntry) == true)
     }
 
+    @Test func installRegistersThenUsesTheHelperWhenNotFoundBecomesEnabled() async throws {
+        // SMAppService reports .notFound for a daemon that has never been registered, so a
+        // single register() attempt is what surfaces the real state.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notFound)
+        helper.statusAfterRegister = .enabled
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(helper.registerCount == 1)
+        #expect(editor.requests == [true])
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func installRegistersNotFoundThenAsksForApproval() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notFound)
+        helper.statusAfterRegister = .requiresApproval
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.registerCount == 1)
+        #expect(helper.openApprovalCount == 1)
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.isEmpty)
+        #expect(try #require(thrown?.description).contains("Login Items"))
+    }
+
+    @Test func installFallsBackToOsascriptWhenNotFoundRegisterThrows() async throws {
+        // An unbundled run (`swift run`) cannot register the daemon: use the legacy path.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notFound)
+        helper.registerError = EditorFailure()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(helper.registerCount == 1)
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.count == 1)
+    }
+
+    @Test func installRegistersThenUsesTheHelperWhenUnknownBecomesEnabled() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .unknown)
+        helper.statusAfterRegister = .enabled
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(helper.registerCount == 1)
+        #expect(editor.requests == [true])
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func installRegistersUnknownThenAsksForApproval() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .unknown)
+        helper.statusAfterRegister = .requiresApproval
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.registerCount == 1)
+        #expect(helper.openApprovalCount == 1)
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.isEmpty)
+        #expect(try #require(thrown?.description).contains("Login Items"))
+    }
+
+    @Test func installFallsBackToOsascriptWhenUnknownRegisterThrows() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .unknown)
+        helper.registerError = EditorFailure()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(helper.registerCount == 1)
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.count == 1)
+    }
+
     @Test func installFallsBackToOsascriptWhenTheHelperStatusIsUnknown() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
