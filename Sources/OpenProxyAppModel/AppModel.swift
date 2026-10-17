@@ -339,19 +339,27 @@ public final class AppModel {
         var failures: [String] = []
 
         // 1. Restore /etc/hosts first — the safety-critical step. If the call failed, only
-        // continue when the entry is really gone; otherwise stopping is the safe choice, since
-        // continuing would drop autostart and the CA while clients are still routed to a dead
-        // proxy.
+        // continue when the entry is confirmed gone; otherwise stopping is the safe choice,
+        // since continuing would drop autostart and the CA while clients are still routed to a
+        // dead proxy. `unknown` (the file could not be read or decoded) stops too: it is not
+        // evidence that the entry is gone.
         do {
             try await installer.setHostsEntry(present: false)
         } catch {
-            guard !installer.hostsEntryPresent() else {
+            switch installer.hostsEntryState() {
+            case .absent:
+                break // The call reported an error but the entry is really gone: step succeeded.
+            case .present:
                 warn(.uninstall, "Uninstall stopped: openrouter.ai is still routed to this Mac "
                     + "because /etc/hosts could not be restored: \(error). Fix it and try again.")
                 routingState = .error("uninstall stopped: /etc/hosts could not be restored")
                 return
+            case .unknown:
+                warn(.uninstall, "Uninstall stopped: could not confirm that /etc/hosts was restored "
+                    + "because the file could not be read: \(error). Fix it and try again.")
+                routingState = .error("uninstall stopped: /etc/hosts could not be restored")
+                return
             }
-            // The call reported an error but the entry is really gone: the step succeeded.
         }
 
         // 2. Autostart off.

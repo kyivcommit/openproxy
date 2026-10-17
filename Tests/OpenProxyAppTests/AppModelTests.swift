@@ -1135,6 +1135,47 @@ struct AppModelTests {
         #expect(!model.warnings.contains { $0.key == .uninstall })
     }
 
+    @Test func uninstallStopsWhenHostsStateIsUnknownAfterFailedRemoval() async throws {
+        // The removal failed and the state cannot be confirmed (undecodable bytes): the only
+        // safe choice is to stop, exactly as when the entry is known to remain.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("hosts locked")
+        h.uninstallDecision.confirm = true
+        try Data([0xFF, 0xFE, 0x00]).write(to: h.directory.appending(path: "hosts"))
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.loginItem.unregisterCount == 0)
+        #expect(h.runner.scripts.isEmpty)
+        #expect(h.dataRemover.count == 0)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains {
+            $0.key == .uninstall && $0.message.contains("could not confirm that /etc/hosts was restored")
+        })
+        #expect(model.routingState == .error("uninstall stopped: /etc/hosts could not be restored"))
+    }
+
+    @Test func uninstallStopsWhenHostsFileIsUnreadableAfterFailedRemoval() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("hosts locked")
+        h.uninstallDecision.confirm = true
+        // The file is gone and a directory (unreadable as hosts text) sits at the path.
+        try FileManager.default.removeItem(at: h.directory.appending(path: "hosts"))
+        try FileManager.default.createDirectory(
+            at: h.directory.appending(path: "hosts"), withIntermediateDirectories: true)
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.loginItem.unregisterCount == 0)
+        #expect(h.dataRemover.count == 0)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains { $0.key == .uninstall && $0.message.contains("could not confirm") })
+    }
+
     @Test func uninstallWithAnyFailingStepDoesNotWipeDataOrTerminate() async throws {
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
         h.helper.status = .enabled

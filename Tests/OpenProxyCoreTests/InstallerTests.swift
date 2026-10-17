@@ -554,6 +554,41 @@ struct InstallerTests {
         #expect(await makeInstaller(runner: runner, hostsPath: withoutEntry).status().hostsEntry == false)
     }
 
+    @Test func hostsEntryStateIsUnknownWhenTheFileCannotBeReadOrDecoded() throws {
+        let withEntry = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        let withoutEntry = try makeHostsFile("127.0.0.1 localhost\n")
+        let undecodable = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).hosts")
+        try Data([0x31, 0x32, 0xFF, 0xFE]).write(to: undecodable)
+        let unreadable = FileManager.default.temporaryDirectory.appending(path: "openproxy-hosts-dir-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: unreadable, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(atPath: withEntry)
+            try? FileManager.default.removeItem(atPath: withoutEntry)
+            try? FileManager.default.removeItem(at: undecodable)
+            try? FileManager.default.removeItem(at: unreadable)
+        }
+        let runner = RecordingRunner()
+
+        #expect(makeInstaller(runner: runner, hostsPath: withEntry).hostsEntryState() == .present)
+        #expect(makeInstaller(runner: runner, hostsPath: withoutEntry).hostsEntryState() == .absent)
+        // A read/decoding error must not read as "absent".
+        #expect(makeInstaller(runner: runner, hostsPath: undecodable.path).hostsEntryState() == .unknown)
+        #expect(makeInstaller(runner: runner, hostsPath: unreadable.path).hostsEntryState() == .unknown)
+        #expect(makeInstaller(runner: runner, hostsPath: "/nonexistent/openproxy-hosts").hostsEntryState() == .unknown)
+        // The legacy Bool keeps its meaning: unknown maps to not present.
+        #expect(makeInstaller(runner: runner, hostsPath: undecodable.path).hostsEntryPresent() == false)
+    }
+
+    @Test func statusMapsAnUnreadableHostsFileToNotPresent() async throws {
+        let unreadable = FileManager.default.temporaryDirectory.appending(path: "openproxy-hosts-dir-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: unreadable, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: unreadable) }
+
+        let status = await makeInstaller(runner: RecordingRunner(), hostsPath: unreadable.path).status()
+
+        #expect(status.hostsEntry == false)
+    }
+
     @Test func statusTrustsOnlyWhenVerifyCertSucceeds() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }

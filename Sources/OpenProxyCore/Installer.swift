@@ -239,6 +239,14 @@ public struct OsascriptRunner: PrivilegedRunner {
     }
 }
 
+/// Whether the managed `/etc/hosts` line is present. `unknown` when the file cannot be read
+/// or decoded, so a caller never mistakes a failed read for "restored".
+public enum HostsEntryState: Equatable, Sendable {
+    case present
+    case absent
+    case unknown
+}
+
 public struct InstallStatus: Equatable, Sendable {
     /// Really trusted (`security verify-cert -p basic`), not merely present in a keychain.
     public var caTrusted: Bool
@@ -602,11 +610,17 @@ public final class Installer: @unchecked Sendable {
         }
     }
 
-    /// True when the managed hosts entry is currently present. Read-only, no status probes;
-    /// the uninstall flow uses it to tell a failed removal that really left the entry behind
-    /// from one that reported an error but removed it anyway.
+    /// Whether the managed hosts entry is present, absent, or could not be determined.
+    /// Read-only, no status probes; the uninstall flow uses it to tell a failed removal that
+    /// really left the entry behind from one that reported an error but removed it anyway.
+    public func hostsEntryState() -> HostsEntryState {
+        guard let text = Self.readHosts(hostsPath) else { return .unknown }
+        return HostsFile.isPresent(in: text) ? .present : .absent
+    }
+
+    /// The legacy Bool view: `unknown` is not present. New safety decisions use the state.
     public func hostsEntryPresent() -> Bool {
-        HostsFile.isPresent(in: Self.readHosts(hostsPath))
+        hostsEntryState() == .present
     }
 
     /// Drops admin-domain trust that an older `add-trusted-cert -d` install left. The privileged
@@ -741,7 +755,9 @@ public final class Installer: @unchecked Sendable {
         return InstallStatus(
             caTrusted: trust.succeeded,
             caPresent: loginFind.succeeded || systemFind.succeeded,
-            hostsEntry: HostsFile.isPresent(in: Self.readHosts(hostsPath)),
+            // Unknown maps to not present here: status() only reports, and every caller of
+            // InstallStatus.hostsEntry reads a true as "routed".
+            hostsEntry: HostsFile.isPresent(in: Self.readHosts(hostsPath) ?? ""),
             portListening: port.succeeded,
             nodeCAEnv: !nodeEnv.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         )
@@ -760,10 +776,11 @@ public final class Installer: @unchecked Sendable {
         "launchctl setenv NODE_EXTRA_CA_CERTS \(quoted(caPEMURL.path))"
     }
 
-    /// Read-only view for `status()` only. Never used to build a write: a read error must not
-    /// become empty hosts text.
-    private static func readHosts(_ path: String) -> String {
-        (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+    /// Read-only view for `status()` and the hosts-entry state. Never used to build a write:
+    /// a read error must not become empty hosts text. nil means the file could not be read or
+    /// decoded, which callers must treat as "unknown", never as "absent".
+    private static func readHosts(_ path: String) -> String? {
+        try? String(contentsOfFile: path, encoding: .utf8)
     }
 
     /// Single-quotes a value for `/bin/sh`, the only quoting that survives arbitrary text.
