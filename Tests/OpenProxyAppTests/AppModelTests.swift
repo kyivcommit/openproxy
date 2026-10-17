@@ -1177,6 +1177,23 @@ struct AppModelTests {
         #expect(h.setupDecision.count == 0)
     }
 
+    @Test func reinstallWithAnAlreadyEnabledHelperSkipsRegistration() async throws {
+        // Uninstall keeps the helper registered, so the next setup finds it .enabled and must
+        // not register again: re-registering an enabled daemon is what made launchd refuse to
+        // spawn it until the user toggled OpenProxy in Login Items by hand.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.helper.registerCount == 0)
+        #expect(h.hostsEditor.requests == [true])
+        #expect(h.runner.scripts.isEmpty)
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
+    }
+
     @Test func setupSkipsTheTrustDialogWhenTheCAIsAlreadyTrusted() async throws {
         let h = try Harness()
         let model = h.model()
