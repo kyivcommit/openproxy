@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import AppKit
 import OpenProxyAppModel
@@ -8,6 +9,18 @@ struct OpenProxyApp: App {
     @State private var startupError: String?
 
     init() {
+        // Single instance: the autostart LaunchAgent (RunAtLoad) makes launchd start a second
+        // copy while the manually started one keeps running. Yield silently with exit(0) — so
+        // launchd does not treat it as a crash and restart it — before building the graph,
+        // binding port 443 or showing a second menu bar icon.
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        if let bundleIdentifier = Bundle.main.bundleIdentifier,
+           SingleInstanceGuard.shouldYield(
+               using: RunningApplicationInstances(),
+               bundleIdentifier: bundleIdentifier,
+               ownPID: ownPID) {
+            exit(0)
+        }
         do {
             let built = try AppGraph.makeModel(quitDecision: AlertQuitDecision())
             _model = State(initialValue: built)
