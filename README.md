@@ -29,6 +29,8 @@ OpenRouter's own `:floor` (the **Price** sort) ranks endpoints by **input** pric
 
 The `order` values are the endpoint tags from the `/endpoints` response (`provider[/variant][/region][/tier]`, e.g. `deepinfra/fp8/flex`), which is exactly what OpenRouter's provider `order` accepts. The endpoint Smart price chose is recorded with each request in the stats.
 
+Aliases (`~vendor/name-latest`) work too: the `~` id names no model, so the ranking uses the concrete model the previous response reported in its `model` field. That mapping is kept in memory only (last 64 aliases, never written to disk), so the first request after launch goes unranked and records `alias_unresolved`; every later request for the same alias is ranked and still sends the alias in the body.
+
 Speed needs the client's key. `throughput_last_30m` and `latency_last_30m` come back only when the `/endpoints` call carries an API key, so the catalog sends the most recent client `Authorization` header it has seen. That value is kept **in memory only** — never logged and never written to disk — and is used solely for the openrouter.ai endpoints request. A model first cached without a key is refetched in the background once a key appears, at most once per TTL window; with no key the speed criteria are skipped and the tie-break falls straight to uptime.
 
 ## Install

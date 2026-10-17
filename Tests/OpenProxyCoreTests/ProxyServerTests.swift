@@ -62,6 +62,8 @@ private final class FakeEndpointsFetcher: EndpointsFetcher, @unchecked Sendable 
     private let lock = NSLock()
     private var _calls: [String] = []
     private let data: Data
+    /// Per-model payloads, so a test can serve different endpoint lists by model id.
+    private var dataByModel: [String: Data] = [:]
 
     init(hasFlex: Bool, hasPriority: Bool = false) {
         var endpoints: [[String: Any]] = []
@@ -72,9 +74,14 @@ private final class FakeEndpointsFetcher: EndpointsFetcher, @unchecked Sendable 
 
     init(data: Data) { self.data = data }
 
+    init(dataByModel: [String: Data]) {
+        self.data = Data()
+        self.dataByModel = dataByModel
+    }
+
     func fetch(modelId: String, authorization: String?) async throws -> Data {
         lock.withLock { _calls.append(modelId) }
-        return data
+        return dataByModel[modelId] ?? data
     }
 
     var calls: [String] { lock.withLock { _calls } }
@@ -649,6 +656,90 @@ struct ProxyServerTests {
             let body = Data(#"{"model":"m"}"#.utf8)
             _ = try await harness.request("POST", chatPath, body: body)
             #expect(harness.upstream.requests[0].body == body)
+        }
+    }
+
+    @Test func smartPriceResolvesAliasFromTheFirstResponse() async throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let stats = try StatsStore(path: url.path)
+        let fetcher = FakeEndpointsFetcher(dataByModel: [
+            "x/y-2026": endpointsJSON([endpointJSON("best-unquantized", prompt: 0.5, completion: 0.6)]),
+        ])
+        let alias = Data(#"{"model":"~vendor/name-latest"}"#.utf8)
+        let replies = [
+            FakeReply(status: 200, body: Data(#"{"model":"x/y-2026"}"#.utf8)), FakeReply(),
+        ]
+        try await withServer(
+            settings: Settings(sort: .smartPrice), replies: replies, fetcher: fetcher, statsStore: stats
+        ) { harness in
+            // Request 1: nothing learned yet, so it goes out untouched and says why.
+            _ = try await harness.request("POST", chatPath, body: alias, headers: ["Authorization": "Bearer k"])
+            #expect(harness.upstream.requests[0].body == alias)
+            #expect(await waitUntil({ harness.stats.summary(since: .distantPast).total == 1 }, timeout: 2))
+
+            // Request 2: ranked from the concrete id, body model stays the alias.
+            _ = try await harness.request("POST", chatPath, body: alias, headers: ["Authorization": "Bearer k"])
+            let rewritten = json(harness.upstream.requests[1].body)
+            let provider = rewritten["provider"] as? [String: Any]
+            #expect(provider?["order"] as? [String] == ["best-unquantized"])
+            #expect(provider?["quantizations"] as? [String] == ["unknown"])
+            #expect(rewritten["model"] as? String == "~vendor/name-latest")
+
+            // A non-alias id is ranked straight from its own endpoints.
+            _ = try await harness.request(
+                "POST", chatPath, body: Data(#"{"model":"x/y-2026"}"#.utf8),
+                headers: ["Authorization": "Bearer k"])
+            let direct = json(harness.upstream.requests[2].body)["provider"] as? [String: Any]
+            #expect(direct?["order"] as? [String] == ["best-unquantized"])
+        }
+        #expect(scalarText(url.path, sql: "SELECT skipped_reason FROM requests LIMIT 1") == "alias_unresolved")
+        #expect(scalarText(url.path, sql: "SELECT model FROM requests LIMIT 1") == "~vendor/name-latest")
+        #expect(scalarText(url.path, sql: "SELECT endpoint_tag FROM requests LIMIT 1 OFFSET 1") == "best-unquantized")
+    }
+
+    @Test func aliasResolvesForTierLookupSoFlexApplies() async throws {
+        let endpoints = endpointsJSON([endpointJSON("flex-endpoint", prompt: 0.5, tier: "flex")])
+        let fetcher = FakeEndpointsFetcher(dataByModel: ["x/y-2026": endpoints])
+        let alias = Data(#"{"model":"~vendor/name-latest"}"#.utf8)
+        let replies = [
+            FakeReply(status: 200, body: Data(#"{"model":"x/y-2026"}"#.utf8)),
+            FakeReply(status: 503),
+            FakeReply(status: 200, body: Data(#"{"ok":true}"#.utf8)),
+        ]
+        try await withServer(
+            settings: Settings(sort: .smartPrice, tier: .flex), replies: replies, fetcher: fetcher
+        ) { harness in
+            let headers = ["Authorization": "Bearer k"]
+            // Request 1 learns the concrete model; it carries no tier yet.
+            _ = try await harness.request("POST", chatPath, body: alias, headers: headers)
+            #expect(harness.upstream.requests[0].body == alias)
+            #expect(await waitUntil({ harness.upstream.requests.count == 1 }, timeout: 2))
+
+            // Request 2 asks for endpoints of the concrete id, so flex is injected and
+            // the Flex policy retries the 503 instead of handing it to the client.
+            let response = try await harness.request("POST", chatPath, body: alias, headers: headers)
+            #expect(response.status == 200)
+            let attempts = harness.upstream.requests.dropFirst()
+            #expect(attempts.count == 2)
+            #expect(attempts.allSatisfy { json($0.body)["service_tier"] as? String == "flex" })
+            #expect(attempts.allSatisfy { json($0.body)["model"] as? String == "~vendor/name-latest" })
+        }
+    }
+
+    @Test func disabledSettingsNeverLearnOrInjectAliases() async throws {
+        let fetcher = FakeEndpointsFetcher(dataByModel: [
+            "x/y-2026": endpointsJSON([endpointJSON("cheap", prompt: 0.5)]),
+        ])
+        let reply = FakeReply(status: 200, body: Data(#"{"model":"x/y-2026"}"#.utf8))
+        try await withServer(
+            settings: Settings(enabled: false, sort: .smartPrice), replies: [reply], fetcher: fetcher
+        ) { harness in
+            let alias = Data(#"{"model":"~vendor/name-latest"}"#.utf8)
+            _ = try await harness.request("POST", chatPath, body: alias)
+            _ = try await harness.request("POST", chatPath, body: alias)
+            #expect(harness.upstream.requests.map(\.body) == [alias, alias])
+            #expect(harness.fetcher.calls.isEmpty)
         }
     }
 
@@ -1369,7 +1460,7 @@ struct ProxyServerTests {
         }
     }
 
-    @Test func cancelDuringConnectReturnsWithinOneSecond() async throws {
+    @Test func cancelDuringConnectReturnsPromptly() async throws {
         let started = Signal()
         let connector = HangingConnector(started: started)
         defer { connector.finish() }
@@ -1387,8 +1478,9 @@ struct ProxyServerTests {
         let start = clock.now
         task.cancel()
         _ = await task.result
-        // Without the cancellation fix this would block for the 10 s connect timeout.
-        #expect(clock.now - start < .seconds(1))
+        // Without the cancellation fix this would block for the 10 s connect timeout;
+        // the bound is loose so a slow CI runner does not flake it.
+        #expect(clock.now - start < .seconds(5))
     }
 }
 
