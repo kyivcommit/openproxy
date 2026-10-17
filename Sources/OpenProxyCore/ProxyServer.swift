@@ -41,6 +41,8 @@ public final class ProxyServer: @unchecked Sendable {
     private let catalog: EndpointCatalog
     /// Per-model Smart-price leader memory, so hysteresis survives across requests.
     private let leaders = EndpointLeaders()
+    /// Alias -> concrete model ids learned from responses (`~vendor/name-latest`).
+    private let aliases = AliasResolver()
     private let stats: StatsStore
     private let settings: @Sendable () -> Settings
     private let group: EventLoopGroup
@@ -235,6 +237,12 @@ public final class ProxyServer: @unchecked Sendable {
                 // Client went away mid-stream: close the upstream connection.
                 response.cancel()
             }
+            // Learn before the client sees the end of the body: its next request is the
+            // one that should already be ranked from the concrete model id.
+            let facts = tap.finish()
+            if settings.enabled, let model, model.hasPrefix("~"), let concrete = facts.model {
+                await aliases.learn(alias: model, concrete: concrete)
+            }
             try? await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
         } catch {
             // The upstream body failed after the head: no clean terminator is
@@ -252,10 +260,19 @@ public final class ProxyServer: @unchecked Sendable {
     private func smartPriceInjection(
         model: String, authorization: String?, tier: TierMode
     ) async -> SmartPriceInjection {
-        guard let endpoints = await catalog.endpoints(model: model, authorization: authorization) else {
+        // An alias only says which model it points at in its response, so rank the concrete
+        // id once known; until then the request goes out unchanged (fail-open).
+        var rankModel = model
+        if model.hasPrefix("~") {
+            guard let concrete = await aliases.resolve(model) else {
+                return SmartPriceInjection(unavailableReason: "alias_unresolved")
+            }
+            rankModel = concrete
+        }
+        guard let endpoints = await catalog.endpoints(model: rankModel, authorization: authorization) else {
             return SmartPriceInjection(unavailableReason: "no_endpoint_data")
         }
-        let ranking = await leaders.rank(model: model, endpoints: endpoints, tier: tier)
+        let ranking = await leaders.rank(model: rankModel, endpoints: endpoints, tier: tier)
         guard ranking.leader != nil else {
             return SmartPriceInjection(unavailableReason: "no_eligible_endpoint")
         }
