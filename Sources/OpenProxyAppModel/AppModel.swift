@@ -268,10 +268,12 @@ public final class AppModel {
             }
 
             // (c) autostart: a LaunchAgent must be enabled before anything routes here, or a
-            // crash would leave openrouter.ai pointing at a dead proxy. Pending approval is a
-            // wait, not a failure, so poll it with the injected clock.
+            // crash would leave openrouter.ai pointing at a dead proxy. Only a pending approval
+            // is a wait (poll it with the injected clock); any other non-enabled status is a
+            // real failure, so stop at once and leave Retry setup available.
             registerLoginItem()
-            if loginItemStatus != .enabled {
+            if loginItemStatus == .requiresApproval {
+                installer.openHelperApprovalSettings()
                 routingState = .waitingForApproval
                 guard await waitForAutostartEnabled() else {
                     warn(.install, "Timed out waiting for autostart approval in System Settings -> "
@@ -281,6 +283,10 @@ public final class AppModel {
                     await refresh()
                     return
                 }
+            } else if loginItemStatus != .enabled {
+                routingState = .error("autostart is \(loginItemStatus.label)")
+                await refresh()
+                return
             }
 
             // (d) hosts entry (helper when enabled, osascript otherwise)

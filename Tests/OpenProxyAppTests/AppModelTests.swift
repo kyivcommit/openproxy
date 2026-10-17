@@ -1054,6 +1054,7 @@ struct AppModelTests {
 
         #expect(h.loginItem.registerCount == 1)
         #expect(h.waiting.count == 1)
+        #expect(h.helper.openApprovalCount == 1)
         #expect(h.runner.scripts.count == 1)
         #expect(model.settings.setupComplete)
         #expect(model.routingState == .active)
@@ -1095,17 +1096,28 @@ struct AppModelTests {
         #expect(h.runner.scripts.count == 1)
     }
 
-    @Test func installDoesNotRouteWhenAutostartRegistrationFails() async throws {
-        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
-        h.loginItem.registerError = LoginItemTestError.denied
-        h.loginItem.status = .notFound
-        let model = h.model()
+    @Test func installDoesNotRouteOrWaitWhenAutostartRegistrationFails() async throws {
+        // Only .requiresApproval is a wait; any other non-enabled status is a real failure and
+        // must finish at once with the registration error, no clock poll and no Login Items hop.
+        for status in [LoginItemStatus.notRegistered, .notFound, .unknown(1)] {
+            let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+            h.loginItem.registerError = LoginItemTestError.denied
+            h.loginItem.status = status
+            let model = h.model()
 
-        await model.install()
+            await model.install()
 
-        #expect(h.runner.scripts.isEmpty)
-        #expect(!model.settings.setupComplete)
-        #expect(model.warnings.contains { $0.key == .autostart && $0.message.contains("registration failed") })
+            #expect(h.runner.scripts.isEmpty)
+            #expect(h.hostsEditor.requests.isEmpty)
+            #expect(!model.settings.setupComplete)
+            #expect(model.routingState == .error("autostart is \(status.label)"))
+            #expect(h.waiting.count == 0)
+            #expect(h.helper.openApprovalCount == 0)
+            #expect(model.canRetrySetup)
+            #expect(model.warnings.contains {
+                $0.key == .autostart && $0.message.contains("Autostart registration failed")
+            })
+        }
     }
 
     @Test func laterLaunchDoesNotRestoreHostsWithoutAutostart() async throws {
