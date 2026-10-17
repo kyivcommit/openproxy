@@ -80,6 +80,28 @@ private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
     }
 }
 
+/// Models a CA that is in the keychain but not yet trusted: `verify-cert` fails until
+/// `add-trusted-cert` has run, so the trust phase's verify-first ordering can be exercised.
+private final class UntrustedThenTrustedCA: @unchecked Sendable {
+    private let lock = NSLock()
+    private var added = false
+
+    func handle(_ command: String) -> CommandResult {
+        lock.withLock {
+            if command.contains("add-trusted-cert") {
+                added = true
+                return CommandResult(status: 0)
+            }
+            if command.contains("verify-cert") {
+                return added
+                    ? CommandResult(status: 0)
+                    : CommandResult(status: 1, standardError: "CSSMERR_TP_NOT_TRUSTED")
+            }
+            return CommandResult(status: 0)
+        }
+    }
+}
+
 @Suite("Installer")
 struct InstallerTests {
     private func makeInstaller(
@@ -110,17 +132,22 @@ struct InstallerTests {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
-        let commands = FakeCommandRunner()
+        // The CA is not trusted yet: `verify-cert` fails until `add-trusted-cert` has run.
+        let caState = UntrustedThenTrustedCA()
+        let commands = FakeCommandRunner(handler: caState.handle)
 
         try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).install()
 
-        // Phase 1: unprivileged, user-domain trust in the login keychain, then verify.
-        #expect(commands.commands.count == 3)
-        let add = try #require(commands.commands.first)
+        // Phase 1: verify (fails, no dialog) -> add trust -> verify (succeeds).
+        #expect(commands.commands.count == 4)
+        let firstVerify = try #require(commands.commands.first)
+        #expect(firstVerify.contains("security verify-cert -c"))
+        #expect(!firstVerify.contains("add-trusted-cert"))
+        let add = try #require(commands.commands.dropFirst().first)
         #expect(add.contains(#"security add-trusted-cert -r trustRoot -k "$HOME/Library/Keychains/login.keychain-db""#))
         #expect(!add.contains(" -d "))
         #expect(!add.contains("System.keychain"))
-        let verify = try #require(commands.commands.dropFirst().first)
+        let verify = try #require(commands.commands.dropFirst(2).first)
         #expect(verify.contains("security verify-cert -c"))
         #expect(verify.contains("-p basic"))
         // Both commands act on the same private temp copy, never the user-writable ca.pem directly.
@@ -164,14 +191,38 @@ struct InstallerTests {
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
         let commands = FakeCommandRunner(handler: { command in
-            command.contains("add-trusted-cert")
-                ? CommandResult(status: 1, standardError: "SecTrustSettingsSetTrustSettings: denied")
-                : CommandResult(status: 0)
+            if command.contains("verify-cert") {
+                return CommandResult(status: 1, standardError: "CSSMERR_TP_NOT_TRUSTED")
+            }
+            if command.contains("add-trusted-cert") {
+                return CommandResult(status: 1, standardError: "SecTrustSettingsSetTrustSettings: denied")
+            }
+            return CommandResult(status: 0)
         })
         let installer = makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath)
 
         await #expect(throws: InstallError.self) { try await installer.install() }
         #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func alreadyTrustedCASkipsTheTrustDialog() async throws {
+        // Live bug: an already-trusted CA still reopened Certificate Trust Settings. Verify first
+        // means a valid user-domain trust writes nothing and shows no dialog.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner()
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).install()
+
+        #expect(!commands.commands.contains { $0.contains("add-trusted-cert") })
+        // The only trust-system command is the single successful verify; no second dialog-bound run.
+        let trustCommands = commands.commands.filter {
+            $0.contains("verify-cert") || $0.contains("add-trusted-cert")
+        }
+        #expect(trustCommands.count == 1)
+        #expect(trustCommands.first?.contains("verify-cert") == true)
+        #expect(runner.scripts.count == 1)
     }
 
     @Test func installFailsBeforeRunningAnythingWhenTheCAIsMissingOrInvalid() async throws {
@@ -251,12 +302,12 @@ struct InstallerTests {
 
     // MARK: - Item 2: uninstall
 
-    @Test func uninstallRemovesHostsLineAndDeletesCertificate() async throws {
+    @Test func removeCARemovesHostsLineAndDeletesCertificate() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
 
-        try await makeInstaller(runner: runner, hostsPath: hostsPath).uninstall()
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).removeCA()
 
         #expect(runner.scripts.count == 1)
         let script = try #require(runner.scripts.first)
@@ -266,14 +317,14 @@ struct InstallerTests {
         #expect(script.contains(hostsPath))
     }
 
-    @Test func uninstallDeletesCertificatesBySHA1Hash() async throws {
+    @Test func removeCADeletesCertificatesBySHA1Hash() async throws {
         // Two CAs can share the CN (a reinstall): `delete-certificate -c <CN>` fails as
         // "ambiguous", so every match is deleted by its SHA-1 hash instead.
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
 
-        try await makeInstaller(runner: runner, hostsPath: hostsPath).uninstall()
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).removeCA()
 
         let script = try #require(runner.scripts.first)
         #expect(script.contains("security find-certificate -a -Z -c 'OpenProxy Local CA'"))
@@ -296,13 +347,13 @@ struct InstallerTests {
         await #expect(throws: InstallError.self) { try await installer.uninstall() }
     }
 
-    @Test func uninstallRestoresHostsBeforeSweepingKeychains() async throws {
+    @Test func removeCARestoresHostsBeforeSweepingKeychains() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
         let commands = FakeCommandRunner()
 
-        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
 
         let script = try #require(runner.scripts.first)
         let remove = try #require(script.range(of: "sed -E"))
@@ -329,7 +380,7 @@ struct InstallerTests {
         #expect(!script.contains(hostsEntry))
     }
 
-    @Test func uninstallRestoresHostsEvenWhenTrustRemovalFails() async throws {
+    @Test func removeCARestoresHostsEvenWhenTrustRemovalFails() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
@@ -340,7 +391,7 @@ struct InstallerTests {
         // Phase B is best-effort for correctness, but the hosts restore — the safety-critical
         // half — already ran and must never be undone. The leftover failure is reported, not
         // swallowed as a clean success.
-        await #expect(throws: InstallError.self) { try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall() }
+        await #expect(throws: InstallError.self) { try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA() }
 
         #expect(runner.scripts.count == 1)
         #expect(commands.commands.contains { $0.contains("remove-trusted-cert") })
@@ -359,7 +410,7 @@ struct InstallerTests {
         })
 
         // The exact Security.framework error for "no trust settings" must not be reported.
-        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
     }
 
     @Test func isAlreadyNotTrustedRecognisesOnlyTheMissingSettingError() {
@@ -370,14 +421,14 @@ struct InstallerTests {
         #expect(!Installer.isAlreadyNotTrusted(CommandResult(status: 0)))
     }
 
-    @Test func uninstallRemovesAdminTrustInPrivilegedPhaseBeforeSweepingSystemKeychain() async throws {
+    @Test func removeCARemovesAdminTrustInPrivilegedPhaseBeforeSweepingSystemKeychain() async throws {
         // An older install used `add-trusted-cert -d`, which writes admin trust settings that
         // deleting the certificate item leaves behind; `remove-trusted-cert -d` clears them.
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
 
-        try await makeInstaller(runner: runner, hostsPath: hostsPath).uninstall()
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).removeCA()
 
         let script = try #require(runner.scripts.first)
         let hostsRestore = try #require(script.range(of: "sed -E"))
@@ -394,12 +445,12 @@ struct InstallerTests {
 
     // MARK: - Item 3: validate the PEM before the privileged remove-trusted-cert
 
-    @Test func uninstallValidatesFingerprintBeforeAdminTrustRemoval() async throws {
+    @Test func removeCAValidatesFingerprintBeforeAdminTrustRemoval() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
 
-        try await makeInstaller(runner: runner, hostsPath: hostsPath).uninstall()
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).removeCA()
 
         let script = try #require(runner.scripts.first)
         let fingerprint = try #require(Installer.sha256Fingerprint(ofPEM: TestCA.pem))
@@ -448,13 +499,13 @@ struct InstallerTests {
     }
 
 
-    @Test func uninstallDeletesLoginKeychainCertWithTrustSettings() async throws {
+    @Test func removeCADeletesLoginKeychainCertWithTrustSettings() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
         let commands = FakeCommandRunner()
 
-        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
 
         // System keychain (privileged phase): no per-user trust settings to carry.
         let system = try #require(runner.scripts.first)
@@ -466,7 +517,107 @@ struct InstallerTests {
         #expect(login.contains("security delete-certificate -t -Z \"$hash\""))
     }
 
-    @Test func uninstallReportsLeftoverCleanupFailureAfterHostsRemoval() async throws {
+    // MARK: - R34: the admin prompt only when the privileged domains still need cleanup
+
+    /// Answers the unprivileged probes the way a clean per-user install does: no certificate in
+    /// the System keychain and no admin trust settings (the exact texts macOS prints).
+    private func cleanProbeRunner() -> FakeCommandRunner {
+        FakeCommandRunner(handler: { command in
+            if command.contains("find-certificate") && command.contains("System.keychain") {
+                return CommandResult(
+                    status: 44,
+                    standardError: "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.")
+            }
+            if command.contains("dump-trust-settings") {
+                return CommandResult(
+                    status: 1,
+                    standardError: "SecTrustSettingsCopyCertificates: No Trust Settings were found.")
+            }
+            return CommandResult(status: 0)
+        })
+    }
+
+    @Test func removeCASkipsTheAdminPromptWhenThereIsNothingPrivilegedToClean() async throws {
+        // The current per-user install: no System-keychain certificate, no admin trust, and the
+        // hosts line is already gone. Only the trust-settings authorization stays.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = cleanProbeRunner()
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.isEmpty)
+        #expect(commands.commands.contains { $0.contains("security remove-trusted-cert ") })
+    }
+
+    @Test func removeCARunsThePrivilegedScriptWhenTheSystemKeychainStillHasTheCertificate() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            if command.contains("find-certificate") && command.contains("System.keychain") {
+                return CommandResult(status: 0, standardOutput: "keychain: \"/Library/Keychains/System.keychain\"")
+            }
+            return CommandResult(status: 0)
+        })
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.count == 1)
+        #expect(runner.scripts.first?.contains("delete-certificate") == true)
+    }
+
+    @Test func removeCARunsThePrivilegedScriptWhenAdminTrustMentionsTheCA() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            if command.contains("find-certificate") && command.contains("System.keychain") {
+                return CommandResult(
+                    status: 44,
+                    standardError: "The specified item could not be found in the keychain.")
+            }
+            if command.contains("dump-trust-settings") {
+                return CommandResult(status: 0, standardOutput: "Trust Settings:\n  OpenProxy Local CA")
+            }
+            return CommandResult(status: 0)
+        })
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.count == 1)
+    }
+
+    @Test func removeCARunsThePrivilegedScriptWhenHostsIsStillRouted() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = cleanProbeRunner()
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.count == 1)
+        #expect(runner.scripts.first?.contains("sed -E") == true)
+    }
+
+    @Test func removeCARunsThePrivilegedScriptWhenAProbeFailsUnexpectedly() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            if command.contains("find-certificate") && command.contains("System.keychain") {
+                return CommandResult(status: 1, standardError: "SecKeychainSearchCopyNext: The authorization was denied")
+            }
+            return CommandResult(status: 0)
+        })
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.count == 1)
+    }
+
+    @Test func removeCAReportsLeftoverCleanupFailureAfterHostsRemoval() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
@@ -478,7 +629,7 @@ struct InstallerTests {
 
         var thrown: InstallError?
         do {
-            try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+            try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
         } catch let error as InstallError {
             thrown = error
         }
@@ -501,6 +652,41 @@ struct InstallerTests {
 
         #expect(await makeInstaller(runner: runner, hostsPath: withEntry).status().hostsEntry)
         #expect(await makeInstaller(runner: runner, hostsPath: withoutEntry).status().hostsEntry == false)
+    }
+
+    @Test func hostsEntryStateIsUnknownWhenTheFileCannotBeReadOrDecoded() throws {
+        let withEntry = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        let withoutEntry = try makeHostsFile("127.0.0.1 localhost\n")
+        let undecodable = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).hosts")
+        try Data([0x31, 0x32, 0xFF, 0xFE]).write(to: undecodable)
+        let unreadable = FileManager.default.temporaryDirectory.appending(path: "openproxy-hosts-dir-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: unreadable, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(atPath: withEntry)
+            try? FileManager.default.removeItem(atPath: withoutEntry)
+            try? FileManager.default.removeItem(at: undecodable)
+            try? FileManager.default.removeItem(at: unreadable)
+        }
+        let runner = RecordingRunner()
+
+        #expect(makeInstaller(runner: runner, hostsPath: withEntry).hostsEntryState() == .present)
+        #expect(makeInstaller(runner: runner, hostsPath: withoutEntry).hostsEntryState() == .absent)
+        // A read/decoding error must not read as "absent".
+        #expect(makeInstaller(runner: runner, hostsPath: undecodable.path).hostsEntryState() == .unknown)
+        #expect(makeInstaller(runner: runner, hostsPath: unreadable.path).hostsEntryState() == .unknown)
+        #expect(makeInstaller(runner: runner, hostsPath: "/nonexistent/openproxy-hosts").hostsEntryState() == .unknown)
+        // The legacy Bool keeps its meaning: unknown maps to not present.
+        #expect(makeInstaller(runner: runner, hostsPath: undecodable.path).hostsEntryPresent() == false)
+    }
+
+    @Test func statusMapsAnUnreadableHostsFileToNotPresent() async throws {
+        let unreadable = FileManager.default.temporaryDirectory.appending(path: "openproxy-hosts-dir-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: unreadable, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: unreadable) }
+
+        let status = await makeInstaller(runner: RecordingRunner(), hostsPath: unreadable.path).status()
+
+        #expect(status.hostsEntry == false)
     }
 
     @Test func statusTrustsOnlyWhenVerifyCertSucceeds() async throws {
@@ -562,7 +748,7 @@ struct InstallerTests {
 
     // MARK: - Item 1: clear NODE_EXTRA_CA_CERTS when it points at our ca.pem
 
-    @Test func uninstallClearsNodeCAEnvWhenItPointsAtOurCA() async throws {
+    @Test func removeCAClearsNodeCAEnvWhenItPointsAtOurCA() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
@@ -572,12 +758,12 @@ struct InstallerTests {
                 : CommandResult(status: 0)
         })
 
-        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
 
         #expect(commands.commands.contains { $0.contains("launchctl unsetenv NODE_EXTRA_CA_CERTS") })
     }
 
-    @Test func uninstallLeavesNodeCAEnvWhenItIsSomeoneElses() async throws {
+    @Test func removeCALeavesNodeCAEnvWhenItIsSomeoneElses() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
@@ -587,12 +773,12 @@ struct InstallerTests {
                 : CommandResult(status: 0)
         })
 
-        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
 
         #expect(!commands.commands.contains { $0.contains("launchctl unsetenv") })
     }
 
-    @Test func uninstallReportsFailureToClearNodeCAEnv() async throws {
+    @Test func removeCAReportsFailureToClearNodeCAEnv() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
@@ -608,7 +794,7 @@ struct InstallerTests {
 
         var thrown: InstallError?
         do {
-            try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).uninstall()
+            try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
         } catch let error as InstallError {
             thrown = error
         }

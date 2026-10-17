@@ -5,6 +5,7 @@ import ServiceManagement
 /// be tested without a real signed bundle or SMAppService.
 public protocol LoginItemRegistering: Sendable {
     func register() throws
+    func unregister() throws
     var status: LoginItemStatus { get }
 }
 
@@ -38,6 +39,10 @@ public struct SMAppServiceLoginItem: LoginItemRegistering {
 
     public func register() throws {
         try SMAppService.agent(plistName: plistName).register()
+    }
+
+    public func unregister() throws {
+        try SMAppService.agent(plistName: plistName).unregister()
     }
 
     public var status: LoginItemStatus {

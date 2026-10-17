@@ -26,10 +26,12 @@ private final class FakeServer: ProxyServerControlling, @unchecked Sendable {
 private final class FakeRunner: PrivilegedRunner, @unchecked Sendable {
     var error: Error?
     var hostsPath: String?
+    var onRun: (() -> Void)?
     private(set) var scripts: [String] = []
 
     func run(script: String) async throws {
         scripts.append(script)
+        onRun?()
         if let error { throw error }
         guard let hostsPath else { return }
         let text = (try? String(contentsOfFile: hostsPath, encoding: .utf8)) ?? ""
@@ -47,6 +49,7 @@ private final class FakeRunner: PrivilegedRunner, @unchecked Sendable {
 private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
     var errorOnContains: String?
     var delay: Duration?
+    var onCommand: ((String) -> Void)?
     private let lock = NSLock()
     private var recorded: [String] = []
     private var current = 0
@@ -60,6 +63,7 @@ private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
         defer { lock.withLock { current -= 1 } }
         if let delay { try? await Task.sleep(for: delay) }
         lock.withLock { recorded.append(command) }
+        onCommand?(command)
         if let errorOnContains, command.contains(errorOnContains) {
             return CommandResult(status: 1, standardError: "denied")
         }
@@ -86,12 +90,63 @@ private final class FailingUpstreamClient: UpstreamClient, @unchecked Sendable {
 /// Records autostart registration and lets a test force the reported status.
 private final class FakeLoginItem: LoginItemRegistering, @unchecked Sendable {
     var registerError: Error?
+    var unregisterError: Error?
     var status: LoginItemStatus = .enabled
+    /// What `register()` reports on the immediate re-read, even when it throws.
+    var statusAfterRegister: LoginItemStatus?
+    var onRegister: (() -> Void)?
+    var onUnregister: (() -> Void)?
     private(set) var registerCount = 0
+    private(set) var unregisterCount = 0
 
     func register() throws {
         registerCount += 1
+        onRegister?()
+        // SMAppService can throw and still change the status (approval pending).
+        if let statusAfterRegister { status = statusAfterRegister }
         if let registerError { throw registerError }
+    }
+
+    func unregister() throws {
+        unregisterCount += 1
+        onUnregister?()
+        if let unregisterError { throw unregisterError }
+        status = .notRegistered
+    }
+}
+
+/// Records root-helper registration and lets a test force the reported status.
+private final class FakeHelper: HelperRegistering, @unchecked Sendable {
+    var status: HelperStatus = .notFound
+    var registerError: Error?
+    var statusAfterRegister: HelperStatus?
+    var onRegister: (() -> Void)?
+    private(set) var registerCount = 0
+    private(set) var openApprovalCount = 0
+
+    func register() throws {
+        registerCount += 1
+        onRegister?()
+        if let registerError { throw registerError }
+        if let statusAfterRegister { status = statusAfterRegister }
+    }
+
+    func openApprovalSettings() { openApprovalCount += 1 }
+}
+
+/// Records the hosts edit the installer would route through the helper.
+private final class FakeHostsEditor: HostsEditing, @unchecked Sendable {
+    var error: Error?
+    var onRequest: (() -> Void)?
+    private let lock = NSLock()
+    private var recorded: [Bool] = []
+
+    var requests: [Bool] { lock.withLock { recorded } }
+
+    func setHostsEntry(present: Bool) async throws {
+        lock.withLock { recorded.append(present) }
+        onRequest?()
+        if let error { throw error }
     }
 }
 
@@ -100,6 +155,7 @@ private final class FakeLoginItem: LoginItemRegistering, @unchecked Sendable {
 @MainActor
 private final class FakeQuitDecision: QuitDecision {
     var choice: QuitChoice = .quitAnyway
+    var onTerminate: (() -> Void)?
     private(set) var decideCount = 0
     private(set) var terminateCount = 0
 
@@ -108,7 +164,59 @@ private final class FakeQuitDecision: QuitDecision {
         return choice
     }
 
-    func terminate() { terminateCount += 1 }
+    func terminate() {
+        terminateCount += 1
+        onTerminate?()
+    }
+}
+
+/// Records the order of setup/uninstall steps so the flows can be asserted in sequence.
+private final class OrderLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+
+    func append(_ event: String) { lock.withLock { events.append(event) } }
+
+    /// First occurrence of each distinct event, in order.
+    var sequence: [String] {
+        var seen: [String] = []
+        for event in lock.withLock({ events }) where !seen.contains(event) { seen.append(event) }
+        return seen
+    }
+}
+
+@MainActor
+private final class FakeSetupDecision: SetupDecision {
+    var confirm = false
+    private(set) var count = 0
+    func confirmSetup() -> Bool { count += 1; return confirm }
+}
+
+@MainActor
+private final class FakeUninstallDecision: UninstallDecision {
+    var confirm = false
+    private(set) var count = 0
+    func confirmUninstall() -> Bool { count += 1; return confirm }
+}
+
+private final class FakeWaiting: SetupWaiting, @unchecked Sendable {
+    var onPoll: (() -> Void)?
+    private(set) var count = 0
+    func waitForNextApprovalPoll() async {
+        count += 1
+        onPoll?()
+    }
+}
+
+private final class FakeDataRemover: AppDataRemoving, @unchecked Sendable {
+    var error: Error?
+    var onRemove: (() -> Void)?
+    private(set) var count = 0
+    func removeAppData() throws {
+        count += 1
+        onRemove?()
+        if let error { throw error }
+    }
 }
 
 @MainActor
@@ -121,7 +229,14 @@ private struct Harness {
     let installer: Installer
     let server: FakeServer
     let loginItem: FakeLoginItem
+    let helper: FakeHelper
+    let hostsEditor: FakeHostsEditor
     let quitDecision: FakeQuitDecision
+    let setupDecision: FakeSetupDecision
+    let uninstallDecision: FakeUninstallDecision
+    let waiting: FakeWaiting
+    let dataRemover: FakeDataRemover
+    let orderLog: OrderLog
 
     init(hostsText: String? = nil) throws {
         let directory = FileManager.default.temporaryDirectory
@@ -138,20 +253,55 @@ private struct Harness {
         self.runner = FakeRunner()
         self.runner.hostsPath = hostsURL.path
         self.commandRunner = FakeCommandRunner()
+        self.hostsEditor = FakeHostsEditor()
+        self.helper = FakeHelper()
         self.installer = Installer(
             caPEMURL: ca.caCertificatePEMURL,
             runner: runner,
             commandRunner: commandRunner,
-            hostsPath: hostsURL.path)
+            hostsPath: hostsURL.path,
+            hostsEditor: hostsEditor,
+            helper: helper)
         self.server = FakeServer()
         self.loginItem = FakeLoginItem()
         self.quitDecision = FakeQuitDecision()
+        self.setupDecision = FakeSetupDecision()
+        self.uninstallDecision = FakeUninstallDecision()
+        self.waiting = FakeWaiting()
+        self.dataRemover = FakeDataRemover()
+
+        // Wire the step-order log; each fake appends its own step name as it runs.
+        let orderLog = OrderLog()
+        self.orderLog = orderLog
+        let runner = self.runner
+        runner.onRun = { [orderLog] in
+            let isCA = runner.scripts.last?.contains("delete-certificate") == true
+            orderLog.append(isCA ? "ca" : "hosts")
+        }
+        self.commandRunner.onCommand = { [orderLog] command in
+            if command.contains("verify-cert") || command.contains("add-trusted-cert") {
+                orderLog.append("trust")
+            }
+            if command.contains("setenv") { orderLog.append("nodeenv") }
+        }
+        self.loginItem.onRegister = { [orderLog] in orderLog.append("autostart") }
+        self.loginItem.onUnregister = { [orderLog] in orderLog.append("autostart") }
+        self.helper.onRegister = { [orderLog] in orderLog.append("helper") }
+        self.hostsEditor.onRequest = { [orderLog] in orderLog.append("hosts") }
+        self.quitDecision.onTerminate = { [orderLog] in orderLog.append("quit") }
+        self.dataRemover.onRemove = { [orderLog] in orderLog.append("data") }
     }
 
-    func model(refreshInterval: Duration = .seconds(5)) -> AppModel {
+    func model(maxApprovalPolls: Int = 1, refreshInterval: Duration = .seconds(5)) -> AppModel {
         AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: loginItem, quitDecision: quitDecision,
+            helper: helper,
+            setupDecision: setupDecision,
+            uninstallDecision: uninstallDecision,
+            dataRemover: dataRemover,
+            waiting: waiting,
+            maxApprovalPolls: maxApprovalPolls,
             refreshInterval: refreshInterval)
     }
 
@@ -336,7 +486,42 @@ struct AppModelTests {
 
         #expect(h.loginItem.registerCount == 1)
         #expect(model.loginItemStatus == .notFound)
-        #expect(model.warnings.contains { $0.message.contains("Autostart") })
+        // A genuine failure keeps its raw text, not the approval hint.
+        #expect(model.warnings.contains { $0.message.contains("Autostart registration failed") })
+        #expect(model.warnings.contains { $0.message.contains("denied") })
+        #expect(!model.warnings.contains { $0.message.contains("needs approval") })
+    }
+
+    @Test func loginItemRegisterThrowingWithApprovalPendingShowsApprovalText() throws {
+        // Live bug: register() throws "Operation not permitted" while approval is pending, but
+        // the status is .requiresApproval. That is the one-time approval state, not an error.
+        let h = try Harness()
+        h.loginItem.registerError = LoginItemTestError.denied
+        h.loginItem.statusAfterRegister = .requiresApproval
+        let model = h.model()
+
+        model.registerLoginItem()
+
+        #expect(model.loginItemStatus == .requiresApproval)
+        #expect(model.warnings.contains { $0.message.contains("needs approval") })
+        #expect(!model.warnings.contains { $0.message.contains("denied") })
+    }
+
+    @Test func autostartApprovalWarningClearsAfterALaterRegisterSucceeds() throws {
+        let h = try Harness()
+        h.loginItem.registerError = LoginItemTestError.denied
+        h.loginItem.statusAfterRegister = .requiresApproval
+        let model = h.model()
+        model.registerLoginItem()
+        #expect(model.warnings.contains { $0.key == .autostart })
+
+        // The user approved; the next register succeeds and the stale hint goes away.
+        h.loginItem.registerError = nil
+        h.loginItem.statusAfterRegister = .enabled
+        model.registerLoginItem()
+
+        #expect(model.loginItemStatus == .enabled)
+        #expect(!model.warnings.contains { $0.key == .autostart })
     }
 
     @Test func loginItemRequiringApprovalBecomesWarning() throws {
@@ -369,6 +554,119 @@ struct AppModelTests {
         await model.refresh()
 
         #expect(model.loginItemStatus == .requiresApproval)
+    }
+
+    // MARK: - Autostart is tied to Install/Uninstall, not to launch
+
+    @Test func installApprovalPendingSkipsAutostartRegistration() async throws {
+        // Install's helper step runs first. While approval is pending it throws the approval
+        // message, so autostart must not be registered in that run; after the user approves,
+        // the next Install registers it.
+        let h = try Harness()
+        h.helper.status = .requiresApproval
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.helper.openApprovalCount == 1)
+        #expect(h.loginItem.registerCount == 0)
+        #expect(model.warnings.contains { $0.message.contains("Login Items") })
+
+        h.helper.status = .enabled
+        await model.install()
+
+        #expect(h.loginItem.registerCount == 1)
+    }
+
+    @Test func installApprovalWarningRendersWithExactlyOnePeriod() async throws {
+        // The thrown text ends with a period and the install wrapper adds one; the rendered
+        // warning must not read ".. The system was not fully changed."
+        let h = try Harness()
+        h.helper.status = .enabled
+        h.hostsEditor.error = HostsEditingError.timedOut
+        let model = h.model()
+
+        await model.install()
+
+        let warning = try #require(model.warnings.first { $0.key == .install })
+        #expect(!warning.message.contains(".."))
+        #expect(warning.message.contains(
+            "then choose Retry setup in the OpenProxy menu. The system was not fully changed."))
+    }
+
+    @Test func launchDoesNotRegisterAutostart() async throws {
+        // A plain launch must not put OpenProxy in Login Items before the user installs.
+        let h = try Harness()
+        let model = h.model()
+
+        await model.start()
+
+        #expect(h.loginItem.registerCount == 0)
+    }
+
+    @Test func installRegistersAutostartOnce() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.loginItem.registerCount == 1)
+        #expect(model.loginItemStatus == .enabled)
+    }
+
+    @Test func installFailureLeavesSetupIncomplete() async throws {
+        // The hosts step (d) runs after autostart (c), so a hosts failure leaves autostart
+        // registered but the setup incomplete: the next launch asks again.
+        let h = try Harness()
+        h.runner.error = InstallError.runnerFailed("boom")
+        let model = h.model()
+
+        await model.install()
+
+        #expect(!model.settings.setupComplete)
+        #expect(model.warnings.contains { $0.key == .install })
+    }
+
+    @Test func uninstallUnregistersAutostart() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+
+        await model.uninstall()
+
+        #expect(h.loginItem.unregisterCount == 1)
+    }
+
+    @Test func uninstallFailureDoesNotUnregisterAutostart() async throws {
+        // The hosts entry is still routed, so the app is still installed: keep autostart on.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.runner.error = InstallError.runnerFailed("boom")
+        let model = h.model()
+
+        await model.uninstall()
+
+        #expect(h.loginItem.unregisterCount == 0)
+    }
+
+    @Test func removeCAUnregistersAutostart() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+
+        await model.removeCA()
+
+        #expect(h.loginItem.unregisterCount == 1)
+    }
+
+    @Test func unregisterFailureBecomesWarningAndUninstallStillCompletes() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.loginItem.unregisterError = LoginItemTestError.denied
+        let model = h.model()
+
+        await model.uninstall()
+
+        // Restoring hosts is what matters; a failed autostart unregister only warns.
+        #expect(h.runner.scripts.count == 1)
+        #expect(!model.status.hostsEntry)
+        #expect(model.warnings.contains { $0.message.contains("Autostart") })
     }
 
     @Test func failedSettingsSaveBecomesWarningAndKeepsValue() throws {
@@ -512,7 +810,7 @@ struct AppModelTests {
 
         // No privileged step ran and the hosts file is left routed as it was.
         #expect(h.runner.scripts.isEmpty)
-        #expect(model.warnings.contains { $0.message.contains("Install was skipped") })
+        #expect(model.warnings.contains { $0.message.contains("Setup was skipped") })
     }
 
     @Test func installDoesNotStartAnAlreadyRunningServer() async throws {
@@ -531,14 +829,16 @@ struct AppModelTests {
         let model = h.model()
         await model.refresh()
         #expect(model.status.hostsEntry)
-        h.quitDecision.choice = .uninstallAndQuit
+        h.quitDecision.choice = .restoreAccessAndQuit
 
         await model.quit()
 
         #expect(h.quitDecision.decideCount == 1)
         #expect(h.quitDecision.terminateCount == 1)
-        // Uninstall ran before quitting, so the hosts entry and CA are removed.
-        #expect(h.runner.scripts.contains { $0.contains("delete-certificate") })
+        // Restoring access restored /etc/hosts before quitting; the CA is left for Uninstall
+        // OpenProxy... in the menu.
+        #expect(h.runner.scripts.count == 1)
+        #expect(!model.status.hostsEntry)
     }
 
     @Test func quitAnywayLeavesHostsEntryAsIs() async throws {
@@ -567,7 +867,7 @@ struct AppModelTests {
     }
 
     @Test func quitWithoutHostsEntryTerminatesWithoutPrompt() async throws {
-        let h = try Harness()
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
         let model = h.model()
         await model.refresh()
         #expect(model.status.hostsEntry == false)
@@ -578,14 +878,97 @@ struct AppModelTests {
         #expect(h.quitDecision.terminateCount == 1)
     }
 
-    @Test func uninstallAndQuitStaysRunningWhenHostsRemovalFails() async throws {
+    @Test func quitWithFailingHelperAndAbsentHostsTerminatesWithoutPopup() async throws {
+        // The helper failed, but the fresh read proves the entry is gone: no popup is needed.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("helper unavailable")
+        let model = h.model()
+        await model.refresh()
+
+        await model.quit()
+
+        #expect(h.hostsEditor.requests == [false])
+        #expect(h.quitDecision.decideCount == 0)
+        #expect(h.quitDecision.terminateCount == 1)
+        #expect(model.warnings.contains { $0.key == .quit && $0.message.contains("could not restore") })
+    }
+
+    @Test func quitWithFailingHelperAndPresentHostsShowsThePopup() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("helper unavailable")
+        h.quitDecision.choice = .cancel
+        let model = h.model()
+        await model.refresh()
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+    }
+
+    @Test func quitWithFailingHelperAndUnreadableHostsShowsThePopup() async throws {
+        // unknown is not absent: quitting could still break every client.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("helper unavailable")
+        h.quitDecision.choice = .cancel
+        try FileManager.default.removeItem(at: h.directory.appending(path: "hosts"))
+        try FileManager.default.createDirectory(
+            at: h.directory.appending(path: "hosts"), withIntermediateDirectories: true)
+        let model = h.model()
+        await model.refresh()
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains {
+            $0.key == .quit && $0.message.contains("could not confirm that openrouter.ai is no longer routed here")
+        })
+    }
+
+    @Test func quitUsesAFreshHostsStateNotTheCachedStatus() async throws {
+        // The cached status was probed while the file was clean; the entry appeared since.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        let model = h.model()
+        await model.refresh()
+        #expect(model.status.hostsEntry == false)
+        try "127.0.0.1 localhost\n127.0.0.1 openrouter.ai # openproxy\n".write(
+            to: h.directory.appending(path: "hosts"), atomically: true, encoding: .utf8)
+        h.quitDecision.choice = .cancel
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+    }
+
+    @Test func quitWithUnreadableHostsWithoutAHelperShowsThePopup() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        try FileManager.default.removeItem(at: h.directory.appending(path: "hosts"))
+        try FileManager.default.createDirectory(
+            at: h.directory.appending(path: "hosts"), withIntermediateDirectories: true)
+        h.quitDecision.choice = .cancel
+        let model = h.model()
+        await model.refresh()
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains { $0.key == .quit && $0.message.contains("could not confirm") })
+    }
+
+    @Test func restoreAccessAndQuitStaysRunningWhenHostsRemovalFails() async throws {
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
         let model = h.model()
         await model.refresh()
         #expect(model.status.hostsEntry)
         // The admin prompt for the hosts edit is dismissed: hosts is never restored.
         h.runner.error = InstallError.runnerFailed("the administrator prompt was dismissed")
-        h.quitDecision.choice = .uninstallAndQuit
+        h.quitDecision.choice = .restoreAccessAndQuit
 
         await model.quit()
 
@@ -596,23 +979,508 @@ struct AppModelTests {
         #expect(model.warnings.contains { $0.message.contains("still routed") })
     }
 
-    @Test func uninstallAndQuitStaysRunningWhenTrustCleanupFails() async throws {
+    @Test func quitWithHelperEnabledRemovesHostsSilentlyWithoutAPrompt() async throws {
+        // With the approved helper, quitting must not show the destructive-route popup: it
+        // silently restores access; the next launch's setupComplete restore puts it back.
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
         let model = h.model()
         await model.refresh()
-        #expect(model.status.hostsEntry)
-        // The hosts entry is restored, but the login-keychain trust cleanup fails.
-        h.commandRunner.errorOnContains = "remove-trusted-cert"
-        h.quitDecision.choice = .uninstallAndQuit
 
         await model.quit()
 
-        // Terminating would silently drop the trustCleanupFailed warning while per-user trust
-        // may remain, so stay running and surface it.
+        #expect(h.hostsEditor.requests == [false])
+        #expect(h.quitDecision.decideCount == 0)
+        #expect(h.quitDecision.terminateCount == 1)
+        #expect(h.runner.scripts.isEmpty)
+    }
+
+    @Test func quitWithFailingHelperFallsBackToThePopupInsteadOfTrappingTheUser() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("helper unavailable")
+        h.quitDecision.choice = .cancel
+        let model = h.model()
+        await model.refresh()
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
         #expect(h.quitDecision.terminateCount == 0)
-        #expect(!model.status.hostsEntry)
-        #expect(model.warnings.contains { $0.key == .uninstall })
         #expect(model.warnings.contains { $0.key == .quit })
+
+        h.quitDecision.choice = .quitAnyway
+        await model.quit()
+
+        #expect(h.quitDecision.terminateCount == 1)
+    }
+
+    // MARK: - Automatic setup
+
+    @Test func installSetsSetupCompleteAndRoutingActive() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.install()
+
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
+    }
+
+    @Test func setupRunsStepsInOrder() async throws {
+        let h = try Harness()
+        // Register enables the helper, so step (b) is exercised and the hosts edit goes via XPC.
+        h.helper.status = .notRegistered
+        h.helper.statusAfterRegister = .enabled
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.orderLog.sequence == ["trust", "helper", "autostart", "hosts", "nodeenv"])
+    }
+
+    @Test func installWaitsForAutostartApprovalBeforeAddingHosts() async throws {
+        // Autostart must be enabled before anything routes here: an approved-but-pending
+        // registration is a wait, and the hosts entry/Node env follow once it flips.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.loginItem.status = .requiresApproval
+        h.loginItem.statusAfterRegister = .requiresApproval
+        h.waiting.onPoll = { h.loginItem.status = .enabled }
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.loginItem.registerCount == 1)
+        #expect(h.waiting.count == 1)
+        #expect(h.helper.openApprovalCount == 1)
+        #expect(h.runner.scripts.count == 1)
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
+        #expect(!model.warnings.contains { $0.key == .autostart })
+        #expect(h.orderLog.sequence == ["trust", "helper", "autostart", "hosts", "nodeenv"])
+    }
+
+    @Test func installDoesNotRouteWhenAutostartNeedsApproval() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.loginItem.status = .requiresApproval
+        h.loginItem.statusAfterRegister = .requiresApproval
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.runner.scripts.isEmpty)
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(!model.settings.setupComplete)
+        #expect(model.routingState == .error("waiting for autostart approval timed out"))
+        #expect(model.warnings.contains { $0.key == .autostart })
+        #expect(model.warnings.contains { $0.key == .install && $0.message.contains("Timed out") })
+        #expect(!model.status.hostsEntry)
+    }
+
+    @Test func installContinuesWhenAutostartIsApprovedLater() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.loginItem.status = .requiresApproval
+        h.loginItem.statusAfterRegister = .requiresApproval
+        let model = h.model()
+        await model.install()
+        #expect(!model.settings.setupComplete)
+
+        h.loginItem.status = .enabled
+        h.loginItem.statusAfterRegister = .enabled
+        await model.install()
+
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
+        #expect(h.runner.scripts.count == 1)
+    }
+
+    @Test func installDoesNotRouteOrWaitWhenAutostartRegistrationFails() async throws {
+        // Only .requiresApproval is a wait; any other non-enabled status is a real failure and
+        // must finish at once with the registration error, no clock poll and no Login Items hop.
+        for status in [LoginItemStatus.notRegistered, .notFound, .unknown(1)] {
+            let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+            h.loginItem.registerError = LoginItemTestError.denied
+            h.loginItem.status = status
+            let model = h.model()
+
+            await model.install()
+
+            #expect(h.runner.scripts.isEmpty)
+            #expect(h.hostsEditor.requests.isEmpty)
+            #expect(!model.settings.setupComplete)
+            #expect(model.routingState == .error("autostart is \(status.label)"))
+            #expect(h.waiting.count == 0)
+            #expect(h.helper.openApprovalCount == 0)
+            #expect(model.canRetrySetup)
+            #expect(model.warnings.contains {
+                $0.key == .autostart && $0.message.contains("Autostart registration failed")
+            })
+        }
+    }
+
+    @Test func laterLaunchDoesNotRestoreHostsWithoutAutostart() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .requiresApproval
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(h.runner.scripts.isEmpty)
+        #expect(!model.status.hostsEntry)
+    }
+
+    @Test func retrySetupRunsTheSetupWithoutTheWelcomeDialog() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.loginItem.status = .requiresApproval
+        h.loginItem.statusAfterRegister = .requiresApproval
+        let model = h.model()
+        await model.install()
+        #expect(!model.settings.setupComplete)
+        #expect(model.canRetrySetup)
+        #expect(h.setupDecision.count == 0)
+
+        h.loginItem.status = .enabled
+        h.loginItem.statusAfterRegister = .enabled
+        await model.retrySetup()
+
+        #expect(h.setupDecision.count == 0)
+        #expect(model.settings.setupComplete)
+        #expect(h.runner.scripts.count == 1)
+    }
+
+    @Test func retrySetupIsNotOfferedOrRunWhenSetupIsComplete() async throws {
+        let h = try Harness()
+        let model = h.model()
+        await model.install()
+        #expect(model.settings.setupComplete)
+        #expect(model.canRetrySetup == false)
+        let scripts = h.runner.scripts.count
+
+        await model.retrySetup()
+
+        #expect(h.runner.scripts.count == scripts)
+    }
+
+    @Test func retrySetupIsNotOfferedBeforeSetupHasEverRun() async throws {
+        let h = try Harness()
+        let model = h.model()
+        #expect(model.routingState == .inactive)
+        #expect(model.canRetrySetup == false)
+
+        await model.retrySetup()
+
+        #expect(h.runner.scripts.isEmpty)
+        #expect(h.loginItem.registerCount == 0)
+        #expect(h.setupDecision.count == 0)
+    }
+
+    @Test func reinstallWithAnAlreadyEnabledHelperSkipsRegistration() async throws {
+        // Uninstall keeps the helper registered, so the next setup finds it .enabled and must
+        // not register again: re-registering an enabled daemon is what made launchd refuse to
+        // spawn it until the user toggled OpenProxy in Login Items by hand.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.helper.registerCount == 0)
+        #expect(h.hostsEditor.requests == [true])
+        #expect(h.runner.scripts.isEmpty)
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
+    }
+
+    @Test func setupSkipsTheTrustDialogWhenTheCAIsAlreadyTrusted() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.install()
+
+        #expect(!h.commandRunner.commands.contains { $0.contains("add-trusted-cert") })
+    }
+
+    @Test func approvalPendingThenEnabledContinuesAutomatically() async throws {
+        let h = try Harness()
+        h.helper.status = .requiresApproval
+        h.waiting.onPoll = { [weak helper = h.helper] in helper?.status = .enabled }
+        let model = h.model(maxApprovalPolls: 3)
+
+        await model.install()
+
+        #expect(h.helper.openApprovalCount == 1)
+        #expect(h.waiting.count >= 1)
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
+        #expect(h.hostsEditor.requests == [true])
+    }
+
+    @Test func approvalTimeoutLeavesSetupIncomplete() async throws {
+        let h = try Harness()
+        h.helper.status = .requiresApproval
+        let model = h.model(maxApprovalPolls: 2)
+
+        await model.install()
+
+        #expect(!model.settings.setupComplete)
+        #expect(model.warnings.contains { $0.message.contains("Login Items") })
+        #expect(h.loginItem.registerCount == 0)
+    }
+
+    @Test func laterLaunchRestoresRoutingWhenSetupComplete() async throws {
+        let h = try Harness()
+        h.helper.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.hostsEditor.requests == [true])
+        #expect(model.routingState == .active)
+        #expect(h.runner.scripts.isEmpty)
+    }
+
+    @Test func launchDoesNotRestoreWhenTheProxyCannotListen() async throws {
+        let h = try Harness()
+        h.helper.status = .enabled
+        h.server.startError = PortInUse()
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        // Routing to a dead listener would block every client, so the entry is never added.
+        #expect(h.hostsEditor.requests.isEmpty)
+    }
+
+    @Test func launchDoesNotRestoreWithoutAHelper() async throws {
+        let h = try Harness()
+        h.helper.status = .notFound
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(h.runner.scripts.isEmpty)
+    }
+
+    @Test func launchDoesNotRestoreBeforeSetupComplete() async throws {
+        let h = try Harness()
+        h.helper.status = .enabled
+        let model = h.model()
+
+        await model.start()
+
+        #expect(h.hostsEditor.requests.isEmpty)
+    }
+
+    // MARK: - Welcome alert
+
+    @Test func firstLaunchAsksWelcomeAndSetupCompletes() async throws {
+        let h = try Harness()
+        h.setupDecision.confirm = true
+        let model = h.model()
+
+        await model.start()
+
+        #expect(h.setupDecision.count == 1)
+        #expect(model.settings.setupComplete)
+    }
+
+    @Test func notNowSkipsSetupAndAsksAgainNextLaunch() async throws {
+        let h = try Harness()
+        h.setupDecision.confirm = false
+        let first = h.model()
+        await first.start()
+        #expect(first.settings.setupComplete == false)
+        #expect(h.loginItem.registerCount == 0)
+        #expect(h.hostsEditor.requests.isEmpty)
+
+        h.setupDecision.confirm = true
+        let second = h.model()
+        await second.start()
+
+        #expect(h.setupDecision.count == 2)
+        #expect(second.settings.setupComplete)
+    }
+
+    // MARK: - Uninstall OpenProxy
+
+    @Test func uninstallCancelDoesNothing() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.uninstallDecision.confirm = false
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.uninstallDecision.count == 1)
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(h.quitDecision.terminateCount == 0)
+    }
+
+    @Test func uninstallRunsTheFullTeardownInOrderAndTerminates() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.uninstallDecision.confirm = true
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.orderLog.sequence == ["hosts", "autostart", "ca", "data", "quit"])
+        #expect(h.dataRemover.count == 1)
+        #expect(h.quitDecision.terminateCount == 1)
+        // Uninstall keeps the helper: unregistering it would make the next setup toggle
+        // OpenProxy in Login Items through the launch-constraint dance.
+        #expect(h.helper.status == .enabled)
+        #expect(h.helper.registerCount == 0)
+    }
+
+    @Test func uninstallStopsWhenHostsRemovalFailedAndEntryRemains() async throws {
+        // The safety-critical step: if /etc/hosts still routes openrouter.ai, continuing would
+        // drop autostart and the CA while every client is pointed at a dead proxy.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("hosts locked")
+        h.uninstallDecision.confirm = true
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.loginItem.unregisterCount == 0)
+        #expect(h.runner.scripts.isEmpty)
+        #expect(h.dataRemover.count == 0)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains { $0.key == .uninstall && $0.message.contains("Uninstall stopped") })
+        #expect(model.routingState == .error("uninstall stopped: /etc/hosts could not be restored"))
+    }
+
+    @Test func uninstallContinuesWhenHostsRemovalThrewButEntryIsGone() async throws {
+        // The call reported an error, but the entry really is gone: the step succeeded.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("hosts locked")
+        h.uninstallDecision.confirm = true
+        try "127.0.0.1 localhost\n".write(
+            to: h.directory.appending(path: "hosts"), atomically: true, encoding: .utf8)
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.loginItem.unregisterCount == 1)
+        #expect(h.dataRemover.count == 1)
+        #expect(h.quitDecision.terminateCount == 1)
+        #expect(!model.warnings.contains { $0.key == .uninstall })
+    }
+
+    @Test func uninstallStopsWhenHostsStateIsUnknownAfterFailedRemoval() async throws {
+        // The removal failed and the state cannot be confirmed (undecodable bytes): the only
+        // safe choice is to stop, exactly as when the entry is known to remain.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("hosts locked")
+        h.uninstallDecision.confirm = true
+        try Data([0xFF, 0xFE, 0x00]).write(to: h.directory.appending(path: "hosts"))
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.loginItem.unregisterCount == 0)
+        #expect(h.runner.scripts.isEmpty)
+        #expect(h.dataRemover.count == 0)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains {
+            $0.key == .uninstall && $0.message.contains("could not confirm that /etc/hosts was restored")
+        })
+        #expect(model.routingState == .error("uninstall stopped: /etc/hosts could not be restored"))
+    }
+
+    @Test func uninstallStopsWhenHostsFileIsUnreadableAfterFailedRemoval() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("hosts locked")
+        h.uninstallDecision.confirm = true
+        // The file is gone and a directory (unreadable as hosts text) sits at the path.
+        try FileManager.default.removeItem(at: h.directory.appending(path: "hosts"))
+        try FileManager.default.createDirectory(
+            at: h.directory.appending(path: "hosts"), withIntermediateDirectories: true)
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.loginItem.unregisterCount == 0)
+        #expect(h.dataRemover.count == 0)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains { $0.key == .uninstall && $0.message.contains("could not confirm") })
+    }
+
+    @Test func uninstallWithAnyFailingStepDoesNotWipeDataOrTerminate() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.uninstallDecision.confirm = true
+        // The CA teardown's osascript fails.
+        h.runner.error = InstallError.runnerFailed("boom")
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.hostsEditor.requests == [false])
+        #expect(h.loginItem.unregisterCount == 1)
+        #expect(h.dataRemover.count == 0)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains { $0.key == .uninstall && $0.message.contains("Uninstall incomplete") })
+        #expect(model.routingState == .error("uninstall incomplete"))
+    }
+
+    @Test func uninstallDataFailureKeepsRunningAndListsTheStep() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.uninstallDecision.confirm = true
+        h.dataRemover.error = InstallError.runnerFailed("locked")
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.dataRemover.count == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains { $0.key == .uninstall && $0.message.contains("OpenProxy data") })
+    }
+
+    @Test func removeCAClearsWarningsOnSuccessAndKeepsTheHelperRegistered() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        let model = h.model()
+
+        await model.removeCA()
+
+        #expect(h.helper.status == .enabled)
+        #expect(h.helper.registerCount == 0)
+        #expect(model.warnings.isEmpty)
+    }
+
+    @Test func removeCAFailureBecomesWarning() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.runner.error = InstallError.runnerFailed("boom")
+        let model = h.model()
+
+        await model.removeCA()
+
+        #expect(model.warnings.contains {
+            $0.key == .uninstall && $0.message.contains("Removing the CA")
+        })
+    }
+
+    @Test func refreshReportsHelperStatus() async throws {
+        let h = try Harness()
+        h.helper.status = .requiresApproval
+        let model = h.model()
+
+        await model.refresh()
+
+        #expect(model.helperStatus == .requiresApproval)
     }
 
     // MARK: - Item 1: keyed warnings clear on success
@@ -697,5 +1565,114 @@ struct AppModelTests {
         #expect(h.runner.scripts.count == 1)
         #expect(model.warnings.contains { $0.key == .nodeEnv })
         #expect(!model.warnings.contains { $0.key == .install })
+    }
+}
+
+@Suite("AppGraph")
+struct AppGraphTests {
+    @Test func aBundleShippingTheDaemonPlistIsTreatedAsBundled() throws {
+        let bundle = FileManager.default.temporaryDirectory.appending(path: "Fake-\(UUID().uuidString).app")
+        let daemonDir = bundle.appending(path: "Contents/Library/LaunchDaemons")
+        try FileManager.default.createDirectory(at: daemonDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: bundle) }
+
+        #expect(AppGraph.helperIsBundled(inBundleAt: bundle) == false)
+        try Data().write(to: daemonDir.appending(path: "dev.openproxy.helper.plist"))
+        #expect(AppGraph.helperIsBundled(inBundleAt: bundle))
+    }
+}
+
+/// The production full-uninstall wipe against real temp directories: only a missing directory
+/// is a success, every other listing or removal error must surface so the app does not quit
+/// with its data still on disk.
+@Suite("AppSupportDataRemover")
+struct AppSupportDataRemoverTests {
+    private func makeDirectory() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "openproxy-data-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    @Test func removesEveryFileInTheDirectory() throws {
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path) }
+        try Data("ca".utf8).write(to: dir.appending(path: "ca.pem"))
+        try Data("stats".utf8).write(to: dir.appending(path: "stats.sqlite"))
+
+        try AppSupportDataRemover(directory: dir).removeAppData()
+
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+    }
+
+    @Test func aMissingDirectoryIsFine() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "openproxy-data-\(UUID().uuidString)")
+        try AppSupportDataRemover(directory: dir).removeAppData()
+    }
+
+    @Test func anUnreadableDirectoryThrows() throws {
+        guard getuid() != 0 else { return } // chmod does not restrict root
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: dir.path)
+
+        #expect(throws: (any Error).self) {
+            try AppSupportDataRemover(directory: dir).removeAppData()
+        }
+    }
+
+    @Test func aRemovalFailureThrows() throws {
+        guard getuid() != 0 else { return }
+        // Listing works (r-x) but unlinking needs write on the parent, so the removal fails.
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path) }
+        try Data("ca".utf8).write(to: dir.appending(path: "ca.pem"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+
+        #expect(throws: (any Error).self) {
+            try AppSupportDataRemover(directory: dir).removeAppData()
+        }
+    }
+
+    @Test func aSymlinkedDirectoryIsRefusedAndItsTargetUntouched() throws {
+        let target = try makeDirectory()
+        let precious = target.appending(path: "precious.txt")
+        try Data("keep me".utf8).write(to: precious)
+        let link = FileManager.default.temporaryDirectory.appending(path: "openproxy-data-link-\(UUID().uuidString)")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        defer { try? FileManager.default.removeItem(at: link); try? FileManager.default.removeItem(at: target) }
+
+        #expect(throws: DataRemovalError.self) {
+            try AppSupportDataRemover(directory: link).removeAppData()
+        }
+
+        #expect(FileManager.default.fileExists(atPath: precious.path))
+        #expect(try String(contentsOf: precious, encoding: .utf8) == "keep me")
+    }
+
+    @Test func aPathThatIsNotADirectoryIsRefused() throws {
+        let file = FileManager.default.temporaryDirectory.appending(path: "openproxy-data-file-\(UUID().uuidString)")
+        try Data("not a directory".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        #expect(throws: DataRemovalError.self) {
+            try AppSupportDataRemover(directory: file).removeAppData()
+        }
+        #expect(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    @Test func aSymlinkInsideIsRemovedAsALinkAndItsTargetUntouched() throws {
+        let dir = try makeDirectory()
+        let target = try makeDirectory()
+        let precious = target.appending(path: "precious.txt")
+        try Data("keep me".utf8).write(to: precious)
+        try FileManager.default.createSymbolicLink(
+            at: dir.appending(path: "linked"), withDestinationURL: target)
+        try Data("ca".utf8).write(to: dir.appending(path: "ca.pem"))
+        defer { try? FileManager.default.removeItem(at: dir); try? FileManager.default.removeItem(at: target) }
+
+        try AppSupportDataRemover(directory: dir).removeAppData()
+
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+        #expect(FileManager.default.fileExists(atPath: precious.path))
     }
 }

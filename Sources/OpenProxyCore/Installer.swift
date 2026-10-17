@@ -239,6 +239,14 @@ public struct OsascriptRunner: PrivilegedRunner {
     }
 }
 
+/// Whether the managed `/etc/hosts` line is present. `unknown` when the file cannot be read
+/// or decoded, so a caller never mistakes a failed read for "restored".
+public enum HostsEntryState: Equatable, Sendable {
+    case present
+    case absent
+    case unknown
+}
+
 public struct InstallStatus: Equatable, Sendable {
     /// Really trusted (`security verify-cert -p basic`), not merely present in a keychain.
     public var caTrusted: Bool
@@ -260,8 +268,9 @@ public struct InstallStatus: Equatable, Sendable {
 public enum InstallError: Error, Equatable, Sendable {
     case runnerFailed(String)
     case commandFailed(command: String, status: Int32)
-    /// The safety-critical hosts restore succeeded, but leftover CA trust cleanup did not.
-    case trustCleanupFailed(String)
+    /// One or more CA-cleanup steps failed. Lists every failed step, so a trust-cleanup error
+    /// is never swallowed behind an earlier one.
+    case caRemovalFailed(String)
 }
 
 extension InstallError: CustomStringConvertible {
@@ -271,9 +280,8 @@ extension InstallError: CustomStringConvertible {
         switch self {
         case .runnerFailed(let message): return message
         case .commandFailed(let command, let status): return "Command failed with status \(status): \(command)"
-        case .trustCleanupFailed(let detail):
-            return "openrouter.ai access was restored, but removing the CA trust did not fully "
-                + "succeed: \(detail)"
+        case .caRemovalFailed(let detail):
+            return "Removing the CA did not fully succeed: \(detail)"
         }
     }
 }
@@ -295,19 +303,33 @@ public final class Installer: @unchecked Sendable {
     private let runner: PrivilegedRunner
     private let commandRunner: CommandRunning
     private let hostsPath: String
+    /// Optional so every existing test/behavior keeps the legacy osascript path; when both are
+    /// present the hosts edit goes through the approved root helper instead (no password).
+    private let hostsEditor: HostsEditing?
+    private let helper: HelperRegistering?
+    /// False for a built app that ships the root helper: an unavailable helper is then an
+    /// error, never the legacy osascript admin-password prompt. True for tests and for an
+    /// unbundled `swift run`, which has no helper to register.
+    private let allowPasswordFallback: Bool
 
     public init(
         caPEMURL: URL,
         caCommonName: String = "OpenProxy Local CA",
         runner: PrivilegedRunner,
         commandRunner: CommandRunning,
-        hostsPath: String = "/etc/hosts"
+        hostsPath: String = "/etc/hosts",
+        hostsEditor: HostsEditing? = nil,
+        helper: HelperRegistering? = nil,
+        allowPasswordFallback: Bool = true
     ) {
         self.caPEMURL = caPEMURL
         self.caCommonName = caCommonName
         self.runner = runner
         self.commandRunner = commandRunner
         self.hostsPath = hostsPath
+        self.hostsEditor = hostsEditor
+        self.helper = helper
+        self.allowPasswordFallback = allowPasswordFallback
     }
 
     /// Phase 1 trusts the CA in the user's login keychain (user-domain trust, no `-d`) and
@@ -319,34 +341,11 @@ public final class Installer: @unchecked Sendable {
     /// in the menu instead of failing the install.
     @discardableResult
     public func install() async throws -> [String] {
-        let trustedCopy = try privateCopyOfCA()
-        defer { try? FileManager.default.removeItem(at: trustedCopy.deletingLastPathComponent()) }
+        try await trustCA()
 
-        let add = await commandRunner.run(
-            Self.addTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
-        guard add.succeeded else {
-            throw InstallError.runnerFailed(Self.trustFailureMessage(add))
-        }
-        let verify = await commandRunner.run(
-            Self.verifyTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
-        guard verify.succeeded else {
-            throw InstallError.runnerFailed(
-                "The CA was added to the login keychain but could not be verified as trusted: "
-                    + verify.failureDetail)
-        }
-
-        // `set -e` aborts at the first failed step; the trailing flushcache can no longer mask
-        // an earlier hosts failure. No keychain command runs privileged anymore.
-        let script = """
-        set -e
-        \(Self.hostsEditScript(hostsPath: hostsPath, adding: true))
-        dscacheutil -flushcache
-        """
-        do {
-            try await runner.run(script: script)
-        } catch {
-            throw InstallError.runnerFailed(String(describing: error))
-        }
+        // Phase 2: the hosts entry, through the approved root helper when it is available
+        // (no password), otherwise the legacy osascript script.
+        try await setHostsEntry(present: true)
 
         // Trust and hosts are in place; finally point new processes at the CA so Node clients
         // started afterwards trust it. Unprivileged and non-fatal: a failure never rolls back
@@ -356,6 +355,31 @@ public final class Installer: @unchecked Sendable {
             return []
         } catch {
             return ["Could not set NODE_EXTRA_CA_CERTS: \(error)."]
+        }
+    }
+
+    /// Phase 1 of install, exposed for the automatic setup flow: trust the CA in the login
+    /// keychain. Verify first, so an already-trusted CA never reopens the Certificate Trust
+    /// Settings dialog; only a failing verify runs `add-trusted-cert`, then verifies again.
+    public func trustCA() async throws {
+        let trustedCopy = try privateCopyOfCA()
+        defer { try? FileManager.default.removeItem(at: trustedCopy.deletingLastPathComponent()) }
+
+        let alreadyTrusted = await commandRunner.run(
+            Self.verifyTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
+        if !alreadyTrusted.succeeded {
+            let add = await commandRunner.run(
+                Self.addTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
+            guard add.succeeded else {
+                throw InstallError.runnerFailed(Self.trustFailureMessage(add))
+            }
+            let verify = await commandRunner.run(
+                Self.verifyTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
+            guard verify.succeeded else {
+                throw InstallError.runnerFailed(
+                    "The CA was added to the login keychain but could not be verified as trusted: "
+                        + verify.failureDetail)
+            }
         }
     }
 
@@ -429,23 +453,126 @@ public final class Installer: @unchecked Sendable {
         text.count > limit ? String(text.prefix(limit)) + "…" : text
     }
 
-    /// Phase A (privileged) restores `/etc/hosts` first — the critical safety path — then
-    /// best-effort clears any admin trust settings an old `add-trusted-cert -d` install left,
-    /// and sweeps a leftover CA from the System keychain; phase B (unprivileged) removes the
-    /// user-domain trust and the login-keychain certificate. Hosts restore must never be
-    /// blocked by the sweeps, and a leftover cleanup failure must be reported, not swallowed.
-    public func uninstall() async throws {
-        // Item 3 / TOCTOU: never point the privileged `remove-trusted-cert -d` at the
-        // user-writable ca.pem. Validate the file against the CA's own SHA-256 fingerprint,
-        // then drop admin trust for a root-owned copy, so a swap before the admin prompt
-        // cannot make root untrust some other certificate.
-        let fingerprint = (try? String(contentsOf: caPEMURL, encoding: .utf8))
-            .flatMap(Self.sha256Fingerprint(ofPEM:))
+    /// Adds or removes the managed `/etc/hosts` line. This is the one place the app edits
+    /// hosts, shared by install/uninstall, the launch-time silent restore, and Quit.
+    ///
+    /// Route: an `enabled` helper edits without a password; `notRegistered` registers first
+    /// and re-reads the status; `requiresApproval` opens Login Items and throws (never
+    /// silently falls back to a password prompt); `notFound`/unknown use the legacy osascript
+    /// path. An `enabled` helper that fails is surfaced, never downgraded to osascript.
+    public func setHostsEntry(present: Bool) async throws {
+        switch try resolveHostsRoute() {
+        case .helper:
+            guard let hostsEditor else {
+                try await runHostsScript(present: present)
+                return
+            }
+            do {
+                try await hostsEditor.setHostsEntry(present: present)
+            } catch let error as HostsEditingError {
+                switch error {
+                case .timedOut, .connectionFailed:
+                    // The daemon is enabled but launchd could not spawn it (its signature was
+                    // not recorded when macOS auto-enabled it). Only toggling the Login Items
+                    // switch fixes that, so open settings and say so; never use osascript.
+                    helper?.openApprovalSettings()
+                    throw InstallError.runnerFailed(Self.helperNotRespondingMessage)
+                case .helperFailed:
+                    // The helper answered with an error; it is running, so settings will not help.
+                    throw InstallError.runnerFailed(String(describing: error))
+                }
+            } catch {
+                throw InstallError.runnerFailed(String(describing: error))
+            }
+        case .osascript:
+            try await runHostsScript(present: present)
+        }
+    }
+
+    private enum HostsRoute {
+        case helper
+        case osascript
+    }
+
+    /// The helper's readiness without throwing, for the automatic setup flow (which waits for
+    /// approval instead of failing). Registers once and re-reads, mirroring `resolveHostsRoute`.
+    public enum HelperReadiness: Equatable, Sendable {
+        case enabled
+        case requiresApproval
+        /// No real bundle (or registration did not enable it): the osascript fallback applies.
+        case unavailable
+    }
+
+    public func helperReadiness() -> HelperReadiness {
+        guard let helper else { return .unavailable }
+        switch helper.status {
+        case .enabled:
+            return .enabled
+        case .requiresApproval:
+            return .requiresApproval
+        case .notRegistered, .notFound, .unknown:
+            // SMAppService can throw and still leave .requiresApproval (approval pending), so
+            // re-read the status whether register() threw or not.
+            try? helper.register()
+            switch helper.status {
+            case .enabled:
+                return .enabled
+            case .requiresApproval:
+                return .requiresApproval
+            default:
+                return .unavailable
+            }
+        }
+    }
+
+    /// Opens System Settings -> Login Items so the user can flip the one-time switch.
+    public func openHelperApprovalSettings() {
+        helper?.openApprovalSettings()
+    }
+
+    private func resolveHostsRoute() throws -> HostsRoute {
+        switch helperReadiness() {
+        case .enabled:
+            return .helper
+        case .requiresApproval:
+            helper?.openApprovalSettings()
+            throw InstallError.runnerFailed(Self.approvalMessage)
+        case .unavailable:
+            // A bundled app must never pop the admin-password dialog the helper exists to
+            // replace; only an unbundled `swift run` keeps that legacy fallback.
+            guard allowPasswordFallback else {
+                throw InstallError.runnerFailed(Self.helperUnavailableMessage(
+                    status: helper?.status.label ?? "no helper available"))
+            }
+            return .osascript
+        }
+    }
+
+    /// The one-time approval is a user action, so the error tells them exactly what to do.
+    static let approvalMessage =
+        "OpenProxy needs one-time approval to change /etc/hosts without a password. "
+        + "Open System Settings -> Login Items, turn on OpenProxy, then choose Retry setup "
+        + "in the OpenProxy menu. Setup also continues automatically once the approval arrives."
+
+    /// An enabled helper whose signature was not recorded when macOS auto-enabled it (the
+    /// Remove CA -> Install again case): launchd fails to spawn it, so the XPC call times out
+    /// and only toggling the Login Items switch fixes it. Never falls back to osascript.
+    static let helperNotRespondingMessage =
+        "The OpenProxy helper is not responding. In System Settings -> Login Items turn OpenProxy off and on again, then choose Retry setup in the OpenProxy menu."
+
+    /// A bundled app's helper could not be registered at all: there is no password fallback,
+    /// so say what failed and how to try again.
+    static func helperUnavailableMessage(status: String) -> String {
+        "The OpenProxy helper could not be registered (status: \(status)). "
+            + "Choose Retry setup in the OpenProxy menu."
+    }
+
+    /// The legacy privileged edit: one `osascript` shell script, `set -e` at the front so the
+    /// trailing flush can never mask an earlier hosts failure.
+    private func runHostsScript(present: Bool) async throws {
         let script = """
         set -e
-        \(Self.hostsEditScript(hostsPath: hostsPath, adding: false))
-        \(Self.removeAdminTrustScript(caPEMURL: caPEMURL, expectedFingerprint: fingerprint))
-        \(Self.deleteCertificatesScript(commonName: caCommonName, keychain: "/Library/Keychains/System.keychain"))
+        \(Self.hostsEditScript(hostsPath: hostsPath, adding: present))
         dscacheutil -flushcache
         """
         do {
@@ -453,11 +580,96 @@ public final class Installer: @unchecked Sendable {
         } catch {
             throw InstallError.runnerFailed(String(describing: error))
         }
-        // The hosts entry is already gone at this point, so this is a warning-level failure
-        // (never a rollback), but it must not be reported as a clean success either.
-        if let failure = await removeUserDomainTrust() {
-            throw InstallError.trustCleanupFailed(failure)
+    }
+
+    /// Removes only the `/etc/hosts` entry, leaving the CA in place. No keychain command runs
+    /// and, when the helper is enabled, no password prompt appears.
+    public func uninstall() async throws {
+        try await setHostsEntry(present: false)
+    }
+
+    /// Phase A (privileged) restores `/etc/hosts` first — the critical safety path — then
+    /// best-effort clears any admin trust settings an old `add-trusted-cert -d` install left,
+    /// and sweeps a leftover CA from the System keychain; phase B (unprivileged) removes the
+    /// user-domain trust and the login-keychain certificate. Hosts restore must never be
+    /// blocked by the sweeps, and a leftover cleanup failure must be reported, not swallowed.
+    /// The privileged phase runs only when `needsPrivilegedCleanup()` finds something there,
+    /// so a plain per-user uninstall never shows the admin password prompt. The root helper
+    /// stays registered (idle, it only edits the one hosts line on request); unregistering it
+    /// would force the next setup through the Launch Items toggle dance.
+    public func removeCA() async throws {
+        // Item 3 / TOCTOU: never point the privileged `remove-trusted-cert -d` at the
+        // user-writable ca.pem. Validate the file against the CA's own SHA-256 fingerprint,
+        // then drop admin trust for a root-owned copy, so a swap before the admin prompt
+        // cannot make root untrust some other certificate.
+        var failures: [String] = []
+        if await needsPrivilegedCleanup() {
+            let fingerprint = (try? String(contentsOf: caPEMURL, encoding: .utf8))
+                .flatMap(Self.sha256Fingerprint(ofPEM:))
+            let script = """
+            set -e
+            \(Self.hostsEditScript(hostsPath: hostsPath, adding: false))
+            \(Self.removeAdminTrustScript(caPEMURL: caPEMURL, expectedFingerprint: fingerprint))
+            \(Self.deleteCertificatesScript(commonName: caCommonName, keychain: "/Library/Keychains/System.keychain"))
+            dscacheutil -flushcache
+            """
+            do {
+                try await runner.run(script: script)
+            } catch {
+                failures.append("privileged cleanup: \(error)")
+            }
         }
+        if let failure = await removeUserDomainTrust() {
+            failures.append(failure)
+        }
+        guard failures.isEmpty else {
+            throw InstallError.caRemovalFailed(failures.joined(separator: "; "))
+        }
+    }
+
+    /// Whether the privileged domains still have something to clean: a certificate with our
+    /// name in the System keychain, admin-domain trust for our CA, or a hosts line still routed
+    /// here. All probes are unprivileged, so a false answer means `removeCA()` can skip the
+    /// admin password prompt entirely. A probe that fails for any reason other than
+    /// "nothing there" reads as true: cleaning unnecessarily is safer than leaving trust behind.
+    public func needsPrivilegedCleanup() async -> Bool {
+        // (c) A hosts line still routed here must be restored (and `.unknown` is not proof).
+        switch hostsEntryState() {
+        case .present, .unknown: return true
+        case .absent: break
+        }
+        // (a) Our certificate in the System keychain.
+        let systemCert = await commandRunner.run(
+            "security find-certificate -c \(Self.quoted(caCommonName)) /Library/Keychains/System.keychain",
+            timeout: Self.statusTimeout)
+        if systemCert.succeeded { return true }
+        guard Self.reportsNothingToClean(systemCert) else { return true }
+        // (b) Admin-domain trust settings naming our CA.
+        let adminTrust = await commandRunner.run(
+            "security dump-trust-settings -d", timeout: Self.statusTimeout)
+        if adminTrust.succeeded { return adminTrust.standardOutput.contains(caCommonName) }
+        return !Self.reportsNothingToClean(adminTrust)
+    }
+
+    /// The two ways a `security` probe reports "nothing here": an item that could not be found
+    /// (find-certificate) and an empty trust-settings domain (dump-trust-settings). Both are
+    /// expected answers, not probe failures.
+    static func reportsNothingToClean(_ result: CommandResult) -> Bool {
+        let text = (result.standardError + "\n" + result.standardOutput).lowercased()
+        return text.contains("could not be found") || text.contains("no trust settings")
+    }
+
+    /// Whether the managed hosts entry is present, absent, or could not be determined.
+    /// Read-only, no status probes; the uninstall flow uses it to tell a failed removal that
+    /// really left the entry behind from one that reported an error but removed it anyway.
+    public func hostsEntryState() -> HostsEntryState {
+        guard let text = Self.readHosts(hostsPath) else { return .unknown }
+        return HostsFile.isPresent(in: text) ? .present : .absent
+    }
+
+    /// The legacy Bool view: `unknown` is not present. New safety decisions use the state.
+    public func hostsEntryPresent() -> Bool {
+        hostsEntryState() == .present
     }
 
     /// Drops admin-domain trust that an older `add-trusted-cert -d` install left. The privileged
@@ -592,7 +804,9 @@ public final class Installer: @unchecked Sendable {
         return InstallStatus(
             caTrusted: trust.succeeded,
             caPresent: loginFind.succeeded || systemFind.succeeded,
-            hostsEntry: HostsFile.isPresent(in: Self.readHosts(hostsPath)),
+            // Unknown maps to not present here: status() only reports, and every caller of
+            // InstallStatus.hostsEntry reads a true as "routed".
+            hostsEntry: HostsFile.isPresent(in: Self.readHosts(hostsPath) ?? ""),
             portListening: port.succeeded,
             nodeCAEnv: !nodeEnv.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         )
@@ -611,10 +825,11 @@ public final class Installer: @unchecked Sendable {
         "launchctl setenv NODE_EXTRA_CA_CERTS \(quoted(caPEMURL.path))"
     }
 
-    /// Read-only view for `status()` only. Never used to build a write: a read error must not
-    /// become empty hosts text.
-    private static func readHosts(_ path: String) -> String {
-        (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+    /// Read-only view for `status()` and the hosts-entry state. Never used to build a write:
+    /// a read error must not become empty hosts text. nil means the file could not be read or
+    /// decoded, which callers must treat as "unknown", never as "absent".
+    private static func readHosts(_ path: String) -> String? {
+        try? String(contentsOfFile: path, encoding: .utf8)
     }
 
     /// Single-quotes a value for `/bin/sh`, the only quoting that survives arbitrary text.

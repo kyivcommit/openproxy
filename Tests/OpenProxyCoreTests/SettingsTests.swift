@@ -94,6 +94,29 @@ struct SettingsTests {
         #expect(SettingsStore(url: url).settings == Settings())
     }
 
+    @Test func setupCompleteDefaultsOffAndRoundTrips() throws {
+        // A fresh install has not been set up yet; only a successful automatic setup sets it.
+        #expect(Settings().setupComplete == false)
+
+        let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = SettingsStore(url: url)
+        var settings = Settings()
+        settings.setupComplete = true
+        store.settings = settings
+        try store.save()
+        #expect(SettingsStore(url: url).settings.setupComplete)
+    }
+
+    @Test func decodedSettingsTolerateMissingSetupCompleteAndOldRouteOnLaunch() throws {
+        // An older settings.json predates setupComplete and may still carry routeOnLaunch;
+        // both must decode without failing, defaulting setupComplete off.
+        let settings = try JSONDecoder().decode(
+            Settings.self, from: Data(#"{"sort":"price","routeOnLaunch":true}"#.utf8))
+        #expect(settings.setupComplete == false)
+        #expect(settings.sort == .price)
+    }
+
     @Test func tierAvailabilityFields() {
         let availability = TierAvailability(hasFlex: true, hasPriority: false)
         #expect(availability.hasFlex)

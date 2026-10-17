@@ -10,10 +10,20 @@ public enum AppGraph {
             .appending(path: "openproxy")
     }
 
+    /// True when the app bundle at `bundleURL` ships the helper's launch daemon plist, i.e. this
+    /// is a built OpenProxy.app. A plain `swift run` has no such bundle, so there the legacy
+    /// osascript fallback stays available; in a built app the helper must work.
+    static func helperIsBundled(inBundleAt bundleURL: URL = Bundle.main.bundleURL) -> Bool {
+        FileManager.default.fileExists(atPath: bundleURL
+            .appending(path: "Contents/Library/LaunchDaemons/dev.openproxy.helper.plist").path)
+    }
+
     @MainActor
     public static func makeModel(
         baseDirectory: URL = AppGraph.defaultBaseDirectory,
-        quitDecision: QuitDecision
+        quitDecision: QuitDecision,
+        setupDecision: SetupDecision = NoSetupDecision(),
+        uninstallDecision: UninstallDecision = NoUninstallDecision()
     ) throws -> AppModel {
         // On a clean install this directory does not exist yet, and SQLite cannot
         // create stats.sqlite in a missing directory. Create it owner-only first.
@@ -30,7 +40,13 @@ public enum AppGraph {
         let catalog = EndpointCatalog(
             fetcher: UpstreamEndpointsFetcher(client: upstream),
             ttl: { [settingsStore] in TimeInterval(settingsStore.settings.pollMinutes * 60) })
-        let installer = Installer(ca: ca, runner: OsascriptRunner())
+        let installer = Installer(
+            caPEMURL: ca.caCertificatePEMURL,
+            runner: OsascriptRunner(),
+            commandRunner: ShellCommandRunner(),
+            hostsEditor: XPCHostsEditor(),
+            helper: SMAppServiceDaemon(),
+            allowPasswordFallback: !helperIsBundled())
         let server = ProxyServer(
             ca: ca,
             upstream: upstream,
@@ -41,6 +57,11 @@ public enum AppGraph {
         return AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: SMAppServiceLoginItem(), quitDecision: quitDecision,
+            helper: SMAppServiceDaemon(),
+            setupDecision: setupDecision,
+            uninstallDecision: uninstallDecision,
+            dataRemover: AppSupportDataRemover(directory: baseDirectory),
+            waiting: RealSetupWaiting(),
             caWasRegenerated: ca.didRotateLegacyCA)
     }
 

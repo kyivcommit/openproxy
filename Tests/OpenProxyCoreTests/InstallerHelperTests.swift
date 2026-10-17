@@ -1,0 +1,641 @@
+import Foundation
+import Testing
+
+@testable import OpenProxyCore
+
+/// Installer routing through the approved root helper. The legacy osascript path is the
+/// fallback; these tests pin which path runs for each `HelperStatus`, and that an enabled
+/// helper's XPC failure is surfaced instead of silently prompting for a password.
+@Suite("InstallerHelperRouting")
+struct InstallerHelperRoutingTests {
+    private let hostsEntry = "127.0.0.1 openrouter.ai # openproxy"
+
+    private final class RecordingRunner: PrivilegedRunner, @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: [String] = []
+        var error: Error?
+
+        var scripts: [String] { lock.withLock { recorded } }
+
+        func run(script: String) async throws {
+            lock.withLock { recorded.append(script) }
+            if let error { throw error }
+        }
+    }
+
+    private final class SucceedingCommandRunner: CommandRunning, @unchecked Sendable {
+        /// Makes any command containing this text fail, for the trust-cleanup failure paths.
+        var failingContains: String?
+
+        func run(_ command: String, timeout: Duration) async -> CommandResult {
+            if let failingContains, command.contains(failingContains) {
+                return CommandResult(status: 1, standardError: "denied")
+            }
+            return CommandResult(status: 0)
+        }
+    }
+
+    private final class FakeHostsEditor: HostsEditing, @unchecked Sendable {
+        var error: Error?
+        private let lock = NSLock()
+        private var recorded: [Bool] = []
+
+        var requests: [Bool] { lock.withLock { recorded } }
+
+        func setHostsEntry(present: Bool) async throws {
+            lock.withLock { recorded.append(present) }
+            if let error { throw error }
+        }
+    }
+
+    private final class FakeHelper: HelperRegistering, @unchecked Sendable {
+        var status: HelperStatus
+        /// What `register()` reports the status as on the immediate re-read.
+        var statusAfterRegister: HelperStatus?
+        var registerError: Error?
+        private(set) var registerCount = 0
+        private(set) var openApprovalCount = 0
+
+        init(status: HelperStatus) { self.status = status }
+
+        func register() throws {
+            registerCount += 1
+            // SMAppService can throw and still change the status (approval pending), so apply
+            // the new status before propagating the error.
+            if let statusAfterRegister { status = statusAfterRegister }
+            if let registerError { throw registerError }
+        }
+
+        func openApprovalSettings() { openApprovalCount += 1 }
+    }
+
+    private struct EditorFailure: Error {}
+
+    /// A real on-disk CA so `install()`'s fingerprint check has a certificate to read.
+    private static let caURL: URL = {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "openproxy-helper-ca-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let ca = CertAuthority(directory: dir)
+        try? ca.loadOrCreate()
+        return ca.caCertificatePEMURL
+    }()
+
+    private func makeHostsFile(_ content: String) throws -> String {
+        let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).hosts")
+        try Data(content.utf8).write(to: url)
+        return url.path
+    }
+
+    private func makeInstaller(
+        runner: RecordingRunner,
+        hostsPath: String,
+        commandRunner: CommandRunning = SucceedingCommandRunner(),
+        editor: HostsEditing? = nil,
+        helper: HelperRegistering? = nil,
+        allowPasswordFallback: Bool = true
+    ) -> Installer {
+        Installer(
+            caPEMURL: Self.caURL,
+            runner: runner,
+            commandRunner: commandRunner,
+            hostsPath: hostsPath,
+            hostsEditor: editor,
+            helper: helper,
+            allowPasswordFallback: allowPasswordFallback)
+    }
+
+    // MARK: - No password fallback in a bundled app
+
+    @Test func bundledAppWithoutAnAvailableHelperFailsWithoutAPasswordPrompt() async throws {
+        for status in [HelperStatus.notFound, .unknown] {
+            let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+            defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+            let runner = RecordingRunner()
+            let helper = FakeHelper(status: status)
+
+            var thrown: InstallError?
+            do {
+                try await makeInstaller(
+                    runner: runner, hostsPath: hostsPath, helper: helper,
+                    allowPasswordFallback: false).install()
+            } catch let error as InstallError {
+                thrown = error
+            }
+
+            let message = try #require(thrown?.description)
+            #expect(message.contains("could not be registered"))
+            #expect(message.contains("Retry setup"))
+            #expect(runner.scripts.isEmpty)
+        }
+    }
+
+    @Test func bundledAppWithoutAnyHelperFailsWithoutAPasswordPrompt() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        await #expect(throws: InstallError.self) {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath, allowPasswordFallback: false).install()
+        }
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func bundledAppUninstallAlsoRefusesThePasswordFallback() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let helper = FakeHelper(status: .notFound)
+
+        await #expect(throws: InstallError.self) {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath, helper: helper,
+                allowPasswordFallback: false).uninstall()
+        }
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func unbundledAppStillFallsBackToOsascript() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let helper = FakeHelper(status: .notFound)
+
+        try await makeInstaller(
+            runner: runner, hostsPath: hostsPath, helper: helper,
+            allowPasswordFallback: true).install()
+
+        #expect(runner.scripts.count == 1)
+    }
+
+    // MARK: - Install
+
+    @Test func installUsesTheHelperWhenEnabledAndSkipsOsascript() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .enabled)
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(editor.requests == [true])
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func installRegistersThenUsesTheHelperOnceEnabled() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notRegistered)
+        helper.statusAfterRegister = .enabled
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(helper.registerCount == 1)
+        #expect(editor.requests == [true])
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func installAsksForApprovalWithoutPromptingForAPassword() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notRegistered)
+        helper.statusAfterRegister = .requiresApproval
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.registerCount == 1)
+        #expect(helper.openApprovalCount == 1)
+        #expect(editor.requests.isEmpty)
+        // Never falls back to the admin-password dialog the helper is meant to replace.
+        #expect(runner.scripts.isEmpty)
+        let message = try #require(thrown?.description)
+        #expect(message.contains("Login Items"))
+        #expect(message.contains("Retry setup"))
+    }
+
+    @Test func approvalMessagesPointAtRetrySetupNotAnInstallButton() {
+        // There is no Install button anymore: the menu's Retry setup runs the flow again, and
+        // approval continues the in-progress setup by itself.
+        for message in [Installer.approvalMessage, Installer.helperNotRespondingMessage] {
+            #expect(!message.contains("Install"))
+            #expect(message.contains("Login Items"))
+            #expect(message.contains("Retry setup"))
+        }
+        #expect(Installer.approvalMessage.contains("continues automatically"))
+    }
+
+    @Test func installOpensApprovalSettingsWhenApprovalIsAlreadyRequired() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .requiresApproval)
+
+        await #expect(throws: InstallError.self) {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        }
+
+        #expect(helper.openApprovalCount == 1)
+        #expect(helper.registerCount == 0)
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func installFallsBackToOsascriptWhenTheHelperIsNotFound() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notFound)
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.count == 1)
+        #expect(runner.scripts.first?.contains(hostsEntry) == true)
+    }
+
+    @Test func installRegistersThenUsesTheHelperWhenNotFoundBecomesEnabled() async throws {
+        // SMAppService reports .notFound for a daemon that has never been registered, so a
+        // single register() attempt is what surfaces the real state.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notFound)
+        helper.statusAfterRegister = .enabled
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(helper.registerCount == 1)
+        #expect(editor.requests == [true])
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func installRegistersNotFoundThenAsksForApproval() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notFound)
+        helper.statusAfterRegister = .requiresApproval
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.registerCount == 1)
+        #expect(helper.openApprovalCount == 1)
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.isEmpty)
+        #expect(try #require(thrown?.description).contains("Login Items"))
+    }
+
+    @Test func installFallsBackToOsascriptWhenNotFoundRegisterThrows() async throws {
+        // An unbundled run (`swift run`) cannot register the daemon: use the legacy path.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notFound)
+        helper.registerError = EditorFailure()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(helper.registerCount == 1)
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.count == 1)
+    }
+
+    @Test func installRegistersThenUsesTheHelperWhenUnknownBecomesEnabled() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .unknown)
+        helper.statusAfterRegister = .enabled
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(helper.registerCount == 1)
+        #expect(editor.requests == [true])
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func installRegistersUnknownThenAsksForApproval() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .unknown)
+        helper.statusAfterRegister = .requiresApproval
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.registerCount == 1)
+        #expect(helper.openApprovalCount == 1)
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.isEmpty)
+        #expect(try #require(thrown?.description).contains("Login Items"))
+    }
+
+    @Test func installFallsBackToOsascriptWhenUnknownRegisterThrows() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .unknown)
+        helper.registerError = EditorFailure()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+
+        #expect(helper.registerCount == 1)
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.count == 1)
+    }
+
+    @Test func installApprovalPendingWhenRegisterThrowsStillAsksForApproval() async throws {
+        // Live bug: SMAppService.register() throws "Operation not permitted" while approval is
+        // pending and leaves status == .requiresApproval, so a thrown register must not be read
+        // as "no real bundle" and fall through to the osascript password dialog.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notFound)
+        helper.registerError = EditorFailure()
+        helper.statusAfterRegister = .requiresApproval
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.registerCount == 1)
+        #expect(helper.openApprovalCount == 1)
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.isEmpty)
+        #expect(try #require(thrown?.description).contains("Login Items"))
+    }
+
+    @Test func installFallsBackToOsascriptWhenTheHelperStatusIsUnknown() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let helper = FakeHelper(status: .unknown)
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: FakeHostsEditor(), helper: helper).install()
+
+        #expect(runner.scripts.count == 1)
+    }
+
+    @Test func enabledHelperFailureIsSurfacedAndNeverFallsBackToOsascript() async throws {
+        // The bug this prevents: an enabled helper whose XPC call fails must not quietly
+        // open an admin-password dialog, which would hide the real failure.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        editor.error = EditorFailure()
+        let helper = FakeHelper(status: .enabled)
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(thrown != nil)
+        #expect(editor.requests == [true])
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func enabledHelperTimeoutOpensApprovalSettingsWithActionableText() async throws {
+        // The Remove CA -> Install again case: macOS auto-enabled the daemon without recording
+        // its signature, launchd cannot spawn it, and the XPC call times out. The user must
+        // toggle the Login Items switch, so open settings and say so.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        editor.error = HostsEditingError.timedOut
+        let helper = FakeHelper(status: .enabled)
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.openApprovalCount == 1)
+        #expect(editor.requests == [true])
+        #expect(runner.scripts.isEmpty)
+        let message = try #require(thrown?.description)
+        #expect(message.contains("not responding"))
+        #expect(message.contains("turn OpenProxy off and on again"))
+    }
+
+    @Test func enabledHelperConnectionFailureOpensApprovalSettingsWithActionableText() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        editor.error = HostsEditingError.connectionFailed("XPC connection interrupted")
+        let helper = FakeHelper(status: .enabled)
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.openApprovalCount == 1)
+        #expect(runner.scripts.isEmpty)
+        #expect(try #require(thrown?.description).contains("not responding"))
+    }
+
+    @Test func enabledHelperErrorKeepsItsTextAndDoesNotOpenSettings() async throws {
+        // `.helperFailed` means the helper answered: it is running, so Login Items cannot help.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        editor.error = HostsEditingError.helperFailed("could not write /etc/hosts")
+        let helper = FakeHelper(status: .enabled)
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.openApprovalCount == 0)
+        #expect(runner.scripts.isEmpty)
+        let message = try #require(thrown?.description)
+        #expect(message.contains("could not write /etc/hosts"))
+        #expect(!message.contains("not responding"))
+    }
+
+    // MARK: - Uninstall
+
+    @Test func uninstallRemovesOnlyHostsThroughTheHelperAndLeavesTheCA() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .enabled)
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).uninstall()
+
+        #expect(editor.requests == [false])
+        // The CA trust and keychain sweep moved to removeCA(); uninstall touches hosts only.
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func uninstallFallsBackToOsascriptForTheHostsEntryOnly() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let helper = FakeHelper(status: .notFound)
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: FakeHostsEditor(), helper: helper).uninstall()
+
+        let script = try #require(runner.scripts.first)
+        #expect(script.contains("sed -E"))
+        #expect(!script.contains("delete-certificate"))
+        #expect(!script.contains("remove-trusted-cert"))
+    }
+
+    @Test func enabledHelperUninstallFailureIsSurfacedAndNeverFallsBackToOsascript() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        editor.error = EditorFailure()
+        let helper = FakeHelper(status: .enabled)
+
+        await #expect(throws: InstallError.self) {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).uninstall()
+        }
+        #expect(runner.scripts.isEmpty)
+    }
+
+    // MARK: - removeCA
+
+    @Test func removeCARunsTheFullLegacyCleanupAndKeepsTheHelperRegistered() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let helper = FakeHelper(status: .enabled)
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: FakeHostsEditor(), helper: helper).removeCA()
+
+        let script = try #require(runner.scripts.first)
+        #expect(script.contains("sed -E"))
+        #expect(script.contains("remove-trusted-cert -d"))
+        #expect(script.contains("delete-certificate"))
+        #expect(script.contains("dscacheutil -flushcache"))
+        // Uninstall must NOT touch the helper: unregistering it makes the next setup toggle
+        // OpenProxy in Login Items through the launch-constraint dance.
+        #expect(helper.registerCount == 0)
+        #expect(helper.status == .enabled)
+    }
+
+    @Test func removeCAWithoutAHelperStillRunsTheLegacyCleanup() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        try await makeInstaller(runner: runner, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.count == 1)
+        #expect(runner.scripts.first?.contains("delete-certificate") == true)
+    }
+
+    @Test func removeCAKeepsTheHelperRegisteredEvenWhenTrustCleanupFails() async throws {
+        // The helper must stay registered even when an earlier cleanup step failed; it is idle
+        // without the CA and only reacts to hosts requests.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = SucceedingCommandRunner()
+        commands.failingContains = "remove-trusted-cert"
+        let helper = FakeHelper(status: .enabled)
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath, commandRunner: commands,
+                editor: FakeHostsEditor(), helper: helper).removeCA()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.registerCount == 0)
+        #expect(helper.status == .enabled)
+        #expect(try #require(thrown?.description).contains("trust"))
+    }
+
+    @Test func removeCAKeepsTheHelperRegisteredEvenWhenThePrivilegedCleanupFails() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        runner.error = EditorFailure()
+        let helper = FakeHelper(status: .enabled)
+
+        await #expect(throws: InstallError.self) {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath,
+                editor: FakeHostsEditor(), helper: helper).removeCA()
+        }
+        #expect(helper.registerCount == 0)
+        #expect(helper.status == .enabled)
+    }
+
+    @Test func removeCAReportsTheTrustFailureWithoutAHelperUnregisterStep() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = SucceedingCommandRunner()
+        commands.failingContains = "remove-trusted-cert"
+        let helper = FakeHelper(status: .enabled)
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath, commandRunner: commands,
+                editor: FakeHostsEditor(), helper: helper).removeCA()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.status == .enabled)
+        let message = try #require(thrown?.description)
+        #expect(message.contains("trust"))
+        #expect(!message.contains("unregister"))
+    }
+}
