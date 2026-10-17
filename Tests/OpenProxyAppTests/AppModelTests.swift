@@ -122,7 +122,6 @@ private final class FakeHelper: HelperRegistering, @unchecked Sendable {
     var statusAfterRegister: HelperStatus?
     var onRegister: (() -> Void)?
     private(set) var registerCount = 0
-    private(set) var unregisterCount = 0
     private(set) var openApprovalCount = 0
 
     func register() throws {
@@ -132,7 +131,6 @@ private final class FakeHelper: HelperRegistering, @unchecked Sendable {
         if let statusAfterRegister { status = statusAfterRegister }
     }
 
-    func unregister() throws { unregisterCount += 1 }
     func openApprovalSettings() { openApprovalCount += 1 }
 }
 
@@ -1318,7 +1316,10 @@ struct AppModelTests {
         #expect(h.orderLog.sequence == ["hosts", "autostart", "ca", "data", "quit"])
         #expect(h.dataRemover.count == 1)
         #expect(h.quitDecision.terminateCount == 1)
-        #expect(h.helper.unregisterCount == 1)
+        // Uninstall keeps the helper: unregistering it would make the next setup toggle
+        // OpenProxy in Login Items through the launch-constraint dance.
+        #expect(h.helper.status == .enabled)
+        #expect(h.helper.registerCount == 0)
     }
 
     @Test func uninstallStopsWhenHostsRemovalFailedAndEntryRemains() async throws {
@@ -1431,14 +1432,15 @@ struct AppModelTests {
         #expect(model.warnings.contains { $0.key == .uninstall && $0.message.contains("OpenProxy data") })
     }
 
-    @Test func removeCAUnregistersTheHelperAndClearsWarningsOnSuccess() async throws {
+    @Test func removeCAClearsWarningsOnSuccessAndKeepsTheHelperRegistered() async throws {
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
         h.helper.status = .enabled
         let model = h.model()
 
         await model.removeCA()
 
-        #expect(h.helper.unregisterCount == 1)
+        #expect(h.helper.status == .enabled)
+        #expect(h.helper.registerCount == 0)
         #expect(model.warnings.isEmpty)
     }
 

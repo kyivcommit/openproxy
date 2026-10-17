@@ -268,8 +268,8 @@ public struct InstallStatus: Equatable, Sendable {
 public enum InstallError: Error, Equatable, Sendable {
     case runnerFailed(String)
     case commandFailed(command: String, status: Int32)
-    /// One or more CA-cleanup steps failed. Lists every failed step, so a helper-unregister
-    /// error is never swallowed behind an earlier trust-cleanup failure.
+    /// One or more CA-cleanup steps failed. Lists every failed step, so a trust-cleanup error
+    /// is never swallowed behind an earlier one.
     case caRemovalFailed(String)
 }
 
@@ -593,7 +593,8 @@ public final class Installer: @unchecked Sendable {
     /// and sweeps a leftover CA from the System keychain; phase B (unprivileged) removes the
     /// user-domain trust and the login-keychain certificate. Hosts restore must never be
     /// blocked by the sweeps, and a leftover cleanup failure must be reported, not swallowed.
-    /// Finally the root helper is unregistered: without the CA it has nothing left to do.
+    /// The root helper stays registered (idle, it only edits the one hosts line on request);
+    /// unregistering it would force the next setup through the Launch Items toggle dance.
     public func removeCA() async throws {
         // Item 3 / TOCTOU: never point the privileged `remove-trusted-cert -d` at the
         // user-writable ca.pem. Validate the file against the CA's own SHA-256 fingerprint,
@@ -616,14 +617,6 @@ public final class Installer: @unchecked Sendable {
         }
         if let failure = await removeUserDomainTrust() {
             failures.append(failure)
-        }
-        // Always unregister the helper, even when an earlier CA-cleanup step failed: without
-        // the CA it has nothing left to do, and a swallowed error would leave a stale daemon
-        // registered with no way for the user to see why.
-        do {
-            try helper?.unregister()
-        } catch {
-            failures.append("helper unregister: \(error)")
         }
         guard failures.isEmpty else {
             throw InstallError.caRemovalFailed(failures.joined(separator: "; "))

@@ -23,10 +23,12 @@ public enum HelperStatus: Equatable, Sendable {
 
 /// Registers the privileged helper daemon. Mirrors `LoginItemRegistering`; injected so the
 /// installer and menu can be tested without a signed bundle or `SMAppService`.
+/// There is no `unregister`: the helper stays registered across Uninstall, because the
+/// OpenProxy row in Login Items belongs to the app, and re-registering an already-enabled
+/// daemon makes macOS skip the signature recording (launchd then refuses to spawn it).
 public protocol HelperRegistering: Sendable {
     func register() throws
     var status: HelperStatus { get }
-    func unregister() throws
     /// Opens System Settings -> Login Items so the user can flip the one-time switch.
     func openApprovalSettings()
 }
@@ -54,10 +56,6 @@ public struct SMAppServiceDaemon: HelperRegistering {
         }
     }
 
-    public func unregister() throws {
-        try service.unregister()
-    }
-
     public func openApprovalSettings() {
         SMAppService.openSystemSettingsLoginItems()
     }
@@ -74,6 +72,5 @@ public struct NoHelperRegistration: HelperRegistering {
 
     public func register() throws {}
     public var status: HelperStatus { .notFound }
-    public func unregister() throws {}
     public func openApprovalSettings() {}
 }
