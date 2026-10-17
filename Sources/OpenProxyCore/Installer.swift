@@ -473,15 +473,10 @@ public final class Installer: @unchecked Sendable {
             helper.openApprovalSettings()
             throw InstallError.runnerFailed(Self.approvalMessage)
         case .notRegistered, .notFound, .unknown:
-            // Register once and re-read. SMAppService reports .notFound/.unknown for a daemon
-            // that has never been registered (the live-test bug), so registration is the only
-            // way to reach `.enabled` or to surface the one-time approval prompt. A thrown
-            // register means there is no real bundle (e.g. `swift run`): use osascript.
-            do {
-                try helper.register()
-            } catch {
-                return .osascript
-            }
+            // Register once, then re-read the status whether or not it threw. When approval is
+            // pending SMAppService.register() throws "Operation not permitted" yet leaves
+            // status == .requiresApproval, so a thrown register alone is not "no bundle".
+            try? helper.register()
             switch helper.status {
             case .enabled:
                 return .helper

@@ -88,11 +88,15 @@ private final class FakeLoginItem: LoginItemRegistering, @unchecked Sendable {
     var registerError: Error?
     var unregisterError: Error?
     var status: LoginItemStatus = .enabled
+    /// What `register()` reports on the immediate re-read, even when it throws.
+    var statusAfterRegister: LoginItemStatus?
     private(set) var registerCount = 0
     private(set) var unregisterCount = 0
 
     func register() throws {
         registerCount += 1
+        // SMAppService can throw and still change the status (approval pending).
+        if let statusAfterRegister { status = statusAfterRegister }
         if let registerError { throw registerError }
     }
 
@@ -383,7 +387,42 @@ struct AppModelTests {
 
         #expect(h.loginItem.registerCount == 1)
         #expect(model.loginItemStatus == .notFound)
-        #expect(model.warnings.contains { $0.message.contains("Autostart") })
+        // A genuine failure keeps its raw text, not the approval hint.
+        #expect(model.warnings.contains { $0.message.contains("Autostart registration failed") })
+        #expect(model.warnings.contains { $0.message.contains("denied") })
+        #expect(!model.warnings.contains { $0.message.contains("needs approval") })
+    }
+
+    @Test func loginItemRegisterThrowingWithApprovalPendingShowsApprovalText() throws {
+        // Live bug: register() throws "Operation not permitted" while approval is pending, but
+        // the status is .requiresApproval. That is the one-time approval state, not an error.
+        let h = try Harness()
+        h.loginItem.registerError = LoginItemTestError.denied
+        h.loginItem.statusAfterRegister = .requiresApproval
+        let model = h.model()
+
+        model.registerLoginItem()
+
+        #expect(model.loginItemStatus == .requiresApproval)
+        #expect(model.warnings.contains { $0.message.contains("needs approval") })
+        #expect(!model.warnings.contains { $0.message.contains("denied") })
+    }
+
+    @Test func autostartApprovalWarningClearsAfterALaterRegisterSucceeds() throws {
+        let h = try Harness()
+        h.loginItem.registerError = LoginItemTestError.denied
+        h.loginItem.statusAfterRegister = .requiresApproval
+        let model = h.model()
+        model.registerLoginItem()
+        #expect(model.warnings.contains { $0.key == .autostart })
+
+        // The user approved; the next register succeeds and the stale hint goes away.
+        h.loginItem.registerError = nil
+        h.loginItem.statusAfterRegister = .enabled
+        model.registerLoginItem()
+
+        #expect(model.loginItemStatus == .enabled)
+        #expect(!model.warnings.contains { $0.key == .autostart })
     }
 
     @Test func loginItemRequiringApprovalBecomesWarning() throws {
@@ -419,6 +458,26 @@ struct AppModelTests {
     }
 
     // MARK: - Autostart is tied to Install/Uninstall, not to launch
+
+    @Test func installApprovalPendingSkipsAutostartRegistration() async throws {
+        // Install's helper step runs first. While approval is pending it throws the approval
+        // message, so autostart must not be registered in that run; after the user approves,
+        // the next Install registers it.
+        let h = try Harness()
+        h.helper.status = .requiresApproval
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.helper.openApprovalCount == 1)
+        #expect(h.loginItem.registerCount == 0)
+        #expect(model.warnings.contains { $0.message.contains("Login Items") })
+
+        h.helper.status = .enabled
+        await model.install()
+
+        #expect(h.loginItem.registerCount == 1)
+    }
 
     @Test func launchDoesNotRegisterAutostart() async throws {
         // A plain launch must not put OpenProxy in Login Items before the user installs.

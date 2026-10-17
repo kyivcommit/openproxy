@@ -56,8 +56,10 @@ struct InstallerHelperRoutingTests {
 
         func register() throws {
             registerCount += 1
-            if let registerError { throw registerError }
+            // SMAppService can throw and still change the status (approval pending), so apply
+            // the new status before propagating the error.
             if let statusAfterRegister { status = statusAfterRegister }
+            if let registerError { throw registerError }
         }
 
         func unregister() throws {
@@ -291,6 +293,32 @@ struct InstallerHelperRoutingTests {
         #expect(helper.registerCount == 1)
         #expect(editor.requests.isEmpty)
         #expect(runner.scripts.count == 1)
+    }
+
+    @Test func installApprovalPendingWhenRegisterThrowsStillAsksForApproval() async throws {
+        // Live bug: SMAppService.register() throws "Operation not permitted" while approval is
+        // pending and leaves status == .requiresApproval, so a thrown register must not be read
+        // as "no real bundle" and fall through to the osascript password dialog.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let editor = FakeHostsEditor()
+        let helper = FakeHelper(status: .notFound)
+        helper.registerError = EditorFailure()
+        helper.statusAfterRegister = .requiresApproval
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(runner: runner, hostsPath: hostsPath, editor: editor, helper: helper).install()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.registerCount == 1)
+        #expect(helper.openApprovalCount == 1)
+        #expect(editor.requests.isEmpty)
+        #expect(runner.scripts.isEmpty)
+        #expect(try #require(thrown?.description).contains("Login Items"))
     }
 
     @Test func installFallsBackToOsascriptWhenTheHelperStatusIsUnknown() async throws {

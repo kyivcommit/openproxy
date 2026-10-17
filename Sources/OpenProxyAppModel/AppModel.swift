@@ -362,16 +362,29 @@ public final class AppModel {
             try loginItem.register()
         } catch {
             loginItemStatus = loginItem.status
-            warn(.autostart, "Autostart registration failed: \(error).")
+            // SMAppService.register() throws "Operation not permitted" while approval is
+            // pending; that is the expected one-time state, so show the approval hint, not
+            // the raw error. Any other error keeps its text.
+            if loginItemStatus == .requiresApproval {
+                warn(.autostart, Self.autostartApprovalMessage)
+            } else {
+                warn(.autostart, "Autostart registration failed: \(error).")
+            }
             return
         }
         loginItemStatus = loginItem.status
-        if loginItemStatus != .enabled {
+        if loginItemStatus == .requiresApproval {
+            warn(.autostart, Self.autostartApprovalMessage)
+        } else if loginItemStatus != .enabled {
             warn(.autostart, "Autostart is \(loginItemStatus.label).")
         } else {
             clearWarnings([.autostart])
         }
     }
+
+    /// Shown instead of the raw "Operation not permitted" error while approval is pending.
+    private static let autostartApprovalMessage =
+        "Autostart needs approval in System Settings -> Login Items"
 
     /// Turns autostart off, reporting a failure as a warning. Never throws: the hosts entry
     /// has already been restored, so a failed unregister must not undo that or block the flow.
