@@ -13,8 +13,12 @@ enum OpenProxyHelper {
     static func main() {
         let delegate = HelperDelegate()
         let listener = NSXPCListener(machServiceName: HelperConstants.machServiceName)
-        // Only a process signed as the OpenProxy app may connect.
-        listener.setConnectionCodeSigningRequirement(HelperConstants.connectionRequirement)
+        // Gate connections by the app that actually shipped this helper, not a hard-coded id.
+        let identifier = Bundle.main.executableURL.flatMap(HelperRequirement.appIdentifier)
+        helperLog.log("app identifier: \(identifier ?? "<none>", privacy: .public)")
+        let requirement = identifier.flatMap { try? HelperConstants.requirement(forAppIdentifier: $0) }
+            ?? HelperConstants.connectionRequirement
+        listener.setConnectionCodeSigningRequirement(requirement)
         listener.delegate = delegate
         listener.resume()
         dispatchMain()

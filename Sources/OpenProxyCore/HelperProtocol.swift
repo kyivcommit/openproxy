@@ -11,7 +11,23 @@ public enum HelperConstants {
 
     /// The only client the daemon accepts: a process signed as the OpenProxy app.
     /// Ad-hoc signing is enough — the bundle identifier is what the requirement pins.
+    /// This is the fallback when the helper cannot read its own parent app's identifier.
     public static let connectionRequirement = "identifier \"dev.openproxy.app\""
+
+    public enum RequirementError: Error, Equatable, Sendable {
+        case emptyIdentifier
+    }
+
+    /// Builds the code-signing requirement that pins one bundle identifier, e.g.
+    /// `identifier "dev.openproxy.app"`. Quotes and backslashes are escaped so a
+    /// crafted identifier cannot break out of the string literal; an empty id is rejected.
+    public static func requirement(forAppIdentifier identifier: String) throws -> String {
+        guard !identifier.isEmpty else { throw RequirementError.emptyIdentifier }
+        let escaped = identifier
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "identifier \"\(escaped)\""
+    }
 }
 
 @objc public protocol HelperProtocol {
