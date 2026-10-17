@@ -50,15 +50,13 @@ struct MenuView: View {
 
             Divider()
             HStack {
-                Button("Install") { Task { await model.install() } }
-                Button("Uninstall") { Task { await model.uninstall() } }
+                Button("Uninstall OpenProxy...") { Task { await model.uninstallOpenProxy() } }
+                    .help("Removes the certificate, the helper, autostart and all OpenProxy data, then quits.")
                 Spacer()
-                Button("Quit") { Task { await model.quit() } }
             }
             HStack {
-                Button("Remove CA...") { Task { await model.removeCA() } }
-                    .help("Removes the local CA trust and the root helper; leaves /etc/hosts restored.")
                 Spacer()
+                Button("Quit") { Task { await model.quit() } }
             }
         }
         .padding(14)
@@ -138,6 +136,7 @@ struct MenuView: View {
             nodeEnvRow
             Text("Autostart: \(model.loginItemStatus.label)").font(.caption)
             Text("Hosts helper: \(model.helperStatus.label)").font(.caption)
+            Text("Routing: \(model.routingLabel)").font(.caption)
         }
     }
 
@@ -187,14 +186,11 @@ struct MenuView: View {
     }
 
     private func unreachableBlock(_ message: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("⚠︎ \(message)")
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-            Button("Uninstall") { Task { await model.uninstall() } }
-        }
+        Text("⚠︎ \(message)")
+            .font(.caption)
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
     }
 
     private var warningBlock: some View {
