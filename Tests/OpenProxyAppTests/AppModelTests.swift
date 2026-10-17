@@ -1587,4 +1587,47 @@ struct AppSupportDataRemoverTests {
             try AppSupportDataRemover(directory: dir).removeAppData()
         }
     }
+
+    @Test func aSymlinkedDirectoryIsRefusedAndItsTargetUntouched() throws {
+        let target = try makeDirectory()
+        let precious = target.appending(path: "precious.txt")
+        try Data("keep me".utf8).write(to: precious)
+        let link = FileManager.default.temporaryDirectory.appending(path: "openproxy-data-link-\(UUID().uuidString)")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        defer { try? FileManager.default.removeItem(at: link); try? FileManager.default.removeItem(at: target) }
+
+        #expect(throws: DataRemovalError.self) {
+            try AppSupportDataRemover(directory: link).removeAppData()
+        }
+
+        #expect(FileManager.default.fileExists(atPath: precious.path))
+        #expect(try String(contentsOf: precious, encoding: .utf8) == "keep me")
+    }
+
+    @Test func aPathThatIsNotADirectoryIsRefused() throws {
+        let file = FileManager.default.temporaryDirectory.appending(path: "openproxy-data-file-\(UUID().uuidString)")
+        try Data("not a directory".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        #expect(throws: DataRemovalError.self) {
+            try AppSupportDataRemover(directory: file).removeAppData()
+        }
+        #expect(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    @Test func aSymlinkInsideIsRemovedAsALinkAndItsTargetUntouched() throws {
+        let dir = try makeDirectory()
+        let target = try makeDirectory()
+        let precious = target.appending(path: "precious.txt")
+        try Data("keep me".utf8).write(to: precious)
+        try FileManager.default.createSymbolicLink(
+            at: dir.appending(path: "linked"), withDestinationURL: target)
+        try Data("ca".utf8).write(to: dir.appending(path: "ca.pem"))
+        defer { try? FileManager.default.removeItem(at: dir); try? FileManager.default.removeItem(at: target) }
+
+        try AppSupportDataRemover(directory: dir).removeAppData()
+
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+        #expect(FileManager.default.fileExists(atPath: precious.path))
+    }
 }

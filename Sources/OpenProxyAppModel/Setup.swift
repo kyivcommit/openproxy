@@ -78,6 +78,21 @@ public struct RealSetupWaiting: SetupWaiting {
     }
 }
 
+/// A refusal to wipe the app's data directory: the path is a symlink or not a directory, so
+/// removing its contents would delete files somewhere other than our own data.
+public enum DataRemovalError: Error, Equatable, Sendable {
+    case notADirectory(String)
+}
+
+extension DataRemovalError: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .notADirectory(let path):
+            return "The OpenProxy data path is not a real directory (symlink?): \(path)"
+        }
+    }
+}
+
 /// Production full-uninstall data wipe: removes every file in the app support directory
 /// (ca.pem, ca.key, settings.json, stats.sqlite).
 public struct AppSupportDataRemover: AppDataRemoving {
@@ -89,6 +104,14 @@ public struct AppSupportDataRemover: AppDataRemoving {
 
     public func removeAppData() throws {
         let manager = FileManager.default
+        // lstat never follows the final component: a symlinked data directory would otherwise
+        // make the wipe delete files wherever the link points. Refuse anything that is not a
+        // real directory. A missing directory falls through to the ENOENT handling below.
+        var entryStatus = stat()
+        if lstat(directory.path, &entryStatus) == 0,
+           entryStatus.st_mode & mode_t(S_IFMT) != mode_t(S_IFDIR) {
+            throw DataRemovalError.notADirectory(directory.path)
+        }
         let contents: [URL]
         do {
             contents = try manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
@@ -99,6 +122,8 @@ public struct AppSupportDataRemover: AppDataRemoving {
             guard Self.isMissingDirectory(error) else { throw error }
             return
         }
+        // `removeItem` unlinks a symlink itself, so a linked item inside is removed as a link
+        // and its target is never touched.
         for item in contents {
             try manager.removeItem(at: item)
         }
