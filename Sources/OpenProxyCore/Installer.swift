@@ -295,19 +295,27 @@ public final class Installer: @unchecked Sendable {
     private let runner: PrivilegedRunner
     private let commandRunner: CommandRunning
     private let hostsPath: String
+    /// Optional so every existing test/behavior keeps the legacy osascript path; when both are
+    /// present the hosts edit goes through the approved root helper instead (no password).
+    private let hostsEditor: HostsEditing?
+    private let helper: HelperRegistering?
 
     public init(
         caPEMURL: URL,
         caCommonName: String = "OpenProxy Local CA",
         runner: PrivilegedRunner,
         commandRunner: CommandRunning,
-        hostsPath: String = "/etc/hosts"
+        hostsPath: String = "/etc/hosts",
+        hostsEditor: HostsEditing? = nil,
+        helper: HelperRegistering? = nil
     ) {
         self.caPEMURL = caPEMURL
         self.caCommonName = caCommonName
         self.runner = runner
         self.commandRunner = commandRunner
         self.hostsPath = hostsPath
+        self.hostsEditor = hostsEditor
+        self.helper = helper
     }
 
     /// Phase 1 trusts the CA in the user's login keychain (user-domain trust, no `-d`) and
@@ -335,18 +343,9 @@ public final class Installer: @unchecked Sendable {
                     + verify.failureDetail)
         }
 
-        // `set -e` aborts at the first failed step; the trailing flushcache can no longer mask
-        // an earlier hosts failure. No keychain command runs privileged anymore.
-        let script = """
-        set -e
-        \(Self.hostsEditScript(hostsPath: hostsPath, adding: true))
-        dscacheutil -flushcache
-        """
-        do {
-            try await runner.run(script: script)
-        } catch {
-            throw InstallError.runnerFailed(String(describing: error))
-        }
+        // Phase 2: the hosts entry, through the approved root helper when it is available
+        // (no password), otherwise the legacy osascript script.
+        try await setHostsEntry(present: true)
 
         // Trust and hosts are in place; finally point new processes at the CA so Node clients
         // started afterwards trust it. Unprivileged and non-fatal: a failure never rolls back
@@ -429,12 +428,97 @@ public final class Installer: @unchecked Sendable {
         text.count > limit ? String(text.prefix(limit)) + "…" : text
     }
 
+    /// Adds or removes the managed `/etc/hosts` line. This is the one place the app edits
+    /// hosts, shared by install/uninstall, the launch-time silent restore, and Quit.
+    ///
+    /// Route: an `enabled` helper edits without a password; `notRegistered` registers first
+    /// and re-reads the status; `requiresApproval` opens Login Items and throws (never
+    /// silently falls back to a password prompt); `notFound`/unknown use the legacy osascript
+    /// path. An `enabled` helper that fails is surfaced, never downgraded to osascript.
+    public func setHostsEntry(present: Bool) async throws {
+        switch try resolveHostsRoute() {
+        case .helper:
+            guard let hostsEditor else {
+                try await runHostsScript(present: present)
+                return
+            }
+            do {
+                try await hostsEditor.setHostsEntry(present: present)
+            } catch {
+                throw InstallError.runnerFailed(String(describing: error))
+            }
+        case .osascript:
+            try await runHostsScript(present: present)
+        }
+    }
+
+    private enum HostsRoute {
+        case helper
+        case osascript
+    }
+
+    private func resolveHostsRoute() throws -> HostsRoute {
+        guard let helper else { return .osascript }
+        switch helper.status {
+        case .enabled:
+            return .helper
+        case .notRegistered:
+            do {
+                try helper.register()
+            } catch {
+                throw InstallError.runnerFailed("Could not register the OpenProxy helper: \(error).")
+            }
+            // Re-read after registering: it may be enabled or need the one-time approval.
+            switch helper.status {
+            case .enabled:
+                return .helper
+            case .requiresApproval:
+                helper.openApprovalSettings()
+                throw InstallError.runnerFailed(Self.approvalMessage)
+            default:
+                return .osascript
+            }
+        case .requiresApproval:
+            helper.openApprovalSettings()
+            throw InstallError.runnerFailed(Self.approvalMessage)
+        case .notFound, .unknown:
+            return .osascript
+        }
+    }
+
+    /// The one-time approval is a user action, so the error tells them exactly what to do.
+    static let approvalMessage =
+        "OpenProxy needs one-time approval to change /etc/hosts without a password. "
+        + "Open System Settings -> Login Items, turn on OpenProxy, then press Install again."
+
+    /// The legacy privileged edit: one `osascript` shell script, `set -e` at the front so the
+    /// trailing flush can never mask an earlier hosts failure.
+    private func runHostsScript(present: Bool) async throws {
+        let script = """
+        set -e
+        \(Self.hostsEditScript(hostsPath: hostsPath, adding: present))
+        dscacheutil -flushcache
+        """
+        do {
+            try await runner.run(script: script)
+        } catch {
+            throw InstallError.runnerFailed(String(describing: error))
+        }
+    }
+
+    /// Removes only the `/etc/hosts` entry, leaving the CA in place. No keychain command runs
+    /// and, when the helper is enabled, no password prompt appears.
+    public func uninstall() async throws {
+        try await setHostsEntry(present: false)
+    }
+
     /// Phase A (privileged) restores `/etc/hosts` first — the critical safety path — then
     /// best-effort clears any admin trust settings an old `add-trusted-cert -d` install left,
     /// and sweeps a leftover CA from the System keychain; phase B (unprivileged) removes the
     /// user-domain trust and the login-keychain certificate. Hosts restore must never be
     /// blocked by the sweeps, and a leftover cleanup failure must be reported, not swallowed.
-    public func uninstall() async throws {
+    /// Finally the root helper is unregistered: without the CA it has nothing left to do.
+    public func removeCA() async throws {
         // Item 3 / TOCTOU: never point the privileged `remove-trusted-cert -d` at the
         // user-writable ca.pem. Validate the file against the CA's own SHA-256 fingerprint,
         // then drop admin trust for a root-owned copy, so a swap before the admin prompt
@@ -458,6 +542,7 @@ public final class Installer: @unchecked Sendable {
         if let failure = await removeUserDomainTrust() {
             throw InstallError.trustCleanupFailed(failure)
         }
+        try? helper?.unregister()
     }
 
     /// Drops admin-domain trust that an older `add-trusted-cert -d` install left. The privileged
