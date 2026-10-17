@@ -330,17 +330,24 @@ public final class Installer: @unchecked Sendable {
         let trustedCopy = try privateCopyOfCA()
         defer { try? FileManager.default.removeItem(at: trustedCopy.deletingLastPathComponent()) }
 
-        let add = await commandRunner.run(
-            Self.addTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
-        guard add.succeeded else {
-            throw InstallError.runnerFailed(Self.trustFailureMessage(add))
-        }
-        let verify = await commandRunner.run(
+        // Verify first: an already-trusted CA must not reopen the Certificate Trust Settings
+        // dialog, and a successful verify is itself the proof that trust is in place. Only an
+        // untrusted CA runs `add-trusted-cert` (which shows the dialog), then verifies again.
+        let alreadyTrusted = await commandRunner.run(
             Self.verifyTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
-        guard verify.succeeded else {
-            throw InstallError.runnerFailed(
-                "The CA was added to the login keychain but could not be verified as trusted: "
-                    + verify.failureDetail)
+        if !alreadyTrusted.succeeded {
+            let add = await commandRunner.run(
+                Self.addTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
+            guard add.succeeded else {
+                throw InstallError.runnerFailed(Self.trustFailureMessage(add))
+            }
+            let verify = await commandRunner.run(
+                Self.verifyTrustCommand(certPath: trustedCopy.path), timeout: Self.dialogTimeout)
+            guard verify.succeeded else {
+                throw InstallError.runnerFailed(
+                    "The CA was added to the login keychain but could not be verified as trusted: "
+                        + verify.failureDetail)
+            }
         }
 
         // Phase 2: the hosts entry, through the approved root helper when it is available

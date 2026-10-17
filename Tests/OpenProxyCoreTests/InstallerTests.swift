@@ -80,6 +80,28 @@ private final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
     }
 }
 
+/// Models a CA that is in the keychain but not yet trusted: `verify-cert` fails until
+/// `add-trusted-cert` has run, so the trust phase's verify-first ordering can be exercised.
+private final class UntrustedThenTrustedCA: @unchecked Sendable {
+    private let lock = NSLock()
+    private var added = false
+
+    func handle(_ command: String) -> CommandResult {
+        lock.withLock {
+            if command.contains("add-trusted-cert") {
+                added = true
+                return CommandResult(status: 0)
+            }
+            if command.contains("verify-cert") {
+                return added
+                    ? CommandResult(status: 0)
+                    : CommandResult(status: 1, standardError: "CSSMERR_TP_NOT_TRUSTED")
+            }
+            return CommandResult(status: 0)
+        }
+    }
+}
+
 @Suite("Installer")
 struct InstallerTests {
     private func makeInstaller(
@@ -110,17 +132,22 @@ struct InstallerTests {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
-        let commands = FakeCommandRunner()
+        // The CA is not trusted yet: `verify-cert` fails until `add-trusted-cert` has run.
+        let caState = UntrustedThenTrustedCA()
+        let commands = FakeCommandRunner(handler: caState.handle)
 
         try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).install()
 
-        // Phase 1: unprivileged, user-domain trust in the login keychain, then verify.
-        #expect(commands.commands.count == 3)
-        let add = try #require(commands.commands.first)
+        // Phase 1: verify (fails, no dialog) -> add trust -> verify (succeeds).
+        #expect(commands.commands.count == 4)
+        let firstVerify = try #require(commands.commands.first)
+        #expect(firstVerify.contains("security verify-cert -c"))
+        #expect(!firstVerify.contains("add-trusted-cert"))
+        let add = try #require(commands.commands.dropFirst().first)
         #expect(add.contains(#"security add-trusted-cert -r trustRoot -k "$HOME/Library/Keychains/login.keychain-db""#))
         #expect(!add.contains(" -d "))
         #expect(!add.contains("System.keychain"))
-        let verify = try #require(commands.commands.dropFirst().first)
+        let verify = try #require(commands.commands.dropFirst(2).first)
         #expect(verify.contains("security verify-cert -c"))
         #expect(verify.contains("-p basic"))
         // Both commands act on the same private temp copy, never the user-writable ca.pem directly.
@@ -164,14 +191,38 @@ struct InstallerTests {
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }
         let runner = RecordingRunner()
         let commands = FakeCommandRunner(handler: { command in
-            command.contains("add-trusted-cert")
-                ? CommandResult(status: 1, standardError: "SecTrustSettingsSetTrustSettings: denied")
-                : CommandResult(status: 0)
+            if command.contains("verify-cert") {
+                return CommandResult(status: 1, standardError: "CSSMERR_TP_NOT_TRUSTED")
+            }
+            if command.contains("add-trusted-cert") {
+                return CommandResult(status: 1, standardError: "SecTrustSettingsSetTrustSettings: denied")
+            }
+            return CommandResult(status: 0)
         })
         let installer = makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath)
 
         await #expect(throws: InstallError.self) { try await installer.install() }
         #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func alreadyTrustedCASkipsTheTrustDialog() async throws {
+        // Live bug: an already-trusted CA still reopened Certificate Trust Settings. Verify first
+        // means a valid user-domain trust writes nothing and shows no dialog.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner()
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).install()
+
+        #expect(!commands.commands.contains { $0.contains("add-trusted-cert") })
+        // The only trust-system command is the single successful verify; no second dialog-bound run.
+        let trustCommands = commands.commands.filter {
+            $0.contains("verify-cert") || $0.contains("add-trusted-cert")
+        }
+        #expect(trustCommands.count == 1)
+        #expect(trustCommands.first?.contains("verify-cert") == true)
+        #expect(runner.scripts.count == 1)
     }
 
     @Test func installFailsBeforeRunningAnythingWhenTheCAIsMissingOrInvalid() async throws {
