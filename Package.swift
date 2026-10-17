@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "OpenProxyCore", targets: ["OpenProxyCore"]),
         .executable(name: "OpenProxyApp", targets: ["OpenProxyApp"]),
+        .executable(name: "OpenProxyHelper", targets: ["OpenProxyHelper"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.104.0"),
@@ -30,6 +31,7 @@ let package = Package(
         ),
         .target(name: "OpenProxyAppModel", dependencies: ["OpenProxyCore"]),
         .executableTarget(name: "OpenProxyApp", dependencies: ["OpenProxyAppModel"]),
+        .executableTarget(name: "OpenProxyHelper", dependencies: ["OpenProxyCore"]),
         .testTarget(name: "OpenProxyCoreTests", dependencies: ["OpenProxyCore"], resources: [.copy("Fixtures")]),
         .testTarget(name: "OpenProxyAppTests", dependencies: ["OpenProxyAppModel", "OpenProxyCore"]),
     ],
