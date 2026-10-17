@@ -99,7 +99,8 @@ struct InstallerHelperRoutingTests {
         hostsPath: String,
         commandRunner: CommandRunning = SucceedingCommandRunner(),
         editor: HostsEditing? = nil,
-        helper: HelperRegistering? = nil
+        helper: HelperRegistering? = nil,
+        allowPasswordFallback: Bool = true
     ) -> Installer {
         Installer(
             caPEMURL: Self.caURL,
@@ -107,7 +108,72 @@ struct InstallerHelperRoutingTests {
             commandRunner: commandRunner,
             hostsPath: hostsPath,
             hostsEditor: editor,
-            helper: helper)
+            helper: helper,
+            allowPasswordFallback: allowPasswordFallback)
+    }
+
+    // MARK: - No password fallback in a bundled app
+
+    @Test func bundledAppWithoutAnAvailableHelperFailsWithoutAPasswordPrompt() async throws {
+        for status in [HelperStatus.notFound, .unknown] {
+            let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+            defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+            let runner = RecordingRunner()
+            let helper = FakeHelper(status: status)
+
+            var thrown: InstallError?
+            do {
+                try await makeInstaller(
+                    runner: runner, hostsPath: hostsPath, helper: helper,
+                    allowPasswordFallback: false).install()
+            } catch let error as InstallError {
+                thrown = error
+            }
+
+            let message = try #require(thrown?.description)
+            #expect(message.contains("could not be registered"))
+            #expect(message.contains("Retry setup"))
+            #expect(runner.scripts.isEmpty)
+        }
+    }
+
+    @Test func bundledAppWithoutAnyHelperFailsWithoutAPasswordPrompt() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+
+        await #expect(throws: InstallError.self) {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath, allowPasswordFallback: false).install()
+        }
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func bundledAppUninstallAlsoRefusesThePasswordFallback() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let helper = FakeHelper(status: .notFound)
+
+        await #expect(throws: InstallError.self) {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath, helper: helper,
+                allowPasswordFallback: false).uninstall()
+        }
+        #expect(runner.scripts.isEmpty)
+    }
+
+    @Test func unbundledAppStillFallsBackToOsascript() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let helper = FakeHelper(status: .notFound)
+
+        try await makeInstaller(
+            runner: runner, hostsPath: hostsPath, helper: helper,
+            allowPasswordFallback: true).install()
+
+        #expect(runner.scripts.count == 1)
     }
 
     // MARK: - Install

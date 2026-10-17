@@ -10,6 +10,14 @@ public enum AppGraph {
             .appending(path: "openproxy")
     }
 
+    /// True when the app bundle at `bundleURL` ships the helper's launch daemon plist, i.e. this
+    /// is a built OpenProxy.app. A plain `swift run` has no such bundle, so there the legacy
+    /// osascript fallback stays available; in a built app the helper must work.
+    static func helperIsBundled(inBundleAt bundleURL: URL = Bundle.main.bundleURL) -> Bool {
+        FileManager.default.fileExists(atPath: bundleURL
+            .appending(path: "Contents/Library/LaunchDaemons/dev.openproxy.helper.plist").path)
+    }
+
     @MainActor
     public static func makeModel(
         baseDirectory: URL = AppGraph.defaultBaseDirectory,
@@ -37,7 +45,8 @@ public enum AppGraph {
             runner: OsascriptRunner(),
             commandRunner: ShellCommandRunner(),
             hostsEditor: XPCHostsEditor(),
-            helper: SMAppServiceDaemon())
+            helper: SMAppServiceDaemon(),
+            allowPasswordFallback: !helperIsBundled())
         let server = ProxyServer(
             ca: ca,
             upstream: upstream,

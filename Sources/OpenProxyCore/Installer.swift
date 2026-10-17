@@ -307,6 +307,10 @@ public final class Installer: @unchecked Sendable {
     /// present the hosts edit goes through the approved root helper instead (no password).
     private let hostsEditor: HostsEditing?
     private let helper: HelperRegistering?
+    /// False for a built app that ships the root helper: an unavailable helper is then an
+    /// error, never the legacy osascript admin-password prompt. True for tests and for an
+    /// unbundled `swift run`, which has no helper to register.
+    private let allowPasswordFallback: Bool
 
     public init(
         caPEMURL: URL,
@@ -315,7 +319,8 @@ public final class Installer: @unchecked Sendable {
         commandRunner: CommandRunning,
         hostsPath: String = "/etc/hosts",
         hostsEditor: HostsEditing? = nil,
-        helper: HelperRegistering? = nil
+        helper: HelperRegistering? = nil,
+        allowPasswordFallback: Bool = true
     ) {
         self.caPEMURL = caPEMURL
         self.caCommonName = caCommonName
@@ -324,6 +329,7 @@ public final class Installer: @unchecked Sendable {
         self.hostsPath = hostsPath
         self.hostsEditor = hostsEditor
         self.helper = helper
+        self.allowPasswordFallback = allowPasswordFallback
     }
 
     /// Phase 1 trusts the CA in the user's login keychain (user-domain trust, no `-d`) and
@@ -532,6 +538,12 @@ public final class Installer: @unchecked Sendable {
             helper?.openApprovalSettings()
             throw InstallError.runnerFailed(Self.approvalMessage)
         case .unavailable:
+            // A bundled app must never pop the admin-password dialog the helper exists to
+            // replace; only an unbundled `swift run` keeps that legacy fallback.
+            guard allowPasswordFallback else {
+                throw InstallError.runnerFailed(Self.helperUnavailableMessage(
+                    status: helper?.status.label ?? "no helper available"))
+            }
             return .osascript
         }
     }
@@ -547,6 +559,13 @@ public final class Installer: @unchecked Sendable {
     /// and only toggling the Login Items switch fixes it. Never falls back to osascript.
     static let helperNotRespondingMessage =
         "The OpenProxy helper is not responding. In System Settings -> Login Items turn OpenProxy off and on again, then choose Retry setup in the OpenProxy menu."
+
+    /// A bundled app's helper could not be registered at all: there is no password fallback,
+    /// so say what failed and how to try again.
+    static func helperUnavailableMessage(status: String) -> String {
+        "The OpenProxy helper could not be registered (status: \(status)). "
+            + "Choose Retry setup in the OpenProxy menu."
+    }
 
     /// The legacy privileged edit: one `osascript` shell script, `set -e` at the front so the
     /// trailing flush can never mask an earlier hosts failure.

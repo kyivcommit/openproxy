@@ -1549,6 +1549,20 @@ struct AppModelTests {
     }
 }
 
+@Suite("AppGraph")
+struct AppGraphTests {
+    @Test func aBundleShippingTheDaemonPlistIsTreatedAsBundled() throws {
+        let bundle = FileManager.default.temporaryDirectory.appending(path: "Fake-\(UUID().uuidString).app")
+        let daemonDir = bundle.appending(path: "Contents/Library/LaunchDaemons")
+        try FileManager.default.createDirectory(at: daemonDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: bundle) }
+
+        #expect(AppGraph.helperIsBundled(inBundleAt: bundle) == false)
+        try Data().write(to: daemonDir.appending(path: "dev.openproxy.helper.plist"))
+        #expect(AppGraph.helperIsBundled(inBundleAt: bundle))
+    }
+}
+
 /// The production full-uninstall wipe against real temp directories: only a missing directory
 /// is a success, every other listing or removal error must surface so the app does not quit
 /// with its data still on disk.
