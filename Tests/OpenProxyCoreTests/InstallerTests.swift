@@ -517,6 +517,106 @@ struct InstallerTests {
         #expect(login.contains("security delete-certificate -t -Z \"$hash\""))
     }
 
+    // MARK: - R34: the admin prompt only when the privileged domains still need cleanup
+
+    /// Answers the unprivileged probes the way a clean per-user install does: no certificate in
+    /// the System keychain and no admin trust settings (the exact texts macOS prints).
+    private func cleanProbeRunner() -> FakeCommandRunner {
+        FakeCommandRunner(handler: { command in
+            if command.contains("find-certificate") && command.contains("System.keychain") {
+                return CommandResult(
+                    status: 44,
+                    standardError: "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.")
+            }
+            if command.contains("dump-trust-settings") {
+                return CommandResult(
+                    status: 1,
+                    standardError: "SecTrustSettingsCopyCertificates: No Trust Settings were found.")
+            }
+            return CommandResult(status: 0)
+        })
+    }
+
+    @Test func removeCASkipsTheAdminPromptWhenThereIsNothingPrivilegedToClean() async throws {
+        // The current per-user install: no System-keychain certificate, no admin trust, and the
+        // hosts line is already gone. Only the trust-settings authorization stays.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = cleanProbeRunner()
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.isEmpty)
+        #expect(commands.commands.contains { $0.contains("security remove-trusted-cert ") })
+    }
+
+    @Test func removeCARunsThePrivilegedScriptWhenTheSystemKeychainStillHasTheCertificate() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            if command.contains("find-certificate") && command.contains("System.keychain") {
+                return CommandResult(status: 0, standardOutput: "keychain: \"/Library/Keychains/System.keychain\"")
+            }
+            return CommandResult(status: 0)
+        })
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.count == 1)
+        #expect(runner.scripts.first?.contains("delete-certificate") == true)
+    }
+
+    @Test func removeCARunsThePrivilegedScriptWhenAdminTrustMentionsTheCA() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            if command.contains("find-certificate") && command.contains("System.keychain") {
+                return CommandResult(
+                    status: 44,
+                    standardError: "The specified item could not be found in the keychain.")
+            }
+            if command.contains("dump-trust-settings") {
+                return CommandResult(status: 0, standardOutput: "Trust Settings:\n  OpenProxy Local CA")
+            }
+            return CommandResult(status: 0)
+        })
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.count == 1)
+    }
+
+    @Test func removeCARunsThePrivilegedScriptWhenHostsIsStillRouted() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = cleanProbeRunner()
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.count == 1)
+        #expect(runner.scripts.first?.contains("sed -E") == true)
+    }
+
+    @Test func removeCARunsThePrivilegedScriptWhenAProbeFailsUnexpectedly() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = FakeCommandRunner(handler: { command in
+            if command.contains("find-certificate") && command.contains("System.keychain") {
+                return CommandResult(status: 1, standardError: "SecKeychainSearchCopyNext: The authorization was denied")
+            }
+            return CommandResult(status: 0)
+        })
+
+        try await makeInstaller(runner: runner, commandRunner: commands, hostsPath: hostsPath).removeCA()
+
+        #expect(runner.scripts.count == 1)
+    }
+
     @Test func removeCAReportsLeftoverCleanupFailureAfterHostsRemoval() async throws {
         let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
         defer { try? FileManager.default.removeItem(atPath: hostsPath) }

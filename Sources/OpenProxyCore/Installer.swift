@@ -593,27 +593,31 @@ public final class Installer: @unchecked Sendable {
     /// and sweeps a leftover CA from the System keychain; phase B (unprivileged) removes the
     /// user-domain trust and the login-keychain certificate. Hosts restore must never be
     /// blocked by the sweeps, and a leftover cleanup failure must be reported, not swallowed.
-    /// The root helper stays registered (idle, it only edits the one hosts line on request);
-    /// unregistering it would force the next setup through the Launch Items toggle dance.
+    /// The privileged phase runs only when `needsPrivilegedCleanup()` finds something there,
+    /// so a plain per-user uninstall never shows the admin password prompt. The root helper
+    /// stays registered (idle, it only edits the one hosts line on request); unregistering it
+    /// would force the next setup through the Launch Items toggle dance.
     public func removeCA() async throws {
         // Item 3 / TOCTOU: never point the privileged `remove-trusted-cert -d` at the
         // user-writable ca.pem. Validate the file against the CA's own SHA-256 fingerprint,
         // then drop admin trust for a root-owned copy, so a swap before the admin prompt
         // cannot make root untrust some other certificate.
         var failures: [String] = []
-        let fingerprint = (try? String(contentsOf: caPEMURL, encoding: .utf8))
-            .flatMap(Self.sha256Fingerprint(ofPEM:))
-        let script = """
-        set -e
-        \(Self.hostsEditScript(hostsPath: hostsPath, adding: false))
-        \(Self.removeAdminTrustScript(caPEMURL: caPEMURL, expectedFingerprint: fingerprint))
-        \(Self.deleteCertificatesScript(commonName: caCommonName, keychain: "/Library/Keychains/System.keychain"))
-        dscacheutil -flushcache
-        """
-        do {
-            try await runner.run(script: script)
-        } catch {
-            failures.append("privileged cleanup: \(error)")
+        if await needsPrivilegedCleanup() {
+            let fingerprint = (try? String(contentsOf: caPEMURL, encoding: .utf8))
+                .flatMap(Self.sha256Fingerprint(ofPEM:))
+            let script = """
+            set -e
+            \(Self.hostsEditScript(hostsPath: hostsPath, adding: false))
+            \(Self.removeAdminTrustScript(caPEMURL: caPEMURL, expectedFingerprint: fingerprint))
+            \(Self.deleteCertificatesScript(commonName: caCommonName, keychain: "/Library/Keychains/System.keychain"))
+            dscacheutil -flushcache
+            """
+            do {
+                try await runner.run(script: script)
+            } catch {
+                failures.append("privileged cleanup: \(error)")
+            }
         }
         if let failure = await removeUserDomainTrust() {
             failures.append(failure)
@@ -621,6 +625,38 @@ public final class Installer: @unchecked Sendable {
         guard failures.isEmpty else {
             throw InstallError.caRemovalFailed(failures.joined(separator: "; "))
         }
+    }
+
+    /// Whether the privileged domains still have something to clean: a certificate with our
+    /// name in the System keychain, admin-domain trust for our CA, or a hosts line still routed
+    /// here. All probes are unprivileged, so a false answer means `removeCA()` can skip the
+    /// admin password prompt entirely. A probe that fails for any reason other than
+    /// "nothing there" reads as true: cleaning unnecessarily is safer than leaving trust behind.
+    public func needsPrivilegedCleanup() async -> Bool {
+        // (c) A hosts line still routed here must be restored (and `.unknown` is not proof).
+        switch hostsEntryState() {
+        case .present, .unknown: return true
+        case .absent: break
+        }
+        // (a) Our certificate in the System keychain.
+        let systemCert = await commandRunner.run(
+            "security find-certificate -c \(Self.quoted(caCommonName)) /Library/Keychains/System.keychain",
+            timeout: Self.statusTimeout)
+        if systemCert.succeeded { return true }
+        guard Self.reportsNothingToClean(systemCert) else { return true }
+        // (b) Admin-domain trust settings naming our CA.
+        let adminTrust = await commandRunner.run(
+            "security dump-trust-settings -d", timeout: Self.statusTimeout)
+        if adminTrust.succeeded { return adminTrust.standardOutput.contains(caCommonName) }
+        return !Self.reportsNothingToClean(adminTrust)
+    }
+
+    /// The two ways a `security` probe reports "nothing here": an item that could not be found
+    /// (find-certificate) and an empty trust-settings domain (dump-trust-settings). Both are
+    /// expected answers, not probe failures.
+    static func reportsNothingToClean(_ result: CommandResult) -> Bool {
+        let text = (result.standardError + "\n" + result.standardOutput).lowercased()
+        return text.contains("could not be found") || text.contains("no trust settings")
     }
 
     /// Whether the managed hosts entry is present, absent, or could not be determined.
