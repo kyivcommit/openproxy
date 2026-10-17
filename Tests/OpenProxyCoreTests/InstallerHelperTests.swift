@@ -24,8 +24,14 @@ struct InstallerHelperRoutingTests {
     }
 
     private final class SucceedingCommandRunner: CommandRunning, @unchecked Sendable {
+        /// Makes any command containing this text fail, for the trust-cleanup failure paths.
+        var failingContains: String?
+
         func run(_ command: String, timeout: Duration) async -> CommandResult {
-            CommandResult(status: 0)
+            if let failingContains, command.contains(failingContains) {
+                return CommandResult(status: 1, standardError: "denied")
+            }
+            return CommandResult(status: 0)
         }
     }
 
@@ -91,13 +97,14 @@ struct InstallerHelperRoutingTests {
     private func makeInstaller(
         runner: RecordingRunner,
         hostsPath: String,
+        commandRunner: CommandRunning = SucceedingCommandRunner(),
         editor: HostsEditing? = nil,
         helper: HelperRegistering? = nil
     ) -> Installer {
         Installer(
             caPEMURL: Self.caURL,
             runner: runner,
-            commandRunner: SucceedingCommandRunner(),
+            commandRunner: commandRunner,
             hostsPath: hostsPath,
             hostsEditor: editor,
             helper: helper)
@@ -494,5 +501,85 @@ struct InstallerHelperRoutingTests {
 
         #expect(runner.scripts.count == 1)
         #expect(runner.scripts.first?.contains("delete-certificate") == true)
+    }
+
+    @Test func removeCAUnregistersTheHelperEvenWhenTrustCleanupFails() async throws {
+        // The helper must not stay registered just because an earlier cleanup step failed.
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = SucceedingCommandRunner()
+        commands.failingContains = "remove-trusted-cert"
+        let helper = FakeHelper(status: .enabled)
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath, commandRunner: commands,
+                editor: FakeHostsEditor(), helper: helper).removeCA()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.unregisterCount == 1)
+        #expect(try #require(thrown?.description).contains("trust"))
+    }
+
+    @Test func removeCAUnregistersTheHelperEvenWhenThePrivilegedCleanupFails() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        runner.error = EditorFailure()
+        let helper = FakeHelper(status: .enabled)
+
+        await #expect(throws: InstallError.self) {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath,
+                editor: FakeHostsEditor(), helper: helper).removeCA()
+        }
+        #expect(helper.unregisterCount == 1)
+    }
+
+    @Test func removeCAReportsBothTrustAndHelperUnregisterFailures() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let commands = SucceedingCommandRunner()
+        commands.failingContains = "remove-trusted-cert"
+        let helper = FakeHelper(status: .enabled)
+        helper.unregisterError = EditorFailure()
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath, commandRunner: commands,
+                editor: FakeHostsEditor(), helper: helper).removeCA()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(helper.unregisterCount == 1)
+        let message = try #require(thrown?.description)
+        #expect(message.contains("trust"))
+        #expect(message.contains("helper unregister"))
+    }
+
+    @Test func removeCAReportsAHelperUnregisterFailureOnItsOwn() async throws {
+        let hostsPath = try makeHostsFile("127.0.0.1 localhost\n\(hostsEntry)\n")
+        defer { try? FileManager.default.removeItem(atPath: hostsPath) }
+        let runner = RecordingRunner()
+        let helper = FakeHelper(status: .enabled)
+        helper.unregisterError = EditorFailure()
+
+        var thrown: InstallError?
+        do {
+            try await makeInstaller(
+                runner: runner, hostsPath: hostsPath,
+                editor: FakeHostsEditor(), helper: helper).removeCA()
+        } catch let error as InstallError {
+            thrown = error
+        }
+
+        #expect(try #require(thrown?.description).contains("helper unregister"))
     }
 }

@@ -331,33 +331,54 @@ public final class AppModel {
     }
 
     /// Menu "Uninstall OpenProxy...": confirm, then the full teardown. Restoring `/etc/hosts`
-    /// is attempted first and is never skipped by a later failure; failures become warnings.
+    /// is attempted first and is never skipped by a later failure; every step is collected so
+    /// the app only wipes its data and quits when nothing is left behind.
     public func uninstallOpenProxy() async {
         guard uninstallDecision.confirmUninstall() else { return }
         routingState = .settingUp
+        var failures: [String] = []
 
-        // 1. Restore /etc/hosts first — the safety-critical step.
+        // 1. Restore /etc/hosts first — the safety-critical step. If the call failed, only
+        // continue when the entry is really gone; otherwise stopping is the safe choice, since
+        // continuing would drop autostart and the CA while clients are still routed to a dead
+        // proxy.
         do {
             try await installer.setHostsEntry(present: false)
         } catch {
-            warn(.uninstall, "Could not restore /etc/hosts: \(error).")
+            guard !installer.hostsEntryPresent() else {
+                warn(.uninstall, "Uninstall stopped: openrouter.ai is still routed to this Mac "
+                    + "because /etc/hosts could not be restored: \(error). Fix it and try again.")
+                routingState = .error("uninstall stopped: /etc/hosts could not be restored")
+                return
+            }
+            // The call reported an error but the entry is really gone: the step succeeded.
         }
 
         // 2. Autostart off.
-        unregisterLoginItem()
+        if let failure = unregisterLoginItem() {
+            failures.append(failure)
+        }
 
         // 3. CA trust + keychains + helper unregister.
         do {
             try await installer.removeCA()
         } catch {
-            warn(.uninstall, "Removing the CA failed: \(error).")
+            failures.append("CA cleanup: \(error)")
         }
 
-        // 4. Wipe the app data (ca.pem, ca.key, settings.json, stats.sqlite).
+        // 4. Only wipe the data (removeCA reads ca.pem to retry) and quit when every step
+        // succeeded.
+        guard failures.isEmpty else {
+            warn(.uninstall, "Uninstall incomplete: \(failures.joined(separator: "; ")). Try again.")
+            routingState = .error("uninstall incomplete")
+            return
+        }
         do {
             try dataRemover.removeAppData()
         } catch {
-            warn(.uninstall, "Could not remove OpenProxy data: \(error).")
+            warn(.uninstall, "Uninstall incomplete: could not remove OpenProxy data: \(error). Try again.")
+            routingState = .error("uninstall incomplete")
+            return
         }
 
         // 5. Quit.
@@ -504,14 +525,20 @@ public final class AppModel {
 
     /// Turns autostart off, reporting a failure as a warning. Never throws: the hosts entry
     /// has already been restored, so a failed unregister must not undo that or block the flow.
-    private func unregisterLoginItem() {
+    /// Turns autostart off. Never throws: returns the failure detail (and warns) when it
+    /// fails, so the full uninstall can list it without aborting the flow.
+    @discardableResult
+    private func unregisterLoginItem() -> String? {
         do {
             try loginItem.unregister()
             loginItemStatus = loginItem.status
             clearWarnings([.autostart])
+            return nil
         } catch {
             loginItemStatus = loginItem.status
-            warn(.autostart, "Autostart could not be turned off: \(error).")
+            let message = "Autostart could not be turned off: \(error)."
+            warn(.autostart, message)
+            return message
         }
     }
 

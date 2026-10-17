@@ -260,8 +260,9 @@ public struct InstallStatus: Equatable, Sendable {
 public enum InstallError: Error, Equatable, Sendable {
     case runnerFailed(String)
     case commandFailed(command: String, status: Int32)
-    /// The safety-critical hosts restore succeeded, but leftover CA trust cleanup did not.
-    case trustCleanupFailed(String)
+    /// One or more CA-cleanup steps failed. Lists every failed step, so a helper-unregister
+    /// error is never swallowed behind an earlier trust-cleanup failure.
+    case caRemovalFailed(String)
 }
 
 extension InstallError: CustomStringConvertible {
@@ -271,9 +272,8 @@ extension InstallError: CustomStringConvertible {
         switch self {
         case .runnerFailed(let message): return message
         case .commandFailed(let command, let status): return "Command failed with status \(status): \(command)"
-        case .trustCleanupFailed(let detail):
-            return "openrouter.ai access was restored, but removing the CA trust did not fully "
-                + "succeed: \(detail)"
+        case .caRemovalFailed(let detail):
+            return "Removing the CA did not fully succeed: \(detail)"
         }
     }
 }
@@ -571,6 +571,7 @@ public final class Installer: @unchecked Sendable {
         // user-writable ca.pem. Validate the file against the CA's own SHA-256 fingerprint,
         // then drop admin trust for a root-owned copy, so a swap before the admin prompt
         // cannot make root untrust some other certificate.
+        var failures: [String] = []
         let fingerprint = (try? String(contentsOf: caPEMURL, encoding: .utf8))
             .flatMap(Self.sha256Fingerprint(ofPEM:))
         let script = """
@@ -583,14 +584,29 @@ public final class Installer: @unchecked Sendable {
         do {
             try await runner.run(script: script)
         } catch {
-            throw InstallError.runnerFailed(String(describing: error))
+            failures.append("privileged cleanup: \(error)")
         }
-        // The hosts entry is already gone at this point, so this is a warning-level failure
-        // (never a rollback), but it must not be reported as a clean success either.
         if let failure = await removeUserDomainTrust() {
-            throw InstallError.trustCleanupFailed(failure)
+            failures.append(failure)
         }
-        try? helper?.unregister()
+        // Always unregister the helper, even when an earlier CA-cleanup step failed: without
+        // the CA it has nothing left to do, and a swallowed error would leave a stale daemon
+        // registered with no way for the user to see why.
+        do {
+            try helper?.unregister()
+        } catch {
+            failures.append("helper unregister: \(error)")
+        }
+        guard failures.isEmpty else {
+            throw InstallError.caRemovalFailed(failures.joined(separator: "; "))
+        }
+    }
+
+    /// True when the managed hosts entry is currently present. Read-only, no status probes;
+    /// the uninstall flow uses it to tell a failed removal that really left the entry behind
+    /// from one that reported an error but removed it anyway.
+    public func hostsEntryPresent() -> Bool {
+        HostsFile.isPresent(in: Self.readHosts(hostsPath))
     }
 
     /// Drops admin-domain trust that an older `add-trusted-cert -d` install left. The privileged

@@ -1098,7 +1098,44 @@ struct AppModelTests {
         #expect(h.helper.unregisterCount == 1)
     }
 
-    @Test func uninstallAttemptsHostsFirstEvenWhenALaterStepFails() async throws {
+    @Test func uninstallStopsWhenHostsRemovalFailedAndEntryRemains() async throws {
+        // The safety-critical step: if /etc/hosts still routes openrouter.ai, continuing would
+        // drop autostart and the CA while every client is pointed at a dead proxy.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("hosts locked")
+        h.uninstallDecision.confirm = true
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.loginItem.unregisterCount == 0)
+        #expect(h.runner.scripts.isEmpty)
+        #expect(h.dataRemover.count == 0)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains { $0.key == .uninstall && $0.message.contains("Uninstall stopped") })
+        #expect(model.routingState == .error("uninstall stopped: /etc/hosts could not be restored"))
+    }
+
+    @Test func uninstallContinuesWhenHostsRemovalThrewButEntryIsGone() async throws {
+        // The call reported an error, but the entry really is gone: the step succeeded.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("hosts locked")
+        h.uninstallDecision.confirm = true
+        try "127.0.0.1 localhost\n".write(
+            to: h.directory.appending(path: "hosts"), atomically: true, encoding: .utf8)
+        let model = h.model()
+
+        await model.uninstallOpenProxy()
+
+        #expect(h.loginItem.unregisterCount == 1)
+        #expect(h.dataRemover.count == 1)
+        #expect(h.quitDecision.terminateCount == 1)
+        #expect(!model.warnings.contains { $0.key == .uninstall })
+    }
+
+    @Test func uninstallWithAnyFailingStepDoesNotWipeDataOrTerminate() async throws {
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
         h.helper.status = .enabled
         h.uninstallDecision.confirm = true
@@ -1109,11 +1146,14 @@ struct AppModelTests {
         await model.uninstallOpenProxy()
 
         #expect(h.hostsEditor.requests == [false])
-        #expect(model.warnings.contains { $0.key == .uninstall })
-        #expect(h.quitDecision.terminateCount == 1)
+        #expect(h.loginItem.unregisterCount == 1)
+        #expect(h.dataRemover.count == 0)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains { $0.key == .uninstall && $0.message.contains("Uninstall incomplete") })
+        #expect(model.routingState == .error("uninstall incomplete"))
     }
 
-    @Test func uninstallDataFailureIsAWarningButStillQuits() async throws {
+    @Test func uninstallDataFailureKeepsRunningAndListsTheStep() async throws {
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
         h.helper.status = .enabled
         h.uninstallDecision.confirm = true
@@ -1122,8 +1162,9 @@ struct AppModelTests {
 
         await model.uninstallOpenProxy()
 
-        #expect(model.warnings.contains { $0.message.contains("OpenProxy data") })
-        #expect(h.quitDecision.terminateCount == 1)
+        #expect(h.dataRemover.count == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains { $0.key == .uninstall && $0.message.contains("OpenProxy data") })
     }
 
     @Test func removeCAUnregistersTheHelperAndClearsWarningsOnSuccess() async throws {
