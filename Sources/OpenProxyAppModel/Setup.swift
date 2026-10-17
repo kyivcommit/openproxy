@@ -89,13 +89,30 @@ public struct AppSupportDataRemover: AppDataRemoving {
 
     public func removeAppData() throws {
         let manager = FileManager.default
-        guard let contents = try? manager.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: nil)
-        else {
+        let contents: [URL]
+        do {
+            contents = try manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        } catch {
+            // Only a directory that is not there means there is nothing to remove. Any other
+            // listing error (unreadable directory, I/O failure) must surface: swallowing it
+            // would let the uninstall quit with the data still on disk.
+            guard Self.isMissingDirectory(error) else { throw error }
             return
         }
         for item in contents {
             try manager.removeItem(at: item)
         }
+    }
+
+    /// True only for "no such file or directory" errors, the one listing failure that means
+    /// the data is already gone.
+    static func isMissingDirectory(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain,
+           (nsError.code == CocoaError.fileNoSuchFile.rawValue
+            || nsError.code == CocoaError.fileReadNoSuchFile.rawValue) {
+            return true
+        }
+        return nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(ENOENT)
     }
 }

@@ -1325,3 +1325,55 @@ struct AppModelTests {
         #expect(!model.warnings.contains { $0.key == .install })
     }
 }
+
+/// The production full-uninstall wipe against real temp directories: only a missing directory
+/// is a success, every other listing or removal error must surface so the app does not quit
+/// with its data still on disk.
+@Suite("AppSupportDataRemover")
+struct AppSupportDataRemoverTests {
+    private func makeDirectory() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "openproxy-data-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    @Test func removesEveryFileInTheDirectory() throws {
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path) }
+        try Data("ca".utf8).write(to: dir.appending(path: "ca.pem"))
+        try Data("stats".utf8).write(to: dir.appending(path: "stats.sqlite"))
+
+        try AppSupportDataRemover(directory: dir).removeAppData()
+
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+    }
+
+    @Test func aMissingDirectoryIsFine() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "openproxy-data-\(UUID().uuidString)")
+        try AppSupportDataRemover(directory: dir).removeAppData()
+    }
+
+    @Test func anUnreadableDirectoryThrows() throws {
+        guard getuid() != 0 else { return } // chmod does not restrict root
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: dir.path)
+
+        #expect(throws: (any Error).self) {
+            try AppSupportDataRemover(directory: dir).removeAppData()
+        }
+    }
+
+    @Test func aRemovalFailureThrows() throws {
+        guard getuid() != 0 else { return }
+        // Listing works (r-x) but unlinking needs write on the parent, so the removal fails.
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path) }
+        try Data("ca".utf8).write(to: dir.appending(path: "ca.pem"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+
+        #expect(throws: (any Error).self) {
+            try AppSupportDataRemover(directory: dir).removeAppData()
+        }
+    }
+}
