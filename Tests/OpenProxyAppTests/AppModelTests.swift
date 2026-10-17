@@ -581,8 +581,8 @@ struct AppModelTests {
     }
 
     @Test func installApprovalWarningRendersWithExactlyOnePeriod() async throws {
-        // The thrown text ends with a period and the Install wrapper adds one; the rendered
-        // warning must not read "press Install again.. The system was not fully changed."
+        // The thrown text ends with a period and the install wrapper adds one; the rendered
+        // warning must not read ".. The system was not fully changed."
         let h = try Harness()
         h.helper.status = .enabled
         h.hostsEditor.error = HostsEditingError.timedOut
@@ -592,7 +592,8 @@ struct AppModelTests {
 
         let warning = try #require(model.warnings.first { $0.key == .install })
         #expect(!warning.message.contains(".."))
-        #expect(warning.message.contains("press Install again. The system was not fully changed."))
+        #expect(warning.message.contains(
+            "then choose Retry setup in the OpenProxy menu. The system was not fully changed."))
     }
 
     @Test func launchDoesNotRegisterAutostart() async throws {
@@ -1056,6 +1057,7 @@ struct AppModelTests {
         #expect(h.runner.scripts.count == 1)
         #expect(model.settings.setupComplete)
         #expect(model.routingState == .active)
+        #expect(!model.warnings.contains { $0.key == .autostart })
         #expect(h.orderLog.sequence == ["trust", "helper", "autostart", "hosts", "nodeenv"])
     }
 
@@ -1118,6 +1120,51 @@ struct AppModelTests {
         #expect(h.hostsEditor.requests.isEmpty)
         #expect(h.runner.scripts.isEmpty)
         #expect(!model.status.hostsEntry)
+    }
+
+    @Test func retrySetupRunsTheSetupWithoutTheWelcomeDialog() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.loginItem.status = .requiresApproval
+        h.loginItem.statusAfterRegister = .requiresApproval
+        let model = h.model()
+        await model.install()
+        #expect(!model.settings.setupComplete)
+        #expect(model.canRetrySetup)
+        #expect(h.setupDecision.count == 0)
+
+        h.loginItem.status = .enabled
+        h.loginItem.statusAfterRegister = .enabled
+        await model.retrySetup()
+
+        #expect(h.setupDecision.count == 0)
+        #expect(model.settings.setupComplete)
+        #expect(h.runner.scripts.count == 1)
+    }
+
+    @Test func retrySetupIsNotOfferedOrRunWhenSetupIsComplete() async throws {
+        let h = try Harness()
+        let model = h.model()
+        await model.install()
+        #expect(model.settings.setupComplete)
+        #expect(model.canRetrySetup == false)
+        let scripts = h.runner.scripts.count
+
+        await model.retrySetup()
+
+        #expect(h.runner.scripts.count == scripts)
+    }
+
+    @Test func retrySetupIsNotOfferedBeforeSetupHasEverRun() async throws {
+        let h = try Harness()
+        let model = h.model()
+        #expect(model.routingState == .inactive)
+        #expect(model.canRetrySetup == false)
+
+        await model.retrySetup()
+
+        #expect(h.runner.scripts.isEmpty)
+        #expect(h.loginItem.registerCount == 0)
+        #expect(h.setupDecision.count == 0)
     }
 
     @Test func setupSkipsTheTrustDialogWhenTheCAIsAlreadyTrusted() async throws {

@@ -49,6 +49,13 @@ struct MenuView: View {
             }
 
             Divider()
+            if model.canRetrySetup {
+                HStack {
+                    Button("Retry setup") { Task { await model.retrySetup() } }
+                        .help("Runs the setup again without the welcome dialog: CA trust, the helper, autostart, the openrouter.ai hosts entry and the Node env.")
+                    Spacer()
+                }
+            }
             HStack {
                 Button("Uninstall OpenProxy...") { Task { await model.uninstallOpenProxy() } }
                     .help("Removes the certificate, the helper, autostart and all OpenProxy data, then quits.")

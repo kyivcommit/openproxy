@@ -162,7 +162,18 @@ struct InstallerHelperRoutingTests {
         #expect(runner.scripts.isEmpty)
         let message = try #require(thrown?.description)
         #expect(message.contains("Login Items"))
-        #expect(message.contains("Install again"))
+        #expect(message.contains("Retry setup"))
+    }
+
+    @Test func approvalMessagesPointAtRetrySetupNotAnInstallButton() {
+        // There is no Install button anymore: the menu's Retry setup runs the flow again, and
+        // approval continues the in-progress setup by itself.
+        for message in [Installer.approvalMessage, Installer.helperNotRespondingMessage] {
+            #expect(!message.contains("Install"))
+            #expect(message.contains("Login Items"))
+            #expect(message.contains("Retry setup"))
+        }
+        #expect(Installer.approvalMessage.contains("continues automatically"))
     }
 
     @Test func installOpensApprovalSettingsWhenApprovalIsAlreadyRequired() async throws {

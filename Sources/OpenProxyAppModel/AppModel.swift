@@ -223,6 +223,22 @@ public final class AppModel {
         await restoreRouting()
     }
 
+    /// True when the menu should offer Retry setup: the setup never completed and it is not
+    /// currently running.
+    public var canRetrySetup: Bool {
+        guard !settings.setupComplete else { return false }
+        switch routingState {
+        case .waitingForApproval, .error: return true
+        case .inactive, .settingUp, .active: return false
+        }
+    }
+
+    /// The menu's Retry setup action: the same flow as Continue, without the welcome dialog.
+    public func retrySetup() async {
+        guard canRetrySetup else { return }
+        await install()
+    }
+
     /// The automatic setup, in order: CA trust, helper (waiting for approval instead of
     /// failing), autostart (also a wait when approval is pending), the hosts entry, then the
     /// Node env. `setupComplete` is set only when the critical steps succeed.
@@ -303,15 +319,20 @@ public final class AppModel {
     }
 
     /// Polls the autostart status until it becomes enabled, or gives up after the poll budget.
+    /// Approval also resolves the pending-approval warning from `registerLoginItem()`.
     private func waitForAutostartEnabled() async -> Bool {
         for _ in 0..<maxApprovalPolls {
             if loginItem.status == .enabled {
                 loginItemStatus = .enabled
+                clearWarnings([.autostart])
                 return true
             }
             await waiting.waitForNextApprovalPoll()
             loginItemStatus = loginItem.status
-            if loginItemStatus == .enabled { return true }
+            if loginItemStatus == .enabled {
+                clearWarnings([.autostart])
+                return true
+            }
         }
         return false
     }

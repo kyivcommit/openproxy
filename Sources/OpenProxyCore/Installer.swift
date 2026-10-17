@@ -539,13 +539,14 @@ public final class Installer: @unchecked Sendable {
     /// The one-time approval is a user action, so the error tells them exactly what to do.
     static let approvalMessage =
         "OpenProxy needs one-time approval to change /etc/hosts without a password. "
-        + "Open System Settings -> Login Items, turn on OpenProxy, then press Install again."
+        + "Open System Settings -> Login Items, turn on OpenProxy, then choose Retry setup "
+        + "in the OpenProxy menu. Setup also continues automatically once the approval arrives."
 
     /// An enabled helper whose signature was not recorded when macOS auto-enabled it (the
     /// Remove CA -> Install again case): launchd fails to spawn it, so the XPC call times out
     /// and only toggling the Login Items switch fixes it. Never falls back to osascript.
     static let helperNotRespondingMessage =
-        "The OpenProxy helper is not responding. In System Settings -> Login Items turn OpenProxy off and on again, then press Install again."
+        "The OpenProxy helper is not responding. In System Settings -> Login Items turn OpenProxy off and on again, then choose Retry setup in the OpenProxy menu."
 
     /// The legacy privileged edit: one `osascript` shell script, `set -e` at the front so the
     /// trailing flush can never mask an earlier hosts failure.
