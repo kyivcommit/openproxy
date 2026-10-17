@@ -31,6 +31,8 @@ private final class HelperDelegate: NSObject, NSXPCListenerDelegate {
         helperLog.log("connection accepted")
         newConnection.exportedInterface = NSXPCInterface(with: HelperProtocol.self)
         newConnection.exportedObject = HelperService()
+        // A listener delegate must resume the connection itself; otherwise no message is delivered.
+        newConnection.resume()
         return true
     }
 }
