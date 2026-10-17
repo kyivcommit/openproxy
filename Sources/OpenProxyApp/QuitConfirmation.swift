@@ -10,7 +10,8 @@ struct AlertQuitDecision: QuitDecision {
         alert.messageText = "openrouter.ai is still routed to this proxy"
         alert.informativeText = "Restoring access removes the openrouter.ai hosts entry and turns "
             + "autostart off; the certificate and the root helper stay, so setup is not repeated. "
-            + "To remove those as well, use Uninstall OpenProxy... in the menu."
+            + "To remove the certificate and the local data as well, use Uninstall OpenProxy... in "
+            + "the menu; the helper stays registered there too."
         alert.addButton(withTitle: "Restore access and quit")
         alert.addButton(withTitle: "Quit anyway")
         alert.addButton(withTitle: "Cancel")

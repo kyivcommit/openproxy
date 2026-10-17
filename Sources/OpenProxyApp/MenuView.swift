@@ -58,7 +58,7 @@ struct MenuView: View {
             }
             HStack {
                 Button("Uninstall OpenProxy...") { Task { await model.uninstallOpenProxy() } }
-                    .help("Removes the certificate, the helper, autostart and all OpenProxy data, then quits.")
+                    .help("Removes the certificate, autostart and all OpenProxy data, then quits. The root helper stays registered but idle.")
                 Spacer()
             }
             HStack {

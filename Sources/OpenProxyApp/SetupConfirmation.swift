@@ -22,8 +22,9 @@ struct AlertUninstallDecision: UninstallDecision {
     func confirmUninstall() -> Bool {
         let alert = NSAlert()
         alert.messageText = "Remove OpenProxy?"
-        alert.informativeText = "This removes the certificate, the helper, autostart and all "
-            + "OpenProxy data, then quits."
+        alert.informativeText = "This removes the certificate, autostart and all "
+            + "OpenProxy data, then quits. The root helper stays registered but idle, and goes "
+            + "away when you delete the app."
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn

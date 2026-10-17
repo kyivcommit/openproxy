@@ -12,9 +12,9 @@ extension ProxyServer: ProxyServerControlling {}
 
 /// What the user chose when quitting with `openrouter.ai` still routed here.
 public enum QuitChoice: Equatable, Sendable {
-    /// Restore access: remove the hosts entry and autostart, then quit. The CA, its trust,
-    /// the root helper and the local data stay; the menu's Uninstall OpenProxy... removes
-    /// everything.
+    /// Restore access: remove the hosts entry and autostart, then quit. The CA, its trust, the
+    /// root helper and the local data stay; the menu's Uninstall OpenProxy... removes the CA,
+    /// its trust and the data too (the root helper stays registered).
     case restoreAccessAndQuit
     case quitAnyway
     case cancel
@@ -377,8 +377,9 @@ public final class AppModel {
         await refresh()
     }
 
-    /// The legacy CA teardown (admin trust, System keychain sweep, user-domain trust, helper
-    /// unregister). Used by the full uninstall flow; kept callable for the popup safety net.
+    /// The legacy CA teardown (admin trust, System keychain sweep, user-domain trust). The
+    /// root helper stays registered but idle. Used by the full uninstall flow; kept callable
+    /// for the popup safety net.
     public func removeCA() async {
         do {
             try await installer.removeCA()
@@ -427,7 +428,8 @@ public final class AppModel {
             failures.append(failure)
         }
 
-        // 3. CA trust + keychains + helper unregister.
+        // 3. CA trust + keychains. The root helper stays registered but idle: it only edits
+        // the one hosts line on request, and unregistering it would break the next setup.
         do {
             try await installer.removeCA()
         } catch {
