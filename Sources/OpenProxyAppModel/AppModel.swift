@@ -224,8 +224,8 @@ public final class AppModel {
     }
 
     /// The automatic setup, in order: CA trust, helper (waiting for approval instead of
-    /// failing), autostart, the hosts entry, then the Node env. `setupComplete` is set only
-    /// when the critical steps succeed.
+    /// failing), autostart (also a wait when approval is pending), the hosts entry, then the
+    /// Node env. `setupComplete` is set only when the critical steps succeed.
     public func install() async {
         guard await startServer(ifFailed: "Setup was skipped; the hosts entry was left unchanged.") else {
             await refresh()
@@ -251,8 +251,21 @@ public final class AppModel {
                 }
             }
 
-            // (c) autostart
+            // (c) autostart: a LaunchAgent must be enabled before anything routes here, or a
+            // crash would leave openrouter.ai pointing at a dead proxy. Pending approval is a
+            // wait, not a failure, so poll it with the injected clock.
             registerLoginItem()
+            if loginItemStatus != .enabled {
+                routingState = .waitingForApproval
+                guard await waitForAutostartEnabled() else {
+                    warn(.install, "Timed out waiting for autostart approval in System Settings -> "
+                        + "Login Items. The openrouter.ai route was not added; choose Retry setup "
+                        + "in the OpenProxy menu once autostart is enabled.")
+                    routingState = .error("waiting for autostart approval timed out")
+                    await refresh()
+                    return
+                }
+            }
 
             // (d) hosts entry (helper when enabled, osascript otherwise)
             try await installer.setHostsEntry(present: true)
@@ -289,11 +302,28 @@ public final class AppModel {
         return false
     }
 
-    /// Every later launch: if the CA is trusted, the helper is enabled and the hosts entry is
-    /// missing, re-add it silently. Never runs when the proxy could not bind.
+    /// Polls the autostart status until it becomes enabled, or gives up after the poll budget.
+    private func waitForAutostartEnabled() async -> Bool {
+        for _ in 0..<maxApprovalPolls {
+            if loginItem.status == .enabled {
+                loginItemStatus = .enabled
+                return true
+            }
+            await waiting.waitForNextApprovalPoll()
+            loginItemStatus = loginItem.status
+            if loginItemStatus == .enabled { return true }
+        }
+        return false
+    }
+
+    /// Every later launch: if the CA is trusted, the helper is enabled, autostart is enabled and
+    /// the hosts entry is missing, re-add it silently. Never runs when the proxy could not bind,
+    /// and never adds the route while autostart is off.
     private func restoreRouting() async {
         guard serverRunning else { return }
-        guard status.caTrusted, helperStatus == .enabled, !status.hostsEntry else {
+        guard status.caTrusted, helperStatus == .enabled, loginItemStatus == .enabled,
+              !status.hostsEntry
+        else {
             if status.hostsEntry { routingState = .active }
             return
         }

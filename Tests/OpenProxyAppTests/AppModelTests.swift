@@ -1040,6 +1040,86 @@ struct AppModelTests {
         #expect(h.orderLog.sequence == ["trust", "helper", "autostart", "hosts", "nodeenv"])
     }
 
+    @Test func installWaitsForAutostartApprovalBeforeAddingHosts() async throws {
+        // Autostart must be enabled before anything routes here: an approved-but-pending
+        // registration is a wait, and the hosts entry/Node env follow once it flips.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.loginItem.status = .requiresApproval
+        h.loginItem.statusAfterRegister = .requiresApproval
+        h.waiting.onPoll = { h.loginItem.status = .enabled }
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.loginItem.registerCount == 1)
+        #expect(h.waiting.count == 1)
+        #expect(h.runner.scripts.count == 1)
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
+        #expect(h.orderLog.sequence == ["trust", "helper", "autostart", "hosts", "nodeenv"])
+    }
+
+    @Test func installDoesNotRouteWhenAutostartNeedsApproval() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.loginItem.status = .requiresApproval
+        h.loginItem.statusAfterRegister = .requiresApproval
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.runner.scripts.isEmpty)
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(!model.settings.setupComplete)
+        #expect(model.routingState == .error("waiting for autostart approval timed out"))
+        #expect(model.warnings.contains { $0.key == .autostart })
+        #expect(model.warnings.contains { $0.key == .install && $0.message.contains("Timed out") })
+        #expect(!model.status.hostsEntry)
+    }
+
+    @Test func installContinuesWhenAutostartIsApprovedLater() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.loginItem.status = .requiresApproval
+        h.loginItem.statusAfterRegister = .requiresApproval
+        let model = h.model()
+        await model.install()
+        #expect(!model.settings.setupComplete)
+
+        h.loginItem.status = .enabled
+        h.loginItem.statusAfterRegister = .enabled
+        await model.install()
+
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
+        #expect(h.runner.scripts.count == 1)
+    }
+
+    @Test func installDoesNotRouteWhenAutostartRegistrationFails() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.loginItem.registerError = LoginItemTestError.denied
+        h.loginItem.status = .notFound
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.runner.scripts.isEmpty)
+        #expect(!model.settings.setupComplete)
+        #expect(model.warnings.contains { $0.key == .autostart && $0.message.contains("registration failed") })
+    }
+
+    @Test func laterLaunchDoesNotRestoreHostsWithoutAutostart() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .requiresApproval
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(h.runner.scripts.isEmpty)
+        #expect(!model.status.hostsEntry)
+    }
+
     @Test func setupSkipsTheTrustDialogWhenTheCAIsAlreadyTrusted() async throws {
         let h = try Harness()
         let model = h.model()
