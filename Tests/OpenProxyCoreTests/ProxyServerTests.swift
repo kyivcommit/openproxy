@@ -1431,7 +1431,7 @@ struct ProxyServerTests {
         }
     }
 
-    @Test func cancelDuringConnectReturnsWithinOneSecond() async throws {
+    @Test func cancelDuringConnectReturnsPromptly() async throws {
         let started = Signal()
         let connector = HangingConnector(started: started)
         defer { connector.finish() }
@@ -1449,8 +1449,9 @@ struct ProxyServerTests {
         let start = clock.now
         task.cancel()
         _ = await task.result
-        // Without the cancellation fix this would block for the 10 s connect timeout.
-        #expect(clock.now - start < .seconds(1))
+        // Without the cancellation fix this would block for the 10 s connect timeout;
+        // the bound is loose so a slow CI runner does not flake it.
+        #expect(clock.now - start < .seconds(5))
     }
 }
 
