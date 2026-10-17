@@ -5,6 +5,8 @@ import Foundation
 struct ResponseFacts: Equatable, Sendable {
     var actualTier: String?
     var provider: String?
+    /// The concrete model the response served, which an alias request only reveals here.
+    var model: String?
     var promptTokens: Int?
     var completionTokens: Int?
     var costUSD: Double?
@@ -72,6 +74,7 @@ final class ResponseTap: @unchecked Sendable {
     private func merge(_ new: ResponseFacts) {
         if let value = new.actualTier { facts.actualTier = value }
         if let value = new.provider { facts.provider = value }
+        if let value = new.model { facts.model = value }
         if let value = new.promptTokens { facts.promptTokens = value }
         if let value = new.completionTokens { facts.completionTokens = value }
         if let value = new.costUSD { facts.costUSD = value }
@@ -86,6 +89,7 @@ final class ResponseTap: @unchecked Sendable {
             facts.actualTier = (usage?["service_tier"] as? String) ?? (usage?["speed"] as? String)
         }
         facts.provider = object["provider"] as? String
+        facts.model = object["model"] as? String
         // /api/v1/messages (Anthropic) names these input/output_tokens.
         facts.promptTokens = (usage?["prompt_tokens"] as? Int) ?? (usage?["input_tokens"] as? Int)
         facts.completionTokens = (usage?["completion_tokens"] as? Int) ?? (usage?["output_tokens"] as? Int)
