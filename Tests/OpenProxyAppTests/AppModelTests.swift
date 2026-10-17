@@ -1053,7 +1053,7 @@ struct AppModelTests {
         #expect(model.settings.setupComplete)
     }
 
-    @Test func notNowChangesNothingAndAsksAgainNextLaunch() async throws {
+    @Test func notNowSkipsSetupAndAsksAgainNextLaunch() async throws {
         let h = try Harness()
         h.setupDecision.confirm = false
         let first = h.model()
