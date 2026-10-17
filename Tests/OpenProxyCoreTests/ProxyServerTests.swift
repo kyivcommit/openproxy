@@ -698,6 +698,35 @@ struct ProxyServerTests {
         #expect(scalarText(url.path, sql: "SELECT endpoint_tag FROM requests LIMIT 1 OFFSET 1") == "best-unquantized")
     }
 
+    @Test func aliasResolvesForTierLookupSoFlexApplies() async throws {
+        let endpoints = endpointsJSON([endpointJSON("flex-endpoint", prompt: 0.5, tier: "flex")])
+        let fetcher = FakeEndpointsFetcher(dataByModel: ["x/y-2026": endpoints])
+        let alias = Data(#"{"model":"~vendor/name-latest"}"#.utf8)
+        let replies = [
+            FakeReply(status: 200, body: Data(#"{"model":"x/y-2026"}"#.utf8)),
+            FakeReply(status: 503),
+            FakeReply(status: 200, body: Data(#"{"ok":true}"#.utf8)),
+        ]
+        try await withServer(
+            settings: Settings(sort: .smartPrice, tier: .flex), replies: replies, fetcher: fetcher
+        ) { harness in
+            let headers = ["Authorization": "Bearer k"]
+            // Request 1 learns the concrete model; it carries no tier yet.
+            _ = try await harness.request("POST", chatPath, body: alias, headers: headers)
+            #expect(harness.upstream.requests[0].body == alias)
+            #expect(await waitUntil({ harness.upstream.requests.count == 1 }, timeout: 2))
+
+            // Request 2 asks for endpoints of the concrete id, so flex is injected and
+            // the Flex policy retries the 503 instead of handing it to the client.
+            let response = try await harness.request("POST", chatPath, body: alias, headers: headers)
+            #expect(response.status == 200)
+            let attempts = harness.upstream.requests.dropFirst()
+            #expect(attempts.count == 2)
+            #expect(attempts.allSatisfy { json($0.body)["service_tier"] as? String == "flex" })
+            #expect(attempts.allSatisfy { json($0.body)["model"] as? String == "~vendor/name-latest" })
+        }
+    }
+
     @Test func disabledSettingsNeverLearnOrInjectAliases() async throws {
         let fetcher = FakeEndpointsFetcher(dataByModel: [
             "x/y-2026": endpointsJSON([endpointJSON("cheap", prompt: 0.5)]),

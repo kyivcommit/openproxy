@@ -89,7 +89,11 @@ final class ResponseTap: @unchecked Sendable {
             facts.actualTier = (usage?["service_tier"] as? String) ?? (usage?["speed"] as? String)
         }
         facts.provider = object["provider"] as? String
-        facts.model = object["model"] as? String
+        // /api/v1/responses and /api/v1/messages report the served model nested in an event
+        // (`response.created`, `message_start`); the top-level field wins when both are present.
+        facts.model = (object["model"] as? String)
+            ?? ((object["response"] as? [String: Any])?["model"] as? String)
+            ?? ((object["message"] as? [String: Any])?["model"] as? String)
         // /api/v1/messages (Anthropic) names these input/output_tokens.
         facts.promptTokens = (usage?["prompt_tokens"] as? Int) ?? (usage?["input_tokens"] as? Int)
         facts.completionTokens = (usage?["completion_tokens"] as? Int) ?? (usage?["output_tokens"] as? Int)
