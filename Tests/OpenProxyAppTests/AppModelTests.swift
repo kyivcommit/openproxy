@@ -867,7 +867,7 @@ struct AppModelTests {
     }
 
     @Test func quitWithoutHostsEntryTerminatesWithoutPrompt() async throws {
-        let h = try Harness()
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
         let model = h.model()
         await model.refresh()
         #expect(model.status.hostsEntry == false)
@@ -876,6 +876,89 @@ struct AppModelTests {
 
         #expect(h.quitDecision.decideCount == 0)
         #expect(h.quitDecision.terminateCount == 1)
+    }
+
+    @Test func quitWithFailingHelperAndAbsentHostsTerminatesWithoutPopup() async throws {
+        // The helper failed, but the fresh read proves the entry is gone: no popup is needed.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("helper unavailable")
+        let model = h.model()
+        await model.refresh()
+
+        await model.quit()
+
+        #expect(h.hostsEditor.requests == [false])
+        #expect(h.quitDecision.decideCount == 0)
+        #expect(h.quitDecision.terminateCount == 1)
+        #expect(model.warnings.contains { $0.key == .quit && $0.message.contains("could not restore") })
+    }
+
+    @Test func quitWithFailingHelperAndPresentHostsShowsThePopup() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("helper unavailable")
+        h.quitDecision.choice = .cancel
+        let model = h.model()
+        await model.refresh()
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+    }
+
+    @Test func quitWithFailingHelperAndUnreadableHostsShowsThePopup() async throws {
+        // unknown is not absent: quitting could still break every client.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("helper unavailable")
+        h.quitDecision.choice = .cancel
+        try FileManager.default.removeItem(at: h.directory.appending(path: "hosts"))
+        try FileManager.default.createDirectory(
+            at: h.directory.appending(path: "hosts"), withIntermediateDirectories: true)
+        let model = h.model()
+        await model.refresh()
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains {
+            $0.key == .quit && $0.message.contains("could not confirm that openrouter.ai is no longer routed here")
+        })
+    }
+
+    @Test func quitUsesAFreshHostsStateNotTheCachedStatus() async throws {
+        // The cached status was probed while the file was clean; the entry appeared since.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        let model = h.model()
+        await model.refresh()
+        #expect(model.status.hostsEntry == false)
+        try "127.0.0.1 localhost\n127.0.0.1 openrouter.ai # openproxy\n".write(
+            to: h.directory.appending(path: "hosts"), atomically: true, encoding: .utf8)
+        h.quitDecision.choice = .cancel
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+    }
+
+    @Test func quitWithUnreadableHostsWithoutAHelperShowsThePopup() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        try FileManager.default.removeItem(at: h.directory.appending(path: "hosts"))
+        try FileManager.default.createDirectory(
+            at: h.directory.appending(path: "hosts"), withIntermediateDirectories: true)
+        h.quitDecision.choice = .cancel
+        let model = h.model()
+        await model.refresh()
+
+        await model.quit()
+
+        #expect(h.quitDecision.decideCount == 1)
+        #expect(h.quitDecision.terminateCount == 0)
+        #expect(model.warnings.contains { $0.key == .quit && $0.message.contains("could not confirm") })
     }
 
     @Test func uninstallAndQuitStaysRunningWhenHostsRemovalFails() async throws {

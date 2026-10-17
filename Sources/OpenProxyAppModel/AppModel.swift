@@ -410,29 +410,45 @@ public final class AppModel {
                 warn(.quit, "The root helper could not restore access to openrouter.ai: \(error).")
             }
         }
-        if status.hostsEntry {
-            switch quitDecision.decide() {
-            case .cancel:
+        // Read the hosts entry fresh, never the cached `status`: Installer.status() maps a
+        // read/decoding error to `false`, so trusting it could quit silently while
+        // openrouter.ai is still routed here. Only a confirmed `.absent` is safe to quit on.
+        switch installer.hostsEntryState() {
+        case .absent:
+            quitDecision.terminate()
+        case .present:
+            await quitAfterConfirmation()
+        case .unknown:
+            warn(.quit, "The hosts file could not be read, so OpenProxy could not confirm that "
+                + "openrouter.ai is no longer routed here.")
+            await quitAfterConfirmation()
+        }
+    }
+
+    /// The fallback confirmation: the popup's choices, then the existing safety checks, all
+    /// against the fresh hosts state rather than the cached status.
+    private func quitAfterConfirmation() async {
+        switch quitDecision.decide() {
+        case .cancel:
+            return
+        case .quitAnyway:
+            break
+        case .uninstallAndQuit:
+            await uninstall()
+            // Terminate only once the hosts entry is confirmed gone: a cancelled or
+            // failed uninstall would otherwise leave openrouter.ai pointing at a dead
+            // listener the moment the app exits.
+            guard installer.hostsEntryState() == .absent else {
+                warn(.quit, "Quit was cancelled: openrouter.ai is still routed to this Mac, so quitting "
+                    + "would break every client. Fix the uninstall problem, then quit again.")
                 return
-            case .quitAnyway:
-                break
-            case .uninstallAndQuit:
-                await uninstall()
-                // Terminate only once the hosts entry is confirmed gone: a cancelled or
-                // failed uninstall would otherwise leave openrouter.ai pointing at a dead
-                // listener the moment the app exits.
-                if status.hostsEntry {
-                    warn(.quit, "Quit was cancelled: openrouter.ai is still routed to this Mac, so quitting "
-                        + "would break every client. Fix the uninstall problem, then quit again.")
-                    return
-                }
-                // Finding 4: hosts was restored but the leftover CA-trust cleanup failed, so
-                // terminating now would drop that warning and leave per-user trust behind.
-                if warnings.contains(where: { $0.key == .uninstall }) {
-                    warn(.quit, "Quit was cancelled: openrouter.ai access was restored, but the CA trust "
-                        + "could not be fully removed, so per-user trust may remain. Fix it, then quit again.")
-                    return
-                }
+            }
+            // Finding 4: hosts was restored but the leftover CA-trust cleanup failed, so
+            // terminating now would drop that warning and leave per-user trust behind.
+            if warnings.contains(where: { $0.key == .uninstall }) {
+                warn(.quit, "Quit was cancelled: openrouter.ai access was restored, but the CA trust "
+                    + "could not be fully removed, so per-user trust may remain. Fix it, then quit again.")
+                return
             }
         }
         quitDecision.terminate()
