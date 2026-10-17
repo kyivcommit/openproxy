@@ -12,7 +12,7 @@ macOS 14+ only.
 
 ## How it works
 
-1. Install adds a local CA (name-constrained to `openrouter.ai`) as a **per-user** trusted root in your **login keychain**, and a line `127.0.0.1 openrouter.ai # openproxy` to `/etc/hosts`.
+1. First launch sets up a local CA (name-constrained to `openrouter.ai`) as a **per-user** trusted root in your **login keychain**. While the app runs, a line `127.0.0.1 openrouter.ai # openproxy` is in `/etc/hosts`; quitting the app removes it.
 2. The app listens on `0.0.0.0:443` (no root needed on macOS), accepts loopback peers only, terminates TLS with a leaf for `openrouter.ai`, rewrites the JSON body, and forwards to the real OpenRouter. The upstream address is resolved over DoH so it never loops back to itself.
 3. Responses (including SSE) are streamed through without buffering.
 
@@ -33,16 +33,21 @@ Aliases (`~vendor/name-latest`) work too: the `~` id names no model, so the rank
 
 Speed needs the client's key. `throughput_last_30m` and `latency_last_30m` come back only when the `/endpoints` call carries an API key, so the catalog sends the most recent client `Authorization` header it has seen. That value is kept **in memory only** — never logged and never written to disk — and is used solely for the openrouter.ai endpoints request. A model first cached without a key is refetched in the background once a key appears, at most once per TTL window; with no key the speed criteria are skipped and the tie-break falls straight to uptime.
 
-## Install
+## First launch
 
-Build: `scripts/build-app.sh` → `build/OpenProxy.app` (ad-hoc signed). Open it, then press **Install** in the menu bar. Install shows **two** authorization prompts:
+Build: `scripts/build-app.sh` → `build/OpenProxy.app` (ad-hoc signed). Open it. On the first launch a welcome dialog explains what will be set up; **Continue** does everything, there is no Install button:
 
-1. A trust dialog for the CA. Trust is **per-user**: the CA certificate is imported into your **login keychain**, not the System keychain.
-2. The admin password prompt for the `/etc/hosts` change and the DNS cache flush.
+1. A trust dialog for the CA (Touch ID or password). Trust is **per-user**: the CA certificate is imported into your **login keychain**, not the System keychain. It is skipped when the CA is already trusted.
+2. A small root helper (`dev.openproxy.helper`, a launch daemon registered with `SMAppService`) edits `/etc/hosts` without a password prompt. macOS asks you once to approve it in **System Settings → Login Items**; the app opens that pane and continues by itself when approval arrives. The helper has exactly one operation: add or remove the managed hosts line.
+3. Autostart (a LaunchAgent, so the proxy is back after login) and `NODE_EXTRA_CA_CERTS` for processes started afterwards (see [Client trust](#client-trust)); if the last step fails it only shows a warning.
 
-Dismissing either prompt stops the install: the hosts entry is written only after the CA is verified as trusted, so clients are never routed to a proxy they cannot trust. The hosts file is left untouched; if the trust prompt was dismissed after the certificate was imported, an untrusted certificate may remain in your login keychain — press **Uninstall** to remove it. On success, Install also sets `NODE_EXTRA_CA_CERTS` for processes started afterwards (see [Client trust](#client-trust)); if that step fails it only shows a warning and the install still stands.
+The hosts entry is written only after the CA is verified as trusted and the helper is approved, so clients are never routed to a proxy they cannot trust. **Not now** in the welcome dialog changes nothing and asks again on the next launch.
+
+Later launches add the hosts line back silently. **Quit** removes it again without any prompt when the helper works; if the helper cannot be used, Quit falls back to a confirmation dialog so you are never left routed to a dead proxy.
 
 If macOS cannot show the trust dialog, trust the CA manually in Keychain Access: **login** keychain → `OpenProxy Local CA` → *Get Info* → *Always Trust*. The certificate lives in the login keychain; the private key stays in `~/Library/Application Support/openproxy/ca.key` (mode 600).
+
+Notes for ad-hoc builds: macOS ties the helper approval to its code signature, so after **rebuilding** the app the helper may stop answering ("The OpenProxy helper is not responding"). Switch OpenProxy off and on again in Login Items (with Touch ID) to refresh it. A signed release build does not have this churn.
 
 ### Client trust
 
@@ -62,7 +67,7 @@ Measured on macOS 27 with per-user trust: curl, Apple Python 3 and opencode (fre
 
 In Node, `--use-system-ca` alone does not pick up the login-keychain CA; use `NODE_EXTRA_CA_CERTS` or the `--use-system-ca --use-bundled-ca` pair. Python 3.13+ strict verification now works with this CA because it carries the Subject and Authority Key Identifier extensions.
 
-**Install** already sets `NODE_EXTRA_CA_CERTS` to this app's `ca.pem` (`launchctl setenv`), so Node clients started after Install trust the CA with no shell configuration. The value only reaches processes started afterwards: **restart your terminal app and any running agents** so they pick it up. If a client is launched by a path that does not inherit the launchd environment, set the variable yourself:
+**First launch** already sets `NODE_EXTRA_CA_CERTS` to this app's `ca.pem` (`launchctl setenv`), so Node clients started afterwards trust the CA with no shell configuration. The value only reaches processes started afterwards: **restart your terminal app and any running agents** so they pick it up. If a client is launched by a path that does not inherit the launchd environment, set the variable yourself:
 
 ```sh
 export NODE_EXTRA_CA_CERTS="$HOME/Library/Application Support/openproxy/ca.pem"
@@ -72,7 +77,7 @@ The app never edits a shell profile.
 
 ### Long-running clients
 
-A process that started before Install keeps the trust store it loaded at startup, so it must be restarted to pick up the new CA. For `opencode`:
+A process that started before setup keeps the trust store it loaded at startup, so it must be restarted to pick up the new CA. For `opencode`:
 
 ```sh
 opencode service restart
@@ -82,7 +87,7 @@ Restart any other long-running client the same way.
 
 ## Uninstall / emergency removal
 
-Press **Uninstall** in the menu. It removes the hosts line first (the safety-critical step), then the per-user trust and the certificate from your login keychain, clears the `NODE_EXTRA_CA_CERTS` variable Install set (only when it still points at our `ca.pem`), and best-effort sweeps any certificate an older install left in the System keychain.
+macOS has no hook for deleting an app, so use **Uninstall OpenProxy…** at the bottom of the menu *before* you delete it. After a confirmation it removes the hosts line first (the safety-critical step), then autostart, the per-user trust and the certificate from your login keychain, the root helper, the `NODE_EXTRA_CA_CERTS` variable (only when it still points at our `ca.pem`), best-effort any certificate an older install left in the System keychain, and finally all OpenProxy data (`~/Library/Application Support/openproxy`), then quits. Removing the CA shows the usual authorization dialogs once.
 
 If the app is gone or crashed, `openrouter.ai` stays unreachable until the hosts line is removed. Do it manually, then remove the trust and the certificate:
 
@@ -90,7 +95,7 @@ If the app is gone or crashed, `openrouter.ai` stays unreachable until the hosts
 # 1. unblock openrouter.ai
 sudo sed -i '' '/# openproxy/d' /etc/hosts && sudo dscacheutil -flushcache
 
-# 2. drop the CA from the launchd environment (Install set it)
+# 2. drop the CA from the launchd environment (setup set it)
 launchctl getenv NODE_EXTRA_CA_CERTS | grep -Fq "$HOME/Library/Application Support/openproxy/ca.pem" \
   && launchctl unsetenv NODE_EXTRA_CA_CERTS
 
@@ -120,7 +125,8 @@ CI (`.github/workflows/ci.yml`) builds, tests and packages on macOS.
 
 - Trust is **per-user**: the CA is trusted and stored only in your login keychain, not system-wide, and the private key is a file (`ca.key`, mode 600) under `~/Library/Application Support/openproxy/`. The CA is name-constrained to `openrouter.ai`, but anyone who can read the key could impersonate that one host to this Mac. Treat the directory as sensitive.
 - `Authorization` headers are forwarded to OpenRouter only and never logged or stored.
-- While the hosts entry is installed and the app is not running, `openrouter.ai` is unreachable from this Mac.
+- While the hosts entry is present and the app is not running (for example after a crash; autostart restarts it), `openrouter.ai` is unreachable from this Mac.
+- The root helper accepts connections only from a process signed with the OpenProxy app's own signing identifier and can only add or remove the one managed hosts line. With ad-hoc signing that identifier is not a strong secret: any local process can sign itself with it, so the worst case is toggling that single hosts line.
 
 ## License
 
