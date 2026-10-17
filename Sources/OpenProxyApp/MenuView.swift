@@ -55,6 +55,11 @@ struct MenuView: View {
                 Spacer()
                 Button("Quit") { Task { await model.quit() } }
             }
+            HStack {
+                Button("Remove CA...") { Task { await model.removeCA() } }
+                    .help("Removes the local CA trust and the root helper; leaves /etc/hosts restored.")
+                Spacer()
+            }
         }
         .padding(14)
         .frame(width: 340)
@@ -132,6 +137,7 @@ struct MenuView: View {
             statusRow("Port 443 listening", model.status.portListening)
             nodeEnvRow
             Text("Autostart: \(model.loginItemStatus.label)").font(.caption)
+            Text("Hosts helper: \(model.helperStatus.label)").font(.caption)
         }
     }
 

@@ -103,6 +103,8 @@ public final class AppModel {
     public private(set) var summary: StatsSummary
     public private(set) var warnings: [Warning] = []
     public private(set) var loginItemStatus: LoginItemStatus = .notRegistered
+    /// The root helper's registration state, refreshed with the rest of the status.
+    public private(set) var helperStatus: HelperStatus = .notFound
 
     /// Derived from `status`, so it stays visible for as long as the danger lasts
     /// (proxy quit/crashed with the hosts entry still routed) and clears itself.
@@ -132,6 +134,7 @@ public final class AppModel {
     private let installer: Installer
     private let server: ProxyServerControlling
     private let loginItem: LoginItemRegistering
+    private let helper: HelperRegistering
     private let quitDecision: QuitDecision
 
     public init(
@@ -141,6 +144,7 @@ public final class AppModel {
         server: ProxyServerControlling,
         loginItem: LoginItemRegistering,
         quitDecision: QuitDecision,
+        helper: HelperRegistering = NoHelperRegistration(),
         caWasRegenerated: Bool = false,
         refreshInterval: Duration = .seconds(5)
     ) {
@@ -149,18 +153,22 @@ public final class AppModel {
         self.installer = installer
         self.server = server
         self.loginItem = loginItem
+        self.helper = helper
         self.quitDecision = quitDecision
         self.refreshInterval = refreshInterval
         self.currentSettings = settingsStore.settings
         self.status = InstallStatus(caTrusted: false, caPresent: false, hostsEntry: false, portListening: false, nodeCAEnv: false)
         self.summary = StatsSummary()
+        self.helperStatus = helper.status
         if caWasRegenerated {
             warn(.legacyCA, "The local CA was regenerated because it predates this version; the trusted copy is stale. Run Uninstall, then Install again.")
         }
     }
 
     public func start() async {
-        _ = await startServer(ifFailed: "The hosts entry was left unchanged.")
+        guard await startServer(ifFailed: "The hosts entry was left unchanged.") else { return }
+        await refresh()
+        await restoreRouteOnLaunch()
     }
 
     public func stop() async {
@@ -192,6 +200,8 @@ public final class AppModel {
         }
         do {
             let warnings = try await installer.install()
+            // Arm the silent launch-time restore; only a real Install does this.
+            settings.routeOnLaunch = true
             // The stale install/uninstall/start/quit warnings are no longer true.
             clearWarnings(Self.operationWarningKeys)
             // The CA and hosts are in place; only the Node env step can have warned.
@@ -209,6 +219,8 @@ public final class AppModel {
     public func uninstall() async {
         do {
             try await installer.uninstall()
+            // Uninstall disarms the launch-time restore: nothing should route on next launch.
+            settings.routeOnLaunch = false
             clearWarnings(Self.operationWarningKeys)
         } catch {
             warn(.uninstall, "Uninstall failed: \(error).")
@@ -216,9 +228,50 @@ public final class AppModel {
         await refresh()
     }
 
+    /// Menu "Remove CA...": the full legacy teardown (admin trust, System keychain sweep,
+    /// user-domain trust) plus the helper unregister. Separate from Uninstall, which now
+    /// only restores `/etc/hosts` and leaves the CA.
+    public func removeCA() async {
+        do {
+            try await installer.removeCA()
+            settings.routeOnLaunch = false
+            clearWarnings(Self.operationWarningKeys)
+        } catch {
+            warn(.uninstall, "Removing the CA failed: \(error).")
+        }
+        await refresh()
+    }
+
+    /// Silently re-adds the hosts route on launch when the previous Install armed it, the CA
+    /// is trusted and the approved helper is enabled. Never runs when the proxy could not bind:
+    /// routing to a dead listener would block every client.
+    private func restoreRouteOnLaunch() async {
+        guard settings.routeOnLaunch, status.caTrusted, helperStatus == .enabled,
+              !status.hostsEntry, serverRunning else { return }
+        do {
+            try await installer.setHostsEntry(present: true)
+            await refresh()
+        } catch {
+            warn(.install, "Could not restore the openrouter.ai route: \(error).")
+        }
+    }
+
     /// Spec 9 / finding: quitting with the hosts entry installed leaves
     /// `openrouter.ai` routed to a dead proxy, so confirm before terminating.
     public func quit() async {
+        // With the approved helper, quitting silently restores access to openrouter.ai and
+        // leaves routeOnLaunch armed, so the next launch restores routing — no popup needed.
+        if helperStatus == .enabled {
+            do {
+                try await installer.setHostsEntry(present: false)
+                settings.routeOnLaunch = true
+                quitDecision.terminate()
+            } catch {
+                warn(.quit, "Quit was cancelled: the root helper could not restore access to "
+                    + "openrouter.ai: \(error). Fix it, then quit again.")
+            }
+            return
+        }
         if status.hostsEntry {
             switch quitDecision.decide() {
             case .cancel:
@@ -270,6 +323,7 @@ public final class AppModel {
             summary = stats.summary(since: Date(timeIntervalSinceNow: -86_400))
             status = await installer.status()
             loginItemStatus = loginItem.status
+            helperStatus = helper.status
             // The regenerated-CA warning stops being true once the current CA is trusted and
             // its hosts entry is in place; until then it stays visible.
             if status.caTrusted && status.hostsEntry {

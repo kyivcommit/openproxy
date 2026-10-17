@@ -95,6 +95,39 @@ private final class FakeLoginItem: LoginItemRegistering, @unchecked Sendable {
     }
 }
 
+/// Records root-helper registration and lets a test force the reported status.
+private final class FakeHelper: HelperRegistering, @unchecked Sendable {
+    var status: HelperStatus = .notFound
+    var registerError: Error?
+    var statusAfterRegister: HelperStatus?
+    private(set) var registerCount = 0
+    private(set) var unregisterCount = 0
+    private(set) var openApprovalCount = 0
+
+    func register() throws {
+        registerCount += 1
+        if let registerError { throw registerError }
+        if let statusAfterRegister { status = statusAfterRegister }
+    }
+
+    func unregister() throws { unregisterCount += 1 }
+    func openApprovalSettings() { openApprovalCount += 1 }
+}
+
+/// Records the hosts edit the installer would route through the helper.
+private final class FakeHostsEditor: HostsEditing, @unchecked Sendable {
+    var error: Error?
+    private let lock = NSLock()
+    private var recorded: [Bool] = []
+
+    var requests: [Bool] { lock.withLock { recorded } }
+
+    func setHostsEntry(present: Bool) async throws {
+        lock.withLock { recorded.append(present) }
+        if let error { throw error }
+    }
+}
+
 /// Stands in for the NSAlert quit gate: records the chosen answer and any
 /// termination, so a test never really quits.
 @MainActor
@@ -121,6 +154,8 @@ private struct Harness {
     let installer: Installer
     let server: FakeServer
     let loginItem: FakeLoginItem
+    let helper: FakeHelper
+    let hostsEditor: FakeHostsEditor
     let quitDecision: FakeQuitDecision
 
     init(hostsText: String? = nil) throws {
@@ -138,11 +173,15 @@ private struct Harness {
         self.runner = FakeRunner()
         self.runner.hostsPath = hostsURL.path
         self.commandRunner = FakeCommandRunner()
+        self.hostsEditor = FakeHostsEditor()
+        self.helper = FakeHelper()
         self.installer = Installer(
             caPEMURL: ca.caCertificatePEMURL,
             runner: runner,
             commandRunner: commandRunner,
-            hostsPath: hostsURL.path)
+            hostsPath: hostsURL.path,
+            hostsEditor: hostsEditor,
+            helper: helper)
         self.server = FakeServer()
         self.loginItem = FakeLoginItem()
         self.quitDecision = FakeQuitDecision()
@@ -152,7 +191,7 @@ private struct Harness {
         AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: loginItem, quitDecision: quitDecision,
-            refreshInterval: refreshInterval)
+            helper: helper, refreshInterval: refreshInterval)
     }
 
     /// Bounded polling helper: returns false after `timeout` so a missing
@@ -537,8 +576,9 @@ struct AppModelTests {
 
         #expect(h.quitDecision.decideCount == 1)
         #expect(h.quitDecision.terminateCount == 1)
-        // Uninstall ran before quitting, so the hosts entry and CA are removed.
-        #expect(h.runner.scripts.contains { $0.contains("delete-certificate") })
+        // Uninstall restored /etc/hosts before quitting; the CA is left for Remove CA....
+        #expect(h.runner.scripts.count == 1)
+        #expect(!model.status.hostsEntry)
     }
 
     @Test func quitAnywayLeavesHostsEntryAsIs() async throws {
@@ -596,23 +636,126 @@ struct AppModelTests {
         #expect(model.warnings.contains { $0.message.contains("still routed") })
     }
 
-    @Test func uninstallAndQuitStaysRunningWhenTrustCleanupFails() async throws {
+    @Test func quitWithHelperEnabledRemovesHostsSilentlyWithoutAPrompt() async throws {
+        // With the approved helper, quitting must not show the destructive-route popup: it
+        // silently restores access and leaves routeOnLaunch armed for the next launch.
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
         let model = h.model()
         await model.refresh()
-        #expect(model.status.hostsEntry)
-        // The hosts entry is restored, but the login-keychain trust cleanup fails.
-        h.commandRunner.errorOnContains = "remove-trusted-cert"
-        h.quitDecision.choice = .uninstallAndQuit
 
         await model.quit()
 
-        // Terminating would silently drop the trustCleanupFailed warning while per-user trust
-        // may remain, so stay running and surface it.
+        #expect(h.hostsEditor.requests == [false])
+        #expect(h.quitDecision.decideCount == 0)
+        #expect(h.quitDecision.terminateCount == 1)
+        #expect(model.settings.routeOnLaunch == true)
+        #expect(h.runner.scripts.isEmpty)
+    }
+
+    @Test func quitWithHelperEnabledStaysRunningWhenTheUnrouteFails() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = InstallError.runnerFailed("helper unavailable")
+        let model = h.model()
+        await model.refresh()
+
+        await model.quit()
+
         #expect(h.quitDecision.terminateCount == 0)
-        #expect(!model.status.hostsEntry)
-        #expect(model.warnings.contains { $0.key == .uninstall })
         #expect(model.warnings.contains { $0.key == .quit })
+    }
+
+    @Test func installArmsAndUninstallDisarmsRouteOnLaunch() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.install()
+        #expect(model.settings.routeOnLaunch)
+
+        await model.uninstall()
+        #expect(!model.settings.routeOnLaunch)
+    }
+
+    @Test func launchSilentlyAddsTheHostsEntryWhenArmed() async throws {
+        let h = try Harness()
+        h.helper.status = .enabled
+        let model = h.model()
+        model.settings.routeOnLaunch = true
+
+        await model.start()
+
+        #expect(h.hostsEditor.requests == [true])
+        #expect(h.runner.scripts.isEmpty)
+    }
+
+    @Test func launchDoesNotAddHostsWhenTheProxyCannotListen() async throws {
+        let h = try Harness()
+        h.helper.status = .enabled
+        h.server.startError = PortInUse()
+        let model = h.model()
+        model.settings.routeOnLaunch = true
+
+        await model.start()
+
+        // Routing to a dead listener would block every client, so the entry is never added.
+        #expect(h.hostsEditor.requests.isEmpty)
+    }
+
+    @Test func launchDoesNotAddHostsWithoutAHelper() async throws {
+        let h = try Harness()
+        h.helper.status = .notFound
+        let model = h.model()
+        model.settings.routeOnLaunch = true
+
+        await model.start()
+
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(h.runner.scripts.isEmpty)
+    }
+
+    @Test func launchDoesNotAddHostsWhenNotArmed() async throws {
+        let h = try Harness()
+        h.helper.status = .enabled
+        let model = h.model()
+
+        await model.start()
+
+        #expect(h.hostsEditor.requests.isEmpty)
+    }
+
+    @Test func removeCAUnregistersTheHelperAndClearsWarningsOnSuccess() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        let model = h.model()
+
+        await model.removeCA()
+
+        #expect(h.helper.unregisterCount == 1)
+        #expect(!model.settings.routeOnLaunch)
+        #expect(model.warnings.isEmpty)
+    }
+
+    @Test func removeCAFailureBecomesWarning() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.runner.error = InstallError.runnerFailed("boom")
+        let model = h.model()
+
+        await model.removeCA()
+
+        #expect(model.warnings.contains {
+            $0.key == .uninstall && $0.message.contains("Removing the CA")
+        })
+    }
+
+    @Test func refreshReportsHelperStatus() async throws {
+        let h = try Harness()
+        h.helper.status = .requiresApproval
+        let model = h.model()
+
+        await model.refresh()
+
+        #expect(model.helperStatus == .requiresApproval)
     }
 
     // MARK: - Item 1: keyed warnings clear on success

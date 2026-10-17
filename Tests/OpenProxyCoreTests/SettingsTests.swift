@@ -94,6 +94,26 @@ struct SettingsTests {
         #expect(SettingsStore(url: url).settings == Settings())
     }
 
+    @Test func routeOnLaunchDefaultsOffAndRoundTrips() throws {
+        // A fresh install must not silently route on launch; only a successful Install arms it.
+        #expect(Settings().routeOnLaunch == false)
+
+        let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = SettingsStore(url: url)
+        var settings = Settings()
+        settings.routeOnLaunch = true
+        store.settings = settings
+        try store.save()
+        #expect(SettingsStore(url: url).settings.routeOnLaunch)
+    }
+
+    @Test func decodedRouteOnLaunchToleratesMissingKey() throws {
+        // An older settings.json predates routeOnLaunch; decoding must default it off.
+        let settings = try JSONDecoder().decode(Settings.self, from: Data(#"{"sort":"price"}"#.utf8))
+        #expect(settings.routeOnLaunch == false)
+    }
+
     @Test func tierAvailabilityFields() {
         let availability = TierAvailability(hasFlex: true, hasPriority: false)
         #expect(availability.hasFlex)

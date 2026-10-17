@@ -30,7 +30,12 @@ public enum AppGraph {
         let catalog = EndpointCatalog(
             fetcher: UpstreamEndpointsFetcher(client: upstream),
             ttl: { [settingsStore] in TimeInterval(settingsStore.settings.pollMinutes * 60) })
-        let installer = Installer(ca: ca, runner: OsascriptRunner())
+        let installer = Installer(
+            caPEMURL: ca.caCertificatePEMURL,
+            runner: OsascriptRunner(),
+            commandRunner: ShellCommandRunner(),
+            hostsEditor: XPCHostsEditor(),
+            helper: SMAppServiceDaemon())
         let server = ProxyServer(
             ca: ca,
             upstream: upstream,
@@ -41,6 +46,7 @@ public enum AppGraph {
         return AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: SMAppServiceLoginItem(), quitDecision: quitDecision,
+            helper: SMAppServiceDaemon(),
             caWasRegenerated: ca.didRotateLegacyCA)
     }
 
