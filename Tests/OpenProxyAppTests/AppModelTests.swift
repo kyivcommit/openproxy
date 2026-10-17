@@ -86,12 +86,20 @@ private final class FailingUpstreamClient: UpstreamClient, @unchecked Sendable {
 /// Records autostart registration and lets a test force the reported status.
 private final class FakeLoginItem: LoginItemRegistering, @unchecked Sendable {
     var registerError: Error?
+    var unregisterError: Error?
     var status: LoginItemStatus = .enabled
     private(set) var registerCount = 0
+    private(set) var unregisterCount = 0
 
     func register() throws {
         registerCount += 1
         if let registerError { throw registerError }
+    }
+
+    func unregister() throws {
+        unregisterCount += 1
+        if let unregisterError { throw unregisterError }
+        status = .notRegistered
     }
 }
 
@@ -408,6 +416,80 @@ struct AppModelTests {
         await model.refresh()
 
         #expect(model.loginItemStatus == .requiresApproval)
+    }
+
+    // MARK: - Autostart is tied to Install/Uninstall, not to launch
+
+    @Test func launchDoesNotRegisterAutostart() async throws {
+        // A plain launch must not put OpenProxy in Login Items before the user installs.
+        let h = try Harness()
+        let model = h.model()
+
+        await model.start()
+
+        #expect(h.loginItem.registerCount == 0)
+    }
+
+    @Test func installRegistersAutostartOnce() async throws {
+        let h = try Harness()
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.loginItem.registerCount == 1)
+        #expect(model.loginItemStatus == .enabled)
+    }
+
+    @Test func installFailureDoesNotRegisterAutostart() async throws {
+        let h = try Harness()
+        h.runner.error = InstallError.runnerFailed("boom")
+        let model = h.model()
+
+        await model.install()
+
+        #expect(h.loginItem.registerCount == 0)
+    }
+
+    @Test func uninstallUnregistersAutostart() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+
+        await model.uninstall()
+
+        #expect(h.loginItem.unregisterCount == 1)
+    }
+
+    @Test func uninstallFailureDoesNotUnregisterAutostart() async throws {
+        // The hosts entry is still routed, so the app is still installed: keep autostart on.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.runner.error = InstallError.runnerFailed("boom")
+        let model = h.model()
+
+        await model.uninstall()
+
+        #expect(h.loginItem.unregisterCount == 0)
+    }
+
+    @Test func removeCAUnregistersAutostart() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+
+        await model.removeCA()
+
+        #expect(h.loginItem.unregisterCount == 1)
+    }
+
+    @Test func unregisterFailureBecomesWarningAndUninstallStillCompletes() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.loginItem.unregisterError = LoginItemTestError.denied
+        let model = h.model()
+
+        await model.uninstall()
+
+        // Restoring hosts is what matters; a failed autostart unregister only warns.
+        #expect(h.runner.scripts.count == 1)
+        #expect(!model.status.hostsEntry)
+        #expect(model.warnings.contains { $0.message.contains("Autostart") })
     }
 
     @Test func failedSettingsSaveBecomesWarningAndKeepsValue() throws {

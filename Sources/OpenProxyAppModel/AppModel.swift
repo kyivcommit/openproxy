@@ -204,6 +204,8 @@ public final class AppModel {
             settings.routeOnLaunch = true
             // The stale install/uninstall/start/quit warnings are no longer true.
             clearWarnings(Self.operationWarningKeys)
+            // Autostart is part of being installed: it stays registered until Uninstall/Remove CA.
+            registerLoginItem()
             // The CA and hosts are in place; only the Node env step can have warned.
             if let warning = warnings.first {
                 warn(.nodeEnv, warning)
@@ -222,6 +224,8 @@ public final class AppModel {
             // Uninstall disarms the launch-time restore: nothing should route on next launch.
             settings.routeOnLaunch = false
             clearWarnings(Self.operationWarningKeys)
+            // The hosts entry is gone, so autostart has nothing to restore: turn it off.
+            unregisterLoginItem()
         } catch {
             warn(.uninstall, "Uninstall failed: \(error).")
         }
@@ -236,6 +240,7 @@ public final class AppModel {
             try await installer.removeCA()
             settings.routeOnLaunch = false
             clearWarnings(Self.operationWarningKeys)
+            unregisterLoginItem()
         } catch {
             warn(.uninstall, "Removing the CA failed: \(error).")
         }
@@ -363,6 +368,21 @@ public final class AppModel {
         loginItemStatus = loginItem.status
         if loginItemStatus != .enabled {
             warn(.autostart, "Autostart is \(loginItemStatus.label).")
+        } else {
+            clearWarnings([.autostart])
+        }
+    }
+
+    /// Turns autostart off, reporting a failure as a warning. Never throws: the hosts entry
+    /// has already been restored, so a failed unregister must not undo that or block the flow.
+    private func unregisterLoginItem() {
+        do {
+            try loginItem.unregister()
+            loginItemStatus = loginItem.status
+            clearWarnings([.autostart])
+        } catch {
+            loginItemStatus = loginItem.status
+            warn(.autostart, "Autostart could not be turned off: \(error).")
         }
     }
 
