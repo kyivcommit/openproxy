@@ -28,7 +28,7 @@ public struct MenuLine: Equatable, Sendable {
 public enum MenuContent {
     /// The Node-env hint: install sets the variable for processes started afterwards.
     public static let nodeRestartHint =
-        "Restart your terminal app and any running agents so they pick up the CA."
+        "Restart terminals and agents to pick up the CA."
 
     /// The checked set of poll-minute choices; a current value outside the presets is appended
     /// so it can still be shown as checked.
@@ -113,7 +113,7 @@ public enum MenuContent {
             lines.append(statusLine("Node CA env", status.nodeCAEnv))
         }
         if status.nodeCAEnv {
-            lines.append(MenuLine(nodeRestartHint))
+            for part in wrapped(nodeRestartHint) { lines.append(MenuLine(part)) }
         }
         lines.append(MenuLine("Autostart: \(loginItem.label)"))
         lines.append(MenuLine("Hosts helper: \(helper.label)"))
@@ -143,8 +143,9 @@ public enum MenuContent {
         return lines
     }
 
-    /// Greedy word wrap for the disabled, non-scrolling menu rows. Long words are kept whole.
-    public static func wrapped(_ text: String, width: Int = 60) -> [String] {
+    /// Greedy word wrap for the disabled, non-scrolling menu rows, so no row grows the menu
+    /// past roughly 300 pt at the menu font. Long words are kept whole.
+    public static func wrapped(_ text: String, width: Int = 42) -> [String] {
         guard !text.isEmpty else { return [] }
         var result: [String] = []
         for paragraph in text.split(separator: "\n", omittingEmptySubsequences: false) {

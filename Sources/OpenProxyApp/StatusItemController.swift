@@ -82,7 +82,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         })
 
         let minutes = model.settings.pollMinutes
-        menu.addItem(submenu("Refresh endpoint data every \(minutes) min") { sub in
+        menu.addItem(submenu("Refresh every \(minutes) min") { sub in
             for choice in MenuContent.minuteChoices(current: minutes) {
                 let item = self.menuItem(
                     "\(choice) min", action: #selector(self.selectPollMinutes(_:)),
@@ -97,20 +97,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        menu.addItem(header("Stats (24h)"))
-        for line in MenuContent.statsLines(model.summary) {
-            menu.addItem(row(line))
-        }
-
-        menu.addItem(.separator())
-        menu.addItem(header("Status"))
-        for line in MenuContent.statusLines(
-            model.status,
-            loginItem: model.loginItemStatus,
-            helper: model.helperStatus,
-            routingLabel: model.routingLabel) {
-            menu.addItem(row(line))
-        }
+        menu.addItem(submenu("Stats (24h)") { sub in
+            for line in MenuContent.statsLines(model.summary) {
+                sub.addItem(self.row(line))
+            }
+        })
+        menu.addItem(submenu("Status") { sub in
+            for line in MenuContent.statusLines(
+                model.status,
+                loginItem: model.loginItemStatus,
+                helper: model.helperStatus,
+                routingLabel: model.routingLabel) {
+                sub.addItem(self.row(line))
+            }
+        })
         for line in MenuContent.warningLines(
             unreachable: model.unreachableWarning,
             untrustedCA: model.untrustedCAWarning,

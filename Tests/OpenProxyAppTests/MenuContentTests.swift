@@ -118,7 +118,7 @@ struct MenuContentTests {
 
         #expect(lines.contains(MenuLine("Node CA env: set (CA not installed)")))
         // Install sets the variable for later processes; the hint follows the variable, not the CA.
-        #expect(lines.contains(MenuLine(MenuContent.nodeRestartHint)))
+        #expect(lines.contains(MenuLine("Restart terminals and agents to pick up")))
     }
 
     @Test func nodeCAEnvSetWithTheCAInstalledAddsTheRestartHint() {
@@ -127,7 +127,10 @@ struct MenuContentTests {
             loginItem: .enabled, helper: .enabled, routingLabel: "active")
 
         #expect(lines.contains(MenuLine("Node CA env", marker: .check)))
-        #expect(lines.contains(MenuLine(MenuContent.nodeRestartHint)))
+        // The hint is wrapped so it cannot widen the menu.
+        #expect(lines.contains(MenuLine("Restart terminals and agents to pick up")))
+        #expect(lines.contains(MenuLine("the CA.")))
+        #expect(lines.allSatisfy { $0.text.count <= 42 })
     }
 
     @Test func minuteChoicesKeepPresetsAndAppendANonPresetCurrent() {
@@ -154,7 +157,7 @@ struct MenuContentTests {
         #expect(lines[2].text.hasPrefix("word word"))
         #expect(lines[3].marker == .none)
         #expect(lines[3].warning)
-        #expect(lines.allSatisfy { $0.text.count <= 60 })
+        #expect(lines.allSatisfy { $0.text.count <= 42 })
     }
 
     @Test func wrappedBreaksOnWidthAndKeepsLongWordsWhole() {
