@@ -4,8 +4,8 @@ import OpenProxyAppModel
 
 @main
 struct OpenProxyApp: App {
-    /// Left click shows the `MenuView` popover, right click the Control window; the AppKit
-    /// item is built here because `MenuBarExtra` cannot see right clicks.
+    /// Left click shows the policy, stats and status menu, right click the app-management
+    /// menu; the AppKit item is built here because `MenuBarExtra` cannot see right clicks.
     private let statusItem: StatusItemController
 
     init() {

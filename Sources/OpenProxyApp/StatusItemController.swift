@@ -1,14 +1,14 @@
 import AppKit
-import SwiftUI
 import OpenProxyAppModel
+import OpenProxyCore
 
-/// Owns the menu bar item. Left click toggles a transient popover with `MenuView`; right
-/// click (or control-click) shows a native `NSMenu` with the app-management actions.
+/// Owns the menu bar item. Left click shows a native `NSMenu` with the policy, stats and
+/// status rows; right click (or control-click) shows the app-management menu. Both are built
+/// fresh on every click so the checkmarks and values reflect the current state.
 /// `MenuBarExtra` cannot see right clicks, so the item is built with AppKit.
 @MainActor
-final class StatusItemController: NSObject, NSPopoverDelegate {
+final class StatusItemController: NSObject, NSMenuDelegate {
     private let statusItem: NSStatusItem
-    private let popover = NSPopover()
     private let model: AppModel?
     private let startupError: String?
 
@@ -25,73 +25,149 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
             button.action = #selector(handleClick)
             _ = button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
-        popover.behavior = .transient
-        popover.delegate = self
-        popover.contentViewController = NSHostingController(rootView: menuContent)
     }
 
-    /// `NSPopover` keeps its hosting view, so SwiftUI may not deliver `onDisappear` on close;
-    /// stop the menu's refresh loop here. Safe to double up with `onDisappear`.
-    func popoverDidClose(_ notification: Notification) {
+    /// The 5 s refresh loop runs only while the left-click menu is open.
+    func menuWillOpen(_ menu: NSMenu) {
+        model?.menuVisibilityChanged(true)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
         model?.menuVisibilityChanged(false)
     }
 
-    @ViewBuilder private var menuContent: some View {
-        if let model {
-            MenuView(model: model)
-        } else {
-            startupErrorView
-        }
-    }
-
-    /// Spec 9: the popover still appears with the reason when the graph could not be built.
-    private var startupErrorView: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("openproxy could not start").font(.headline)
-            Text(startupError ?? "Unknown error")
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-            Divider()
-            HStack {
-                Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-            }
-        }
-        .padding(14)
-        .frame(width: 340)
-    }
-
     @objc private func handleClick() {
+        guard let model else {
+            popUp(startupErrorMenu())
+            return
+        }
         let event = NSApp.currentEvent
         let rightClick = event?.type == .rightMouseUp
             || (event?.type == .leftMouseUp && event?.modifierFlags.contains(.control) == true)
-        if rightClick {
-            showContextMenu()
-        } else {
-            togglePopover()
+        popUp(rightClick ? controlMenu(model) : mainMenu(model))
+    }
+
+    /// Attaching the menu and clicking makes AppKit pop it natively; detaching it again keeps
+    /// the next left click on the left-click menu.
+    private func popUp(_ menu: NSMenu) {
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    // MARK: - Left click
+
+    private func mainMenu(_ model: AppModel) -> NSMenu {
+        let menu = NSMenu()
+        menu.delegate = self
+
+        menu.addItem(submenu("Sort") { sub in
+            for mode in SortMode.allCases {
+                let item = self.menuItem(
+                    mode.displayName, action: #selector(self.selectSort(_:)),
+                    on: model.settings.sort == mode)
+                item.representedObject = mode
+                sub.addItem(item)
+            }
+        })
+
+        menu.addItem(submenu("Tier") { sub in
+            for mode in TierMode.allCases {
+                let item = self.menuItem(
+                    mode.rawValue.capitalized, action: #selector(self.selectTier(_:)),
+                    on: model.settings.tier == mode)
+                item.representedObject = mode
+                sub.addItem(item)
+            }
+        })
+
+        let minutes = model.settings.pollMinutes
+        menu.addItem(submenu("Refresh endpoint data every \(minutes) min") { sub in
+            for choice in MenuContent.minuteChoices(current: minutes) {
+                let item = self.menuItem(
+                    "\(choice) min", action: #selector(self.selectPollMinutes(_:)),
+                    on: choice == minutes)
+                item.representedObject = choice
+                sub.addItem(item)
+            }
+        })
+
+        if model.settings.tier == .flex {
+            menu.addItem(flexMenu(model.settings.flex))
+        }
+
+        menu.addItem(.separator())
+        menu.addItem(header("Stats (24h)"))
+        for line in MenuContent.statsLines(model.summary) {
+            menu.addItem(row(line))
+        }
+
+        menu.addItem(.separator())
+        menu.addItem(header("Status"))
+        for line in MenuContent.statusLines(
+            model.status,
+            loginItem: model.loginItemStatus,
+            helper: model.helperStatus,
+            routingLabel: model.routingLabel) {
+            menu.addItem(row(line))
+        }
+        for line in MenuContent.warningLines(
+            unreachable: model.unreachableWarning,
+            untrustedCA: model.untrustedCAWarning,
+            warnings: model.warnings) {
+            menu.addItem(row(line))
+        }
+
+        if model.canRetrySetup {
+            menu.addItem(.separator())
+            menu.addItem(menuItem("Retry setup", action: #selector(retrySetup)))
+        }
+        return menu
+    }
+
+    private func flexMenu(_ flex: FlexPolicy) -> NSMenuItem {
+        submenu("Flex") { sub in
+            sub.addItem(self.menuItem(
+                "Fallback without flex", action: #selector(self.toggleFlexFallback), on: flex.fallback))
+            sub.addItem(self.submenu("Attempts: \(flex.attempts)") { attempts in
+                for count in 1...5 {
+                    let item = self.menuItem(
+                        "\(count)", action: #selector(self.selectAttempts(_:)),
+                        on: count == flex.attempts)
+                    item.representedObject = count
+                    attempts.addItem(item)
+                }
+            })
+            sub.addItem(self.timeoutMenu(
+                "First byte (s)", current: flex.firstByteTimeout,
+                action: #selector(self.selectFirstByteTimeout(_:))))
+            sub.addItem(self.timeoutMenu(
+                "Non-streaming (s)", current: flex.nonStreamingTimeout,
+                action: #selector(self.selectNonStreamingTimeout(_:))))
         }
     }
 
-    private func togglePopover() {
-        guard let button = statusItem.button else { return }
-        if popover.isShown {
-            popover.performClose(nil)
-            return
+    private func timeoutMenu(_ title: String, current: Double, action: Selector) -> NSMenuItem {
+        submenu(title) { sub in
+            for seconds in MenuContent.timeoutChoices(current: current) {
+                let item = self.menuItem(
+                    Self.secondsTitle(seconds), action: action, on: seconds == current)
+                item.representedObject = seconds
+                sub.addItem(item)
+            }
         }
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
     }
 
-    /// Built fresh on every right click so the checkmarks reflect the current state. Attaching
-    /// it to the status item and clicking makes AppKit pop the native menu; detaching it again
-    /// keeps left click on the popover.
-    private func showContextMenu() {
-        guard let model else { return }
+    private static func secondsTitle(_ seconds: Double) -> String {
+        seconds == seconds.rounded() ? "\(Int(seconds))" : "\(seconds)"
+    }
+
+    // MARK: - Right click
+
+    private func controlMenu(_ model: AppModel) -> NSMenu {
         let menu = NSMenu()
         menu.addItem(menuItem(
-            "Enabled", action: #selector(toggleEnabled),
-            on: model.settings.enabled))
+            "Enabled", action: #selector(toggleEnabled), on: model.settings.enabled))
         menu.addItem(menuItem(
             "Start at login", action: #selector(toggleStartAtLogin),
             on: model.loginItemStatus == .enabled))
@@ -99,10 +175,33 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         menu.addItem(menuItem("Uninstall OpenProxy...", action: #selector(uninstallOpenProxy)))
         menu.addItem(.separator())
         menu.addItem(menuItem("Quit OpenProxy", action: #selector(quitOpenProxy)))
+        return menu
+    }
 
-        statusItem.menu = menu
-        statusItem.button?.performClick(nil)
-        statusItem.menu = nil
+    // MARK: - Startup error
+
+    private func startupErrorMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(header("openproxy could not start"))
+        for part in MenuContent.wrapped(startupError ?? "Unknown error") {
+            let item = disabled(part)
+            item.attributedTitle = NSAttributedString(
+                string: part, attributes: [.foregroundColor: NSColor.systemOrange])
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        menu.addItem(menuItem("Quit", action: #selector(quitOpenProxy)))
+        return menu
+    }
+
+    // MARK: - Item builders
+
+    private func submenu(_ title: String, _ build: (NSMenu) -> Void) -> NSMenuItem {
+        let menu = NSMenu()
+        build(menu)
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.submenu = menu
+        return item
     }
 
     private func menuItem(_ title: String, action: Selector, on: Bool = false) -> NSMenuItem {
@@ -110,6 +209,77 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         item.target = self
         item.state = on ? .on : .off
         return item
+    }
+
+    private func disabled(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
+    private func header(_ title: String) -> NSMenuItem {
+        let item = disabled(title)
+        item.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)])
+        return item
+    }
+
+    private func row(_ line: MenuLine) -> NSMenuItem {
+        let prefix: String
+        switch line.marker {
+        case .check: prefix = "✓ "
+        case .cross: prefix = "✗ "
+        case .alert: prefix = "⚠︎ "
+        case .bullet, .none: prefix = ""
+        }
+        let item = disabled(prefix + line.text)
+        if line.warning {
+            item.attributedTitle = NSAttributedString(
+                string: prefix + line.text,
+                attributes: [.foregroundColor: NSColor.systemOrange])
+        }
+        return item
+    }
+
+    // MARK: - Actions
+
+    @objc private func selectSort(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? SortMode else { return }
+        model?.settings.sort = mode
+    }
+
+    @objc private func selectTier(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? TierMode else { return }
+        model?.settings.tier = mode
+    }
+
+    @objc private func selectPollMinutes(_ sender: NSMenuItem) {
+        guard let minutes = sender.representedObject as? Int else { return }
+        model?.settings.pollMinutes = minutes
+    }
+
+    @objc private func toggleFlexFallback() {
+        model?.settings.flex.fallback.toggle()
+    }
+
+    @objc private func selectAttempts(_ sender: NSMenuItem) {
+        guard let count = sender.representedObject as? Int else { return }
+        model?.settings.flex.attempts = count
+    }
+
+    @objc private func selectFirstByteTimeout(_ sender: NSMenuItem) {
+        guard let seconds = sender.representedObject as? Double else { return }
+        model?.settings.flex.firstByteTimeout = seconds
+    }
+
+    @objc private func selectNonStreamingTimeout(_ sender: NSMenuItem) {
+        guard let seconds = sender.representedObject as? Double else { return }
+        model?.settings.flex.nonStreamingTimeout = seconds
+    }
+
+    @objc private func retrySetup() {
+        Task { await model?.retrySetup() }
     }
 
     @objc private func toggleEnabled() {
