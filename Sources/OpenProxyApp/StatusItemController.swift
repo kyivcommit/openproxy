@@ -221,7 +221,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let item = disabled(title)
         item.attributedTitle = NSAttributedString(
             string: title,
-            attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)])
+            attributes: [
+                .font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
+                // Explicit colour so the disabled row is not drawn in dim grey.
+                .foregroundColor: NSColor.labelColor,
+            ])
         return item
     }
 
@@ -233,12 +237,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         case .alert: prefix = "⚠︎ "
         case .bullet, .none: prefix = ""
         }
-        let item = disabled(prefix + line.text)
-        if line.warning {
-            item.attributedTitle = NSAttributedString(
-                string: prefix + line.text,
-                attributes: [.foregroundColor: NSColor.systemOrange])
-        }
+        let text = prefix + line.text
+        let item = disabled(text)
+        // Disabled items otherwise draw their title in dim grey; an explicit colour keeps
+        // every informational row readable. Only warnings (and the untrusted-CA ✓/✗ row)
+        // stay orange.
+        item.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [
+                .foregroundColor: line.warning ? NSColor.systemOrange : NSColor.labelColor,
+            ])
         return item
     }
 
