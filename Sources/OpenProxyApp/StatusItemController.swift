@@ -60,6 +60,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func mainMenu(_ model: AppModel) -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
+        menu.autoenablesItems = false
 
         menu.addItem(submenu("Sort") { sub in
             for mode in SortMode.allCases {
@@ -166,6 +167,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func controlMenu(_ model: AppModel) -> NSMenu {
         let menu = NSMenu()
+        menu.autoenablesItems = false
         menu.addItem(menuItem(
             "Enabled", action: #selector(toggleEnabled), on: model.settings.enabled))
         menu.addItem(menuItem(
@@ -182,9 +184,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func startupErrorMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.autoenablesItems = false
         menu.addItem(header("openproxy could not start"))
         for part in MenuContent.wrapped(startupError ?? "Unknown error") {
-            let item = disabled(part)
+            let item = info(part)
             item.attributedTitle = NSAttributedString(
                 string: part, attributes: [.foregroundColor: NSColor.systemOrange])
             menu.addItem(item)
@@ -198,6 +201,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func submenu(_ title: String, _ build: (NSMenu) -> Void) -> NSMenuItem {
         let menu = NSMenu()
+        menu.autoenablesItems = false
         build(menu)
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.submenu = menu
@@ -211,19 +215,22 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         return item
     }
 
-    private func disabled(_ title: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
+    /// A non-actionable informational row. It must stay enabled: a disabled item still renders
+    /// its attributed title dim, and the menu's `autoenablesItems = false` keeps AppKit from
+    /// disabling it. The no-op action keeps it selectable, which just closes the menu.
+    private func info(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: #selector(noop(_:)), keyEquivalent: "")
+        item.target = self
+        item.isEnabled = true
         return item
     }
 
     private func header(_ title: String) -> NSMenuItem {
-        let item = disabled(title)
+        let item = info(title)
         item.attributedTitle = NSAttributedString(
             string: title,
             attributes: [
                 .font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
-                // Explicit colour so the disabled row is not drawn in dim grey.
                 .foregroundColor: NSColor.labelColor,
             ])
         return item
@@ -238,10 +245,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         case .bullet, .none: prefix = ""
         }
         let text = prefix + line.text
-        let item = disabled(text)
-        // Disabled items otherwise draw their title in dim grey; an explicit colour keeps
-        // every informational row readable. Only warnings (and the untrusted-CA ✓/✗ row)
-        // stay orange.
+        let item = info(text)
+        // Only warnings (and the untrusted-CA ✗ row) are coloured; everything else is the
+        // normal label colour.
         item.attributedTitle = NSAttributedString(
             string: text,
             attributes: [
@@ -249,6 +255,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             ])
         return item
     }
+
+    @objc private func noop(_ sender: NSMenuItem) {}
 
     // MARK: - Actions
 
