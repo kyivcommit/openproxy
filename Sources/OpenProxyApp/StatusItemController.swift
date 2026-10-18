@@ -186,10 +186,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.autoenablesItems = false
         menu.addItem(header("openproxy could not start"))
         for part in MenuContent.wrapped(startupError ?? "Unknown error") {
-            let item = info(part)
-            item.attributedTitle = NSAttributedString(
-                string: part, attributes: [.foregroundColor: NSColor.systemOrange])
-            menu.addItem(item)
+            menu.addItem(viewItem(part, color: .systemOrange))
         }
         menu.addItem(.separator())
         menu.addItem(menuItem("Quit", action: #selector(quitOpenProxy)))
@@ -214,25 +211,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         return item
     }
 
-    /// A non-actionable informational row. It must stay enabled: a disabled item still renders
-    /// its attributed title dim, and the menu's `autoenablesItems = false` keeps AppKit from
-    /// disabling it. The no-op action keeps it selectable, which just closes the menu.
-    private func info(_ title: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: #selector(noop(_:)), keyEquivalent: "")
-        item.target = self
-        item.isEnabled = true
-        return item
-    }
+    private static let rowMaxWidth: CGFloat = 300
+    private static let rowInset: CGFloat = 14
+    private static let rowVerticalPadding: CGFloat = 3
 
     private func header(_ title: String) -> NSMenuItem {
-        let item = info(title)
-        item.attributedTitle = NSAttributedString(
-            string: title,
-            attributes: [
-                .font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
-                .foregroundColor: NSColor.labelColor,
-            ])
-        return item
+        viewItem(title, bold: true, color: .labelColor)
     }
 
     private func row(_ line: MenuLine) -> NSMenuItem {
@@ -243,19 +227,38 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         case .alert: prefix = "⚠︎ "
         case .bullet, .none: prefix = ""
         }
-        let text = prefix + line.text
-        let item = info(text)
-        // Only warnings (and the untrusted-CA ✗ row) are coloured; everything else is the
-        // normal label colour.
-        item.attributedTitle = NSAttributedString(
-            string: text,
-            attributes: [
-                .foregroundColor: line.warning ? NSColor.systemOrange : NSColor.labelColor,
-            ])
+        return viewItem(prefix + line.text, color: line.warning ? .systemOrange : .labelColor)
+    }
+
+    /// A non-actionable informational row. A view is never highlighted nor dimmed, unlike an
+    /// item title, so the label always reads at full contrast.
+    private func viewItem(_ text: String, bold: Bool = false, color: NSColor) -> NSMenuItem {
+        let item = NSMenuItem()
+        item.view = rowView(text, bold: bold, color: color)
         return item
     }
 
-    @objc private func noop(_ sender: NSMenuItem) {}
+    private func rowView(_ text: String, bold: Bool, color: NSColor) -> NSView {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = bold
+            ? NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)
+            : NSFont.menuFont(ofSize: 0)
+        label.textColor = color
+        label.isEditable = false
+        label.isSelectable = false
+        label.preferredMaxLayoutWidth = Self.rowMaxWidth - Self.rowInset * 2
+        let textSize = label.fittingSize
+        let textWidth = min(textSize.width, Self.rowMaxWidth - Self.rowInset * 2)
+
+        let container = NSView(frame: NSRect(
+            x: 0, y: 0,
+            width: min(textWidth + Self.rowInset * 2, Self.rowMaxWidth),
+            height: textSize.height + Self.rowVerticalPadding * 2))
+        label.frame = NSRect(
+            x: Self.rowInset, y: Self.rowVerticalPadding, width: textWidth, height: textSize.height)
+        container.addSubview(label)
+        return container
+    }
 
     // MARK: - Actions
 
