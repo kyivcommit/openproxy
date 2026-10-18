@@ -1,18 +1,32 @@
+import AppKit
 import Foundation
-import SwiftUI
 import OpenProxyAppModel
 
+/// Pure AppKit entry point: a menu bar agent with no SwiftUI scenes, so no empty Settings
+/// window can ever open on activate/reopen/Cmd+,.
 @main
-struct OpenProxyApp: App {
-    /// Left click shows the policy, stats and status menu, right click the app-management
-    /// menu; the AppKit item is built here because `MenuBarExtra` cannot see right clicks.
-    private let statusItem: StatusItemController
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// `NSApplication.delegate` is weak, so the delegate must be kept alive for the run loop.
+    private static let shared = AppDelegate()
+    private var statusItem: StatusItemController?
 
-    init() {
+    static func main() {
+        let app = NSApplication.shared
+        // Both a plain `swift run` (no Info.plist) and the built app must be an agent with no
+        // Dock icon. The built app already sets LSUIElement, so only add the policy without it.
+        if Bundle.main.object(forInfoDictionaryKey: "LSUIElement") as? Bool != true {
+            _ = app.setActivationPolicy(.accessory)
+        }
+        app.delegate = shared
+        app.run()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
         // Single instance: the autostart LaunchAgent (RunAtLoad) makes launchd start a second
         // copy while the manually started one keeps running. Yield silently with exit(0) — so
-        // launchd does not treat it as a crash and restart it — before building the graph,
-        // binding port 443 or showing a second menu bar icon.
+        // launchd does not treat it as a crash and restart it — before building the graph or
+        // binding port 443.
         let ownPID = ProcessInfo.processInfo.processIdentifier
         if let bundleIdentifier = Bundle.main.bundleIdentifier,
            SingleInstanceGuard.shouldYield(
@@ -27,8 +41,6 @@ struct OpenProxyApp: App {
                 setupDecision: AlertSetupDecision(),
                 uninstallDecision: AlertUninstallDecision())
             statusItem = StatusItemController(model: built)
-            // Never registers autostart, installs or touches hosts on launch; only the user's
-            // Install button does, so OpenProxy only appears in Login Items while installed.
             Task { @MainActor in
                 await built.start()
                 await built.refresh()
@@ -39,7 +51,8 @@ struct OpenProxyApp: App {
         }
     }
 
-    var body: some Scene {
-        Settings { EmptyView() }
+    /// There are no windows to reopen; activate only re-shows nothing.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        false
     }
 }

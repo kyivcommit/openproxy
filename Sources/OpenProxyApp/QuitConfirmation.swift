@@ -15,6 +15,8 @@ struct AlertQuitDecision: QuitDecision {
         alert.addButton(withTitle: "Restore access and quit")
         alert.addButton(withTitle: "Quit anyway")
         alert.addButton(withTitle: "Cancel")
+        // Accessory apps can open a modal alert behind the frontmost app; raise it first.
+        NSApplication.shared.activate()
         switch alert.runModal() {
         case .alertFirstButtonReturn: return .restoreAccessAndQuit
         case .alertSecondButtonReturn: return .quitAnyway
