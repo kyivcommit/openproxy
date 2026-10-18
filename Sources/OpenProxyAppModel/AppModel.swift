@@ -247,7 +247,14 @@ public final class AppModel {
     /// with autostart off, and a failed removal keeps autostart on for the same reason.
     public func setStartAtLogin(_ on: Bool) async {
         guard !on else {
-            await retrySetup()
+            // Before the first-launch setup was accepted, "Not now" leaves setupComplete false
+            // and no route, where retrySetup is a no-op; ask the welcome question instead.
+            if !settings.setupComplete, routingState != .settingUp {
+                guard setupDecision.confirmSetup() else { return }
+                await install()
+            } else {
+                await retrySetup()
+            }
             return
         }
         do {

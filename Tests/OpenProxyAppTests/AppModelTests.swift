@@ -1150,6 +1150,42 @@ struct AppModelTests {
         #expect(model.routingState == .active)
     }
 
+    @Test func setStartAtLoginOnBeforeFirstLaunchAsksTheWelcomeAndSetsUpWhenAccepted() async throws {
+        // "Not now" on first launch leaves setupComplete false and no route; turning Start at
+        // login on must ask the welcome question rather than silently do nothing.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .notRegistered
+        h.loginItem.statusAfterRegister = .enabled
+        h.setupDecision.confirm = true
+        let model = h.model()
+
+        await model.setStartAtLogin(true)
+
+        #expect(h.setupDecision.count == 1)
+        #expect(h.loginItem.registerCount == 1)
+        #expect(h.hostsEditor.requests == [true])
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .active)
+    }
+
+    @Test func setStartAtLoginOnBeforeFirstLaunchDoesNothingWhenDeclinedAgain() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .notRegistered
+        h.loginItem.statusAfterRegister = .enabled
+        h.setupDecision.confirm = false
+        let model = h.model()
+
+        await model.setStartAtLogin(true)
+
+        #expect(h.setupDecision.count == 1)
+        #expect(h.loginItem.registerCount == 0)
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(!model.settings.setupComplete)
+        #expect(model.routingState == .inactive)
+    }
+
     @Test func canRetrySetupIsFalseWhileTheSetupIsRunning() async throws {
         // With a completed setup but autostart off, turning Start at login on runs the setup
         // again; while it runs the toggle must not offer a second, concurrent setup.

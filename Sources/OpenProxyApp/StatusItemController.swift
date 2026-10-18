@@ -189,7 +189,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(viewItem(part, color: .systemOrange))
         }
         menu.addItem(.separator())
-        menu.addItem(menuItem("Quit", action: #selector(quitOpenProxy)))
+        menu.addItem(menuItem("Quit", action: #selector(terminateApp)))
         return menu
     }
 
@@ -316,5 +316,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func quitOpenProxy() {
         Task { await model?.quit() }
+    }
+
+    /// The startup-error menu has no model, so its Quit terminates directly.
+    @objc private func terminateApp() {
+        NSApplication.shared.terminate(nil)
     }
 }
