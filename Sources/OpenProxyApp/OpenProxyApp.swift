@@ -1,12 +1,12 @@
 import Foundation
 import SwiftUI
-import AppKit
 import OpenProxyAppModel
 
 @main
 struct OpenProxyApp: App {
-    @State private var model: AppModel?
-    @State private var startupError: String?
+    /// Left click shows the `MenuView` popover, right click the Control window; the AppKit
+    /// item is built here because `MenuBarExtra` cannot see right clicks.
+    private let statusItem: StatusItemController
 
     init() {
         // Single instance: the autostart LaunchAgent (RunAtLoad) makes launchd start a second
@@ -26,7 +26,7 @@ struct OpenProxyApp: App {
                 quitDecision: AlertQuitDecision(),
                 setupDecision: AlertSetupDecision(),
                 uninstallDecision: AlertUninstallDecision())
-            _model = State(initialValue: built)
+            statusItem = StatusItemController(model: built)
             // Never registers autostart, installs or touches hosts on launch; only the user's
             // Install button does, so OpenProxy only appears in Login Items while installed.
             Task { @MainActor in
@@ -35,37 +35,11 @@ struct OpenProxyApp: App {
             }
         } catch {
             // Spec 9: still show the menu bar with the reason and a way out, not nothing.
-            _startupError = State(initialValue: String(describing: error))
+            statusItem = StatusItemController(model: nil, startupError: String(describing: error))
         }
     }
 
     var body: some Scene {
-        MenuBarExtra {
-            if let model {
-                MenuView(model: model)
-            } else {
-                startupErrorView
-            }
-        } label: {
-            Image(systemName: "shield.lefthalf.filled")
-        }
-        .menuBarExtraStyle(.window)
-    }
-
-    private var startupErrorView: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("openproxy could not start").font(.headline)
-            Text(startupError ?? "Unknown error")
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-            Divider()
-            HStack {
-                Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-            }
-        }
-        .padding(14)
-        .frame(width: 340)
+        Settings { EmptyView() }
     }
 }

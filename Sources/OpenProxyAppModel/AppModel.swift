@@ -223,10 +223,13 @@ public final class AppModel {
         await restoreRouting()
     }
 
-    /// True when the menu should offer Retry setup: the setup never completed and it is not
-    /// currently running.
+    /// True when the menu should offer Retry setup: the setup never completed (and is not
+    /// currently running), or it completed but autostart was turned off since — the Control
+    /// window leaves the route removed in that state, so the setup must be runnable again.
     public var canRetrySetup: Bool {
-        guard !settings.setupComplete else { return false }
+        guard !settings.setupComplete else {
+            return routingState != .settingUp && loginItemStatus != .enabled
+        }
         switch routingState {
         case .waitingForApproval, .error: return true
         case .inactive, .settingUp, .active: return false
@@ -237,6 +240,25 @@ public final class AppModel {
     public func retrySetup() async {
         guard canRetrySetup else { return }
         await install()
+    }
+
+    /// The Control window's "Start at login" toggle. ON is the setup's autostart step. OFF
+    /// restores `/etc/hosts` before autostart stops: the hosts entry must never stay routed
+    /// with autostart off, and a failed removal keeps autostart on for the same reason.
+    public func setStartAtLogin(_ on: Bool) async {
+        guard !on else {
+            await retrySetup()
+            return
+        }
+        do {
+            try await installer.setHostsEntry(present: false)
+        } catch {
+            warn(.autostart, "Could not remove the openrouter.ai route, so autostart was left on: \(error).")
+            return
+        }
+        unregisterLoginItem()
+        routingState = .inactive
+        await refresh()
     }
 
     /// The automatic setup, in order: CA trust, helper (waiting for approval instead of

@@ -7,8 +7,6 @@ struct MenuView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Toggle("Enabled", isOn: $model.settings.enabled)
-
             Picker("Sort", selection: $model.settings.sort) {
                 ForEach(SortMode.allCases, id: \.self) { mode in
                     Text(mode.displayName).tag(mode)
@@ -55,15 +53,6 @@ struct MenuView: View {
                         .help("Runs the setup again without the welcome dialog: CA trust, the helper, autostart, the openrouter.ai hosts entry and the Node env.")
                     Spacer()
                 }
-            }
-            HStack {
-                Button("Uninstall OpenProxy...") { Task { await model.uninstallOpenProxy() } }
-                    .help("Removes the certificate, autostart and all OpenProxy data, then quits. The root helper stays registered but idle.")
-                Spacer()
-            }
-            HStack {
-                Spacer()
-                Button("Quit") { Task { await model.quit() } }
             }
         }
         .padding(14)

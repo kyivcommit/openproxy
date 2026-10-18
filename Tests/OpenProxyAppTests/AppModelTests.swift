@@ -1132,6 +1132,93 @@ struct AppModelTests {
         #expect(!model.status.hostsEntry)
     }
 
+    // MARK: - Start at login (Control window)
+
+    @Test func setStartAtLoginOnDelegatesToSetup() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .notRegistered
+        h.loginItem.statusAfterRegister = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.setStartAtLogin(true)
+
+        #expect(h.loginItem.registerCount == 1)
+        #expect(model.loginItemStatus == .enabled)
+        #expect(h.hostsEditor.requests == [true])
+        #expect(model.routingState == .active)
+    }
+
+    @Test func canRetrySetupIsFalseWhileTheSetupIsRunning() async throws {
+        // With a completed setup but autostart off, turning Start at login on runs the setup
+        // again; while it runs the toggle must not offer a second, concurrent setup.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .notRegistered
+        h.loginItem.statusAfterRegister = .enabled
+        h.commandRunner.delay = .milliseconds(200)
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        let run = Task { await model.setStartAtLogin(true) }
+        let settingUp = await h.waitUntil {
+            model.routingState == .settingUp && model.loginItemStatus != .enabled
+        }
+        #expect(settingUp)
+        #expect(model.canRetrySetup == false)
+
+        await run.value
+        #expect(model.routingState == .active)
+    }
+
+    @Test func setStartAtLoginOffRemovesHostsBeforeUnregistering() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.setStartAtLogin(false)
+
+        #expect(h.orderLog.sequence.filter { $0 == "hosts" || $0 == "autostart" } == ["hosts", "autostart"])
+        #expect(h.runner.scripts.count == 1)
+        #expect(h.loginItem.unregisterCount == 1)
+        #expect(model.loginItemStatus == .notRegistered)
+        #expect(model.settings.setupComplete)
+        #expect(model.routingState == .inactive)
+        #expect(!model.status.hostsEntry)
+    }
+
+    @Test func setStartAtLoginOffKeepsAutostartWhenHostsRemovalFails() async throws {
+        // Hosts must never stay routed with autostart off: a failed removal keeps autostart on.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.runner.error = InstallError.runnerFailed("boom")
+        let model = h.model()
+        model.settings.setupComplete = true
+        await model.refresh()
+
+        await model.setStartAtLogin(false)
+
+        #expect(h.loginItem.unregisterCount == 0)
+        #expect(model.loginItemStatus == .enabled)
+        #expect(model.warnings.contains { $0.key == .autostart })
+    }
+
+    @Test func relaunchAfterStartAtLoginOffDoesNotReAddHosts() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        let model = h.model()
+        model.settings.setupComplete = true
+        await model.setStartAtLogin(false)
+        #expect(!model.status.hostsEntry)
+
+        // Everything else the restore needs is in place; only autostart is off.
+        h.helper.status = .enabled
+        let relaunched = h.model()
+        await relaunched.start()
+
+        #expect(h.runner.scripts.count == 1) // the OFF removal only, no re-add
+        #expect(!relaunched.status.hostsEntry)
+    }
+
     @Test func retrySetupRunsTheSetupWithoutTheWelcomeDialog() async throws {
         let h = try Harness(hostsText: "127.0.0.1 localhost\n")
         h.loginItem.status = .requiresApproval
