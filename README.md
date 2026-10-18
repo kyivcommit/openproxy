@@ -35,7 +35,7 @@ Speed needs the client's key. `throughput_last_30m` and `latency_last_30m` come 
 
 ## First launch
 
-Left click the menu bar icon for a native menu with **Sort**, **Tier**, **Refresh** (endpoint data interval), **Flex**, **Stats** and **Status**; right click (or control-click) for **Enabled**, **Start at login**, **Uninstall OpenProxy…** and **Quit OpenProxy**.
+Left click the menu bar icon for a native menu with **Sort**, **Tier** (which holds the Flex settings while that tier is selected), **Refresh** (endpoint data interval), **Stats** and **Status**; right click (or control-click) for **Enabled**, **Start at login**, **Uninstall OpenProxy…** and **Quit OpenProxy**.
 
 Build: `scripts/build-app.sh` → `build/OpenProxy.app` (ad-hoc signed). Open it. On the first launch a welcome dialog explains what will be set up; **Continue** does everything, there is no Install button:
 

@@ -80,6 +80,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 item.representedObject = mode
                 sub.addItem(item)
             }
+            if model.settings.tier == .flex {
+                self.addFlexItems(to: sub, flex: model.settings.flex)
+            }
         })
 
         let minutes = model.settings.pollMinutes
@@ -92,10 +95,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 sub.addItem(item)
             }
         })
-
-        if model.settings.tier == .flex {
-            menu.addItem(flexMenu(model.settings.flex))
-        }
 
         menu.addItem(.separator())
         menu.addItem(submenu("Stats (24h)") { sub in
@@ -126,26 +125,26 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         return menu
     }
 
-    private func flexMenu(_ flex: FlexPolicy) -> NSMenuItem {
-        submenu("Flex") { sub in
-            sub.addItem(self.menuItem(
-                "Fallback without flex", action: #selector(self.toggleFlexFallback), on: flex.fallback))
-            sub.addItem(self.submenu("Attempts: \(flex.attempts)") { attempts in
-                for count in 1...5 {
-                    let item = self.menuItem(
-                        "\(count)", action: #selector(self.selectAttempts(_:)),
-                        on: count == flex.attempts)
-                    item.representedObject = count
-                    attempts.addItem(item)
-                }
-            })
-            sub.addItem(self.timeoutMenu(
-                "First byte (s)", current: flex.firstByteTimeout,
-                action: #selector(self.selectFirstByteTimeout(_:))))
-            sub.addItem(self.timeoutMenu(
-                "Non-streaming (s)", current: flex.nonStreamingTimeout,
-                action: #selector(self.selectNonStreamingTimeout(_:))))
-        }
+    /// The flex policy rows, appended to the Tier submenu after the tier choices.
+    private func addFlexItems(to sub: NSMenu, flex: FlexPolicy) {
+        sub.addItem(.separator())
+        sub.addItem(menuItem(
+            "Fallback without flex", action: #selector(toggleFlexFallback), on: flex.fallback))
+        sub.addItem(submenu("Attempts: \(flex.attempts)") { attempts in
+            for count in 1...5 {
+                let item = self.menuItem(
+                    "\(count)", action: #selector(self.selectAttempts(_:)),
+                    on: count == flex.attempts)
+                item.representedObject = count
+                attempts.addItem(item)
+            }
+        })
+        sub.addItem(timeoutMenu(
+            "First byte (s)", current: flex.firstByteTimeout,
+            action: #selector(selectFirstByteTimeout(_:))))
+        sub.addItem(timeoutMenu(
+            "Non-streaming (s)", current: flex.nonStreamingTimeout,
+            action: #selector(selectNonStreamingTimeout(_:))))
     }
 
     private func timeoutMenu(_ title: String, current: Double, action: Selector) -> NSMenuItem {
