@@ -139,12 +139,29 @@ private final class FakeHelperSession: HelperSessionKeeping, @unchecked Sendable
     private let lock = NSLock()
     private var _starts = 0
     private var _stops = 0
+    private var _ready = true
+    private var observer: (@Sendable (HelperSessionEvent) -> Void)?
 
     var starts: Int { lock.withLock { _starts } }
     var stops: Int { lock.withLock { _stops } }
+    var isSessionReady: Bool { lock.withLock { _ready } }
+
+    func setSessionReady(_ ready: Bool) { lock.withLock { _ready = ready } }
 
     func start() { lock.withLock { _starts += 1 } }
-    func stop() { lock.withLock { _stops += 1 } }
+    func stop() { lock.withLock { _stops += 1; _ready = false } }
+
+    func observe(_ handler: @escaping @Sendable (HelperSessionEvent) -> Void) {
+        lock.withLock { observer = handler }
+    }
+
+    func emit(_ event: HelperSessionEvent) {
+        let handler = lock.withLock { () -> (@Sendable (HelperSessionEvent) -> Void)? in
+            _ready = event == .connected
+            return observer
+        }
+        handler?(event)
+    }
 }
 
 /// Records the hosts edit the installer would route through the helper.
@@ -1037,6 +1054,7 @@ struct AppModelTests {
 
     @Test func installSetsSetupCompleteAndRoutingActive() async throws {
         let h = try Harness()
+        h.helper.status = .enabled
         let model = h.model()
 
         await model.install()
@@ -1061,6 +1079,8 @@ struct AppModelTests {
         // Autostart must be enabled before anything routes here: an approved-but-pending
         // registration is a wait, and the hosts entry/Node env follow once it flips.
         let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .notRegistered
+        h.helper.statusAfterRegister = .enabled
         h.loginItem.status = .requiresApproval
         h.loginItem.statusAfterRegister = .requiresApproval
         h.waiting.onPoll = { h.loginItem.status = .enabled }
@@ -1071,7 +1091,7 @@ struct AppModelTests {
         #expect(h.loginItem.registerCount == 1)
         #expect(h.waiting.count == 1)
         #expect(h.helper.openApprovalCount == 1)
-        #expect(h.runner.scripts.count == 1)
+        #expect(h.hostsEditor.requests == [true])
         #expect(model.settings.setupComplete)
         #expect(model.routingState == .active)
         #expect(!model.warnings.contains { $0.key == .autostart })
@@ -1097,6 +1117,8 @@ struct AppModelTests {
 
     @Test func installContinuesWhenAutostartIsApprovedLater() async throws {
         let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .notRegistered
+        h.helper.statusAfterRegister = .enabled
         h.loginItem.status = .requiresApproval
         h.loginItem.statusAfterRegister = .requiresApproval
         let model = h.model()
@@ -1109,7 +1131,7 @@ struct AppModelTests {
 
         #expect(model.settings.setupComplete)
         #expect(model.routingState == .active)
-        #expect(h.runner.scripts.count == 1)
+        #expect(h.hostsEditor.requests == [true])
     }
 
     @Test func installDoesNotRouteOrWaitWhenAutostartRegistrationFails() async throws {
@@ -1187,7 +1209,101 @@ struct AppModelTests {
 
         #expect(model.routingState != .active)
         #expect(model.warnings.contains { $0.message.contains("could not confirm") })
-        #expect(model.warnings.contains { $0.key == .install })
+        #expect(model.warnings.contains { $0.key == .helperSession })
+        #expect(model.canRetrySetup)
+    }
+
+    @Test func sessionConnectedWhileAutostartIsOffDoesNotAddOrActivateTheRoute() async throws {
+        // A reconnect is not permission to route: with autostart off the restore must stay
+        // off, even though the hosts line is already present.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .notRegistered
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+        h.helperSession.emit(.connected)
+        try await Task.sleep(for: .milliseconds(20))
+
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(model.routingState != .active)
+    }
+
+    @Test func refreshWithHostsEntryButHelperNeedingApprovalDoesNotActivate() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .requiresApproval
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.refresh()
+
+        #expect(model.routingState != .active)
+    }
+
+    @Test func routingErrorClearsAfterTheSessionReconnects() async throws {
+        // The confirmation failure leaves an error and a warning; a later real session must
+        // clear both without a manual Retry setup.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = HostsEditingError.timedOut
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+        #expect(isRoutingError(model.routingState))
+        #expect(model.warnings.contains { $0.key == .helperSession })
+
+        h.hostsEditor.error = nil
+        h.helperSession.emit(.connected)
+
+        #expect(await h.waitUntil { model.routingState == .active })
+        #expect(!model.warnings.contains { $0.key == .helperSession })
+    }
+
+    @Test func reconnectRestoresTheLineTheHelperRemovedDuringARestart() async throws {
+        // The helper removes the line when the session drops, but the last status probe may
+        // still cache "present". A reconnect must restore from the current hosts state, not
+        // from that cached flag.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+        await model.start()
+        #expect(model.routingState == .active)
+        let requestsBefore = h.hostsEditor.requests.count
+
+        try "127.0.0.1 localhost\n".write(
+            to: h.directory.appending(path: "hosts"), atomically: true, encoding: .utf8)
+        #expect(model.status.hostsEntry)
+
+        h.helperSession.emit(.disconnected)
+        #expect(await h.waitUntil { model.routingState == .error("helper session lost") })
+
+        h.helperSession.emit(.connected)
+        #expect(await h.waitUntil { model.routingState == .active })
+        #expect(h.hostsEditor.requests.count == requestsBefore + 1)
+        #expect(h.hostsEditor.requests.last == true)
+    }
+
+    @Test func disconnectWithARoutedHostsEntrySetsAnError() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+        await model.start()
+        #expect(model.routingState == .active)
+
+        h.helperSession.emit(.disconnected)
+
+        #expect(await h.waitUntil { model.routingState == .error("helper session lost") })
+        #expect(model.routingState != .active)
+        #expect(model.warnings.contains { $0.key == .helperSession })
+    }
+
+    private func isRoutingError(_ state: RoutingState) -> Bool {
+        if case .error = state { return true }
+        return false
     }
 
     @Test func laterLaunchDoesNotRestoreHostsWithoutAutostart() async throws {

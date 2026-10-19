@@ -41,6 +41,7 @@ public enum WarningKey: Hashable, Sendable {
     case quit
     case autostart
     case nodeEnv
+    case helperSession
 }
 
 public struct Warning: Equatable, Sendable, Identifiable {
@@ -111,6 +112,10 @@ public final class AppModel {
     /// The compact "Routing:" line: inactive / setting up... / waiting for approval... / active.
     public private(set) var routingState: RoutingState = .inactive
     public var routingLabel: String { routingState.label }
+    private var isRoutingError: Bool {
+        if case .error = routingState { return true }
+        return false
+    }
 
     /// Derived from `status`, so it stays visible for as long as the danger lasts
     /// (proxy quit/crashed with the hosts entry still routed) and clears itself.
@@ -129,6 +134,7 @@ public final class AppModel {
     /// fresh round, so an Install/Uninstall refresh is neither concurrent nor starved.
     @ObservationIgnored private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var refreshRunning = false
+    @ObservationIgnored private var observingHelperSession = false
 
     /// Whether `server.start()` already bound the port. Guards Install from a
     /// second bind (and from installing hosts before anything listens).
@@ -190,6 +196,7 @@ public final class AppModel {
     }
 
     public func start() async {
+        observeHelperSessionIfNeeded()
         guard await startServer(ifFailed: "The hosts entry was left unchanged.") else { return }
         await refresh()
         await setupOrRestoreRouting()
@@ -250,8 +257,10 @@ public final class AppModel {
     /// the route is unsafe in either state, so the setup must be runnable again.
     public var canRetrySetup: Bool {
         guard !settings.setupComplete else {
-            return routingState != .settingUp
-                && (loginItemStatus != .enabled || helperStatus != .enabled)
+            guard routingState != .settingUp else { return false }
+            if isRoutingError { return true }
+            return loginItemStatus != .enabled || helperStatus != .enabled
+                || !helperSession.isSessionReady
         }
         switch routingState {
         case .waitingForApproval, .error: return true
@@ -298,6 +307,7 @@ public final class AppModel {
     /// failing), autostart (also a wait when approval is pending), the hosts entry, then the
     /// Node env. `setupComplete` is set only when the critical steps succeed.
     public func install() async {
+        observeHelperSessionIfNeeded()
         guard await startServer(ifFailed: "Setup was skipped; the hosts entry was left unchanged.") else {
             await refresh()
             return
@@ -369,6 +379,41 @@ public final class AppModel {
         await refresh()
     }
 
+    /// The editor keeps a live session for the app's lifetime; install the one observer that
+    /// turns its transitions into routing state. Reinstalling would replace the observer, so
+    /// guard it once per model.
+    private func observeHelperSessionIfNeeded() {
+        guard !observingHelperSession else { return }
+        observingHelperSession = true
+        helperSession.observe { [weak self] event in
+            Task { @MainActor [weak self] in await self?.handleHelperSession(event) }
+        }
+    }
+
+    /// A reconnect proves the helper is reachable again, but the route is only re-added when
+    /// every current prerequisite holds: never from a cached "it used to be routed" state.
+    private func handleHelperSession(_ event: HelperSessionEvent) async {
+        switch event {
+        case .connected:
+            clearWarnings([.helperSession])
+            guard settings.setupComplete, serverRunning, status.caTrusted,
+                  helperStatus == .enabled, loginItemStatus == .enabled,
+                  routingState != .settingUp else { return }
+            // A helper restart may have removed the line after the last probe; read the
+            // current state and let the idempotent restore re-add it instead of trusting
+            // the cached `status.hostsEntry`.
+            await refresh()
+            await restoreRouting()
+        case .disconnected:
+            guard settings.setupComplete, status.hostsEntry, routingState != .settingUp else {
+                return
+            }
+            routingState = .error("helper session lost")
+            warn(.helperSession, "The root helper session was lost. openrouter.ai is still "
+                + "routed here; fix the helper before quitting.")
+        }
+    }
+
     /// Polls the helper status until it becomes enabled, or gives up after the poll budget.
     private func waitForHelperApproval() async -> Bool {
         for _ in 0..<maxApprovalPolls {
@@ -410,7 +455,15 @@ public final class AppModel {
     private func restoreRouting() async {
         guard serverRunning else { return }
         guard status.caTrusted, helperStatus == .enabled, loginItemStatus == .enabled else {
-            if status.hostsEntry { routingState = .active }
+            if status.hostsEntry {
+                // A routed line without the helper, autostart or CA trust has no dead-man
+                // switch: it must not read as a healthy route.
+                routingState = .error("routing is not protected")
+                warn(.helperSession, "openrouter.ai is still routed here, but the helper, "
+                    + "autostart or CA trust is not ready. Fix setup or remove the route.")
+            } else if routingState != .settingUp {
+                routingState = .inactive
+            }
             return
         }
         if status.hostsEntry {
@@ -421,7 +474,7 @@ public final class AppModel {
                 try await installer.setHostsEntry(present: true)
                 routingState = .active
             } catch {
-                warn(.install, "openrouter.ai is routed here, but the root helper could not "
+                warn(.helperSession, "openrouter.ai is routed here, but the root helper could not "
                     + "confirm the session: \(error).")
                 routingState = .error(String(describing: error))
             }
@@ -626,9 +679,20 @@ public final class AppModel {
             if status.caTrusted && status.hostsEntry {
                 clearWarnings([.legacyCA])
             }
-            // A later launch that already has the route shows it as active without a restore.
-            if settings.setupComplete, status.hostsEntry, routingState == .inactive {
-                routingState = .active
+            // A later launch that already has the route shows it as active without a restore,
+            // but only while every protection is actually in place right now.
+            if settings.setupComplete, status.hostsEntry, routingState != .settingUp {
+                if status.caTrusted, helperStatus == .enabled, loginItemStatus == .enabled,
+                   helperSession.isSessionReady {
+                    if routingState == .inactive || isRoutingError {
+                        routingState = .active
+                        clearWarnings([.helperSession])
+                    }
+                } else if routingState == .active {
+                    routingState = .error("routing is not protected")
+                    warn(.helperSession, "openrouter.ai is still routed here, but the helper, "
+                        + "autostart or CA trust is not ready. Fix setup or remove the route.")
+                }
             }
             waiters.forEach { $0.resume() }
         }

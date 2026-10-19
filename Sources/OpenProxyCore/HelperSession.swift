@@ -5,12 +5,22 @@ import Foundation
 /// connection's invalidation as "the app is gone" and removes the managed `/etc/hosts` line,
 /// so a crash cannot leave `openrouter.ai` routed to a dead proxy. Injected so `AppModel` is
 /// testable without a real daemon.
+public enum HelperSessionEvent: Equatable, Sendable {
+    case connected
+    case disconnected
+}
+
 public protocol HelperSessionKeeping: Sendable {
     /// Idempotent: opens the session if needed, does nothing when it is already open.
     func start()
     /// Closes the session. The helper removes the managed hosts line when the last connection
     /// closes, so this is also a safety action.
     func stop()
+    /// Registers the one observer for connection transitions. Not replayed: callers read
+    /// `isSessionReady` for the current state.
+    func observe(_ handler: @escaping @Sendable (HelperSessionEvent) -> Void)
+    /// True while the helper has confirmed the session over a live connection.
+    var isSessionReady: Bool { get }
 }
 
 /// For tests and unbundled runs: no daemon, no session.
@@ -18,6 +28,8 @@ public struct NoHelperSession: HelperSessionKeeping {
     public init() {}
     public func start() {}
     public func stop() {}
+    public func observe(_ handler: @escaping @Sendable (HelperSessionEvent) -> Void) {}
+    public var isSessionReady: Bool { false }
 }
 
 /// Pure counter behind the helper's dead-man switch. All edits and this state run on one

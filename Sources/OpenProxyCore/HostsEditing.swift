@@ -34,7 +34,8 @@ public final class XPCHostsEditor: HostsEditing, HelperSessionKeeping, @unchecke
     /// connection that was created after a timeout.
     private var generation = 0
     private var started = false
-    private var lastPresent: Bool?
+    private var sessionConnected = false
+    private var sessionObserver: (@Sendable (HelperSessionEvent) -> Void)?
     private var reconnectTask: Task<Void, Never>?
 
     public init(timeout: Duration = .seconds(5)) {
@@ -64,18 +65,25 @@ public final class XPCHostsEditor: HostsEditing, HelperSessionKeeping, @unchecke
             return current
         }
         current?.connection.invalidate()
+        markSessionDisconnected()
     }
+
+    public func observe(_ handler: @escaping @Sendable (HelperSessionEvent) -> Void) {
+        lock.withLock { sessionObserver = handler }
+    }
+
+    public var isSessionReady: Bool { lock.withLock { sessionConnected } }
 
     // MARK: - HostsEditing
 
     public func setHostsEntry(present: Bool) async throws {
-        lock.withLock { lastPresent = present }
         try await call { helper, gate in
             helper.setHostsEntry(present: present) { error in
                 if let error { gate.fail(HostsEditingError.helperFailed(error)) }
                 else { gate.succeed() }
             }
         }
+        markSessionConnected()
     }
 
     // MARK: - Connection lifecycle
@@ -96,12 +104,9 @@ public final class XPCHostsEditor: HostsEditing, HelperSessionKeeping, @unchecke
                     }
                 }
                 // Stop may have won the race while beginSession was in flight. Do not
-                // re-create a session (or re-add hosts) after the app said stop.
+                // re-create a session after the app said stop.
                 guard self.lock.withLock({ self.started }) else { return }
-                // A helper restart may have removed the route before this session arrived.
-                if self.lock.withLock({ self.lastPresent == true }) {
-                    try? await self.setHostsEntry(present: true)
-                }
+                self.markSessionConnected(requireStarted: true)
             } catch {
                 self.discard(connection)
                 self.scheduleReconnect()
@@ -119,9 +124,13 @@ public final class XPCHostsEditor: HostsEditing, HelperSessionKeeping, @unchecke
             let generation = generation
             newConnection.invalidationHandler = { [weak self] in
                 guard let self else { return }
-                self.lock.withLock {
-                    if self.generation == generation { self.connection = nil }
+                let wasCurrent = self.lock.withLock { () -> Bool in
+                    guard self.generation == generation else { return false }
+                    self.connection = nil
+                    return true
                 }
+                // A stale connection going away says nothing about the live session.
+                if wasCurrent { self.markSessionDisconnected() }
                 if self.lock.withLock({ self.started }) {
                     self.scheduleReconnect()
                 }
@@ -175,7 +184,29 @@ public final class XPCHostsEditor: HostsEditing, HelperSessionKeeping, @unchecke
         }
         guard shouldInvalidate else { return }
         connection.connection.invalidate()
+        markSessionDisconnected()
         scheduleReconnect()
+    }
+
+    /// Notifies the observer outside the lock, only when the state actually changed, so a
+    /// burst of failures cannot flood the main actor with duplicate transitions.
+    private func markSessionConnected(requireStarted: Bool = false) {
+        let observer = lock.withLock { () -> (@Sendable (HelperSessionEvent) -> Void)? in
+            if requireStarted && !started { return nil }
+            guard !sessionConnected else { return nil }
+            sessionConnected = true
+            return sessionObserver
+        }
+        observer?(.connected)
+    }
+
+    private func markSessionDisconnected() {
+        let observer = lock.withLock { () -> (@Sendable (HelperSessionEvent) -> Void)? in
+            guard sessionConnected else { return nil }
+            sessionConnected = false
+            return sessionObserver
+        }
+        observer?(.disconnected)
     }
 
     private func scheduleReconnect() {
