@@ -23,10 +23,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Single instance: the autostart LaunchAgent (RunAtLoad) makes launchd start a second
-        // copy while the manually started one keeps running. Yield silently with exit(0) — so
-        // launchd does not treat it as a crash and restart it — before building the graph or
-        // binding port 443.
+        // Single instance: a login-item launch can overlap with a manually started copy. The
+        // duplicate yields silently with exit(0) — so it is not treated as a crash and
+        // restarted — before building the graph or binding port 443.
         let ownPID = ProcessInfo.processInfo.processIdentifier
         if let bundleIdentifier = Bundle.main.bundleIdentifier,
            SingleInstanceGuard.shouldYield(

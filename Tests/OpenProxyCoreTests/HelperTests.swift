@@ -14,7 +14,7 @@ struct HelperRegistrationTests {
     }
 
     @Test func machServiceNameMatchesThePlistContract() {
-        // The app connects to this name; Resources/dev.openproxy.helper.plist must advertise it.
+        // The app connects to this name; Resources/dev.openproxy.helperd3.plist must advertise it.
         #expect(HelperConstants.machServiceName == "dev.openproxy.helper")
     }
 
@@ -54,5 +54,43 @@ struct HelperRegistrationTests {
 
     @Test func defaultConnectionRequirementMatchesTheDefaultIdentifier() throws {
         #expect(HelperConstants.connectionRequirement == (try HelperConstants.requirement(forAppIdentifier: "dev.openproxy.app")))
+    }
+
+    @Test func lastSessionCloseIsTheDeadManSignal() {
+        var tracker = HelperConnectionTracker()
+        #expect(tracker.isIdle)
+
+        tracker.opened()
+        tracker.opened()
+        #expect(!tracker.isIdle)
+        let firstClose = tracker.closed()
+        #expect(!firstClose)
+        let lastClose = tracker.closed()
+        #expect(lastClose)
+        #expect(tracker.isIdle)
+    }
+
+    @Test func aStrayCloseCannotMakeTheTrackerNegative() {
+        var tracker = HelperConnectionTracker()
+        let firstClose = tracker.closed()
+        #expect(firstClose)
+        #expect(tracker.isIdle)
+        let secondClose = tracker.closed()
+        #expect(secondClose)
+        #expect(tracker.isIdle)
+    }
+
+    @Test func cleanupRetryBacksOffAndStops() {
+        let retry = HelperCleanupRetry(maxAttempts: 3)
+        #expect(retry.delay(afterFailedAttempt: 0) == nil)
+        #expect(retry.delay(afterFailedAttempt: 1) == .seconds(1))
+        #expect(retry.delay(afterFailedAttempt: 2) == .seconds(2))
+        #expect(retry.delay(afterFailedAttempt: 3) == nil)
+    }
+
+    @Test func cleanupRetryBudgetIsAtLeastOneAttempt() {
+        let retry = HelperCleanupRetry(maxAttempts: 0)
+        #expect(retry.maxAttempts == 1)
+        #expect(retry.delay(afterFailedAttempt: 1) == nil)
     }
 }

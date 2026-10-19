@@ -41,6 +41,8 @@ public enum WarningKey: Hashable, Sendable {
     case quit
     case autostart
     case nodeEnv
+    case helperSession
+    case legacyMigration
 }
 
 public struct Warning: Equatable, Sendable, Identifiable {
@@ -111,6 +113,22 @@ public final class AppModel {
     /// The compact "Routing:" line: inactive / setting up... / waiting for approval... / active.
     public private(set) var routingState: RoutingState = .inactive
     public var routingLabel: String { routingState.label }
+    private var isRoutingError: Bool {
+        if case .error = routingState { return true }
+        return false
+    }
+
+    /// A routed line without a live helper session has no dead-man switch. Tell the user how
+    /// to make it safe when the helper cannot be used (for example while approval is pending).
+    private static let unprotectedRouteMessage =
+        "openrouter.ai is still routed here, but the root helper, autostart or CA trust is not "
+        + "ready. Approve OpenProxy in System Settings -> Login Items, or remove the line "
+        + "manually: sudo sed -i '' '/# openproxy/d' /etc/hosts && sudo dscacheutil -flushcache."
+
+    private func markRoutingUnprotected() {
+        routingState = .error("routing is not protected")
+        warn(.helperSession, Self.unprotectedRouteMessage)
+    }
 
     /// Derived from `status`, so it stays visible for as long as the danger lasts
     /// (proxy quit/crashed with the hosts entry still routed) and clears itself.
@@ -129,10 +147,14 @@ public final class AppModel {
     /// fresh round, so an Install/Uninstall refresh is neither concurrent nor starved.
     @ObservationIgnored private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var refreshRunning = false
+    @ObservationIgnored private var observingHelperSession = false
 
     /// Whether `server.start()` already bound the port. Guards Install from a
     /// second bind (and from installing hosts before anything listens).
     private var serverRunning = false
+    /// Set when the old daemon could not be removed: it may still hold the Mach service, so
+    /// the route must stay off until a retry succeeds.
+    private var legacyDaemonRemovalFailed = false
 
     private var currentSettings: Settings
     private let settingsStore: SettingsStore
@@ -141,6 +163,8 @@ public final class AppModel {
     private let server: ProxyServerControlling
     private let loginItem: LoginItemRegistering
     private let helper: HelperRegistering
+    private let helperSession: HelperSessionKeeping
+    private let legacyCleanup: LegacyServiceCleaning
     private let quitDecision: QuitDecision
     private let setupDecision: SetupDecision
     private let uninstallDecision: UninstallDecision
@@ -156,6 +180,8 @@ public final class AppModel {
         loginItem: LoginItemRegistering,
         quitDecision: QuitDecision,
         helper: HelperRegistering = NoHelperRegistration(),
+        helperSession: HelperSessionKeeping = NoHelperSession(),
+        legacyCleanup: LegacyServiceCleaning = NoLegacyServiceCleaning(),
         setupDecision: SetupDecision = NoSetupDecision(),
         uninstallDecision: UninstallDecision = NoUninstallDecision(),
         dataRemover: AppDataRemoving = NoAppDataRemoving(),
@@ -170,6 +196,8 @@ public final class AppModel {
         self.server = server
         self.loginItem = loginItem
         self.helper = helper
+        self.helperSession = helperSession
+        self.legacyCleanup = legacyCleanup
         self.quitDecision = quitDecision
         self.setupDecision = setupDecision
         self.uninstallDecision = uninstallDecision
@@ -187,12 +215,30 @@ public final class AppModel {
     }
 
     public func start() async {
+        // Upgrades still carry the old LaunchAgent and LaunchDaemon; drop them before any new
+        // registration or restore, so the app cannot start twice and the old daemon cannot
+        // hold dev.openproxy.helper against the new one.
+        applyLegacyCleanup()
+        observeHelperSessionIfNeeded()
         guard await startServer(ifFailed: "The hosts entry was left unchanged.") else { return }
         await refresh()
         await setupOrRestoreRouting()
     }
 
+    /// Runs the legacy-service migration and records what it left behind. A failed daemon
+    /// removal keeps the route off; every failure is surfaced so Retry setup can be offered.
+    private func applyLegacyCleanup() {
+        let report = legacyCleanup.removeLegacyRegistrations()
+        legacyDaemonRemovalFailed = report.blocksRouting
+        if report.hasFailures {
+            warn(.legacyMigration, report.message ?? "Legacy service cleanup failed.")
+        } else {
+            clearWarnings([.legacyMigration])
+        }
+    }
+
     public func stop() async {
+        helperSession.stop()
         await server.stop()
         serverRunning = false
     }
@@ -213,22 +259,49 @@ public final class AppModel {
     }
 
     /// First launch: ask once, then run the automatic setup. Later launches: silently restore
-    /// the route when the setup is already complete.
+    /// the route when the setup is already complete. A helper registration can disappear (the
+    /// user switched the background item off, or the app bundle was rebuilt), so try once to
+    /// bring it back before deciding that the route must stay off.
     private func setupOrRestoreRouting() async {
+        guard !legacyDaemonRemovalFailed else {
+            routingState = .error("legacy helper still registered")
+            return
+        }
         guard settings.setupComplete else {
             guard setupDecision.confirmSetup() else { return }
             await install()
             return
         }
+        if helperStatus != .enabled {
+            switch installer.helperReadiness() {
+            case .enabled:
+                helperStatus = .enabled
+                // Arm the persistent session before the hosts edit. Without this flag the
+                // editor's reconnect path stays disabled if the helper later drops.
+                helperSession.start()
+            case .requiresApproval:
+                installer.openHelperApprovalSettings()
+                warn(.install, "The root helper needs approval in System Settings -> Login Items. "
+                    + "Approve OpenProxy, then choose Retry setup in the OpenProxy menu.")
+                if status.hostsEntry { markRoutingUnprotected() }
+                return
+            case .unavailable:
+                break
+            }
+        }
         await restoreRouting()
     }
 
     /// True when the menu should offer Retry setup: the setup never completed (and is not
-    /// currently running), or it completed but autostart was turned off since — the Control
-    /// window leaves the route removed in that state, so the setup must be runnable again.
+    /// currently running), or it completed but autostart or the root helper is gone since —
+    /// the route is unsafe in either state, so the setup must be runnable again.
     public var canRetrySetup: Bool {
+        if legacyDaemonRemovalFailed { return true }
         guard !settings.setupComplete else {
-            return routingState != .settingUp && loginItemStatus != .enabled
+            guard routingState != .settingUp else { return false }
+            if isRoutingError { return true }
+            return loginItemStatus != .enabled || helperStatus != .enabled
+                || !helperSession.isSessionReady
         }
         switch routingState {
         case .waitingForApproval, .error: return true
@@ -275,6 +348,16 @@ public final class AppModel {
     /// failing), autostart (also a wait when approval is pending), the hosts entry, then the
     /// Node env. `setupComplete` is set only when the critical steps succeed.
     public func install() async {
+        // Retry setup after a failed legacy daemon removal retries the migration first; a
+        // still-registered old daemon may hold the Mach service the new helper needs.
+        if legacyDaemonRemovalFailed {
+            applyLegacyCleanup()
+            guard !legacyDaemonRemovalFailed else {
+                routingState = .error("legacy helper still registered")
+                return
+            }
+        }
+        observeHelperSessionIfNeeded()
         guard await startServer(ifFailed: "Setup was skipped; the hosts entry was left unchanged.") else {
             await refresh()
             return
@@ -286,7 +369,10 @@ public final class AppModel {
 
             // (b) helper: register once; approval is a wait, not a failure.
             switch installer.helperReadiness() {
-            case .enabled, .unavailable:
+            case .enabled:
+                helperStatus = .enabled
+                helperSession.start()
+            case .unavailable:
                 break
             case .requiresApproval:
                 installer.openHelperApprovalSettings()
@@ -299,10 +385,11 @@ public final class AppModel {
                 }
             }
 
-            // (c) autostart: a LaunchAgent must be enabled before anything routes here, or a
-            // crash would leave openrouter.ai pointing at a dead proxy. Only a pending approval
-            // is a wait (poll it with the injected clock); any other non-enabled status is a
-            // real failure, so stop at once and leave Retry setup available.
+            // (c) autostart: the login item must be enabled before anything routes here. The
+            // helper removes the hosts line if the app exits or crashes, so the route cannot
+            // outlive the proxy. Only a pending approval is a wait (poll it with the injected
+            // clock); any other non-enabled status is a real failure, so stop at once and leave
+            // Retry setup available.
             registerLoginItem()
             if loginItemStatus == .requiresApproval {
                 installer.openHelperApprovalSettings()
@@ -342,6 +429,41 @@ public final class AppModel {
         await refresh()
     }
 
+    /// The editor keeps a live session for the app's lifetime; install the one observer that
+    /// turns its transitions into routing state. Reinstalling would replace the observer, so
+    /// guard it once per model.
+    private func observeHelperSessionIfNeeded() {
+        guard !observingHelperSession else { return }
+        observingHelperSession = true
+        helperSession.observe { [weak self] event in
+            Task { @MainActor [weak self] in await self?.handleHelperSession(event) }
+        }
+    }
+
+    /// A reconnect proves the helper is reachable again, but the route is only re-added when
+    /// every current prerequisite holds: never from a cached "it used to be routed" state.
+    private func handleHelperSession(_ event: HelperSessionEvent) async {
+        switch event {
+        case .connected:
+            clearWarnings([.helperSession])
+            guard settings.setupComplete, serverRunning, status.caTrusted,
+                  helperStatus == .enabled, loginItemStatus == .enabled,
+                  routingState != .settingUp else { return }
+            // A helper restart may have removed the line after the last probe; read the
+            // current state and let the idempotent restore re-add it instead of trusting
+            // the cached `status.hostsEntry`.
+            await refresh()
+            await restoreRouting()
+        case .disconnected:
+            guard settings.setupComplete, status.hostsEntry, routingState != .settingUp else {
+                return
+            }
+            routingState = .error("helper session lost")
+            warn(.helperSession, "The root helper session was lost. openrouter.ai is still "
+                + "routed here; fix the helper before quitting.")
+        }
+    }
+
     /// Polls the helper status until it becomes enabled, or gives up after the poll budget.
     private func waitForHelperApproval() async -> Bool {
         for _ in 0..<maxApprovalPolls {
@@ -375,15 +497,39 @@ public final class AppModel {
         return false
     }
 
-    /// Every later launch: if the CA is trusted, the helper is enabled, autostart is enabled and
-    /// the hosts entry is missing, re-add it silently. Never runs when the proxy could not bind,
-    /// and never adds the route while autostart is off.
+    /// Every later launch: if the CA is trusted, the helper is enabled and autostart is enabled,
+    /// keep the helper session open and make sure the hosts entry is present. The edit is a
+    /// no-op when the line is already there, but it establishes the session the helper uses as
+    /// its dead-man switch. Never runs when the proxy could not bind, and never adds the route
+    /// while autostart is off.
     private func restoreRouting() async {
+        guard !legacyDaemonRemovalFailed else {
+            routingState = .error("legacy helper still registered")
+            return
+        }
         guard serverRunning else { return }
-        guard status.caTrusted, helperStatus == .enabled, loginItemStatus == .enabled,
-              !status.hostsEntry
-        else {
-            if status.hostsEntry { routingState = .active }
+        guard status.caTrusted, helperStatus == .enabled, loginItemStatus == .enabled else {
+            if status.hostsEntry {
+                // A routed line without the helper, autostart or CA trust has no dead-man
+                // switch: it must not read as a healthy route.
+                markRoutingUnprotected()
+            } else if routingState != .settingUp {
+                routingState = .inactive
+            }
+            return
+        }
+        if status.hostsEntry {
+            // The line is already there, but this edit also proves the helper session works.
+            // Do not claim "active" if that confirmation failed: without the session the
+            // helper cannot remove the line when this app exits or crashes.
+            do {
+                try await installer.setHostsEntry(present: true)
+                routingState = .active
+            } catch {
+                warn(.helperSession, "openrouter.ai is routed here, but the root helper could not "
+                    + "confirm the session: \(error).")
+                routingState = .error(String(describing: error))
+            }
             return
         }
         routingState = .settingUp
@@ -485,6 +631,7 @@ public final class AppModel {
 
         // 5. Quit.
         routingState = .inactive
+        helperSession.stop()
         quitDecision.terminate()
     }
 
@@ -496,6 +643,7 @@ public final class AppModel {
         if helperStatus == .enabled {
             do {
                 try await installer.setHostsEntry(present: false)
+                helperSession.stop()
                 quitDecision.terminate()
                 return
             } catch {
@@ -509,6 +657,7 @@ public final class AppModel {
         // openrouter.ai is still routed here. Only a confirmed `.absent` is safe to quit on.
         switch installer.hostsEntryState() {
         case .absent:
+            helperSession.stop()
             quitDecision.terminate()
         case .present:
             await quitAfterConfirmation()
@@ -545,6 +694,7 @@ public final class AppModel {
                 return
             }
         }
+        helperSession.stop()
         quitDecision.terminate()
     }
 
@@ -572,14 +722,31 @@ public final class AppModel {
             status = await installer.status()
             loginItemStatus = loginItem.status
             helperStatus = helper.status
+            // Keep the helper session alive only while the daemon is usable. The session is
+            // the helper's signal that the app is still running; `stop()` also removes the
+            // managed hosts line, which is what the user expects when the helper is gone.
+            if helperStatus == .enabled { helperSession.start() } else { helperSession.stop() }
             // The regenerated-CA warning stops being true once the current CA is trusted and
             // its hosts entry is in place; until then it stays visible.
             if status.caTrusted && status.hostsEntry {
                 clearWarnings([.legacyCA])
             }
-            // A later launch that already has the route shows it as active without a restore.
-            if settings.setupComplete, status.hostsEntry, routingState == .inactive {
-                routingState = .active
+            // A later launch that already has the route shows it as active without a restore,
+            // but only while every protection is actually in place right now.
+            if legacyDaemonRemovalFailed, routingState == .active {
+                routingState = .error("legacy helper still registered")
+            }
+            if settings.setupComplete, status.hostsEntry, routingState != .settingUp,
+               !legacyDaemonRemovalFailed {
+                if status.caTrusted, helperStatus == .enabled, loginItemStatus == .enabled,
+                   helperSession.isSessionReady {
+                    if routingState == .inactive || isRoutingError {
+                        routingState = .active
+                        clearWarnings([.helperSession])
+                    }
+                } else if routingState == .active || routingState == .inactive {
+                    markRoutingUnprotected()
+                }
             }
             waiters.forEach { $0.resume() }
         }

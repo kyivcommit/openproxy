@@ -134,6 +134,56 @@ private final class FakeHelper: HelperRegistering, @unchecked Sendable {
     func openApprovalSettings() { openApprovalCount += 1 }
 }
 
+/// Records the legacy-service cleanup; `onClean` lets a test place it in the step-order log.
+/// Mutating `report` between calls makes the retry path testable.
+private final class FakeLegacyCleanup: LegacyServiceCleaning, @unchecked Sendable {
+    var onClean: (() -> Void)?
+    var report = LegacyServiceCleanupReport()
+    private let lock = NSLock()
+    private var _count = 0
+
+    var count: Int { lock.withLock { _count } }
+
+    func removeLegacyRegistrations() -> LegacyServiceCleanupReport {
+        let report = lock.withLock { () -> LegacyServiceCleanupReport in
+            _count += 1
+            return self.report
+        }
+        onClean?()
+        return report
+    }
+}
+
+/// Records the helper's live-session signal without opening a real XPC connection.
+private final class FakeHelperSession: HelperSessionKeeping, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _starts = 0
+    private var _stops = 0
+    private var _ready = true
+    private var observer: (@Sendable (HelperSessionEvent) -> Void)?
+
+    var starts: Int { lock.withLock { _starts } }
+    var stops: Int { lock.withLock { _stops } }
+    var isSessionReady: Bool { lock.withLock { _ready } }
+
+    func setSessionReady(_ ready: Bool) { lock.withLock { _ready = ready } }
+
+    func start() { lock.withLock { _starts += 1 } }
+    func stop() { lock.withLock { _stops += 1; _ready = false } }
+
+    func observe(_ handler: @escaping @Sendable (HelperSessionEvent) -> Void) {
+        lock.withLock { observer = handler }
+    }
+
+    func emit(_ event: HelperSessionEvent) {
+        let handler = lock.withLock { () -> (@Sendable (HelperSessionEvent) -> Void)? in
+            _ready = event == .connected
+            return observer
+        }
+        handler?(event)
+    }
+}
+
 /// Records the hosts edit the installer would route through the helper.
 private final class FakeHostsEditor: HostsEditing, @unchecked Sendable {
     var error: Error?
@@ -230,6 +280,8 @@ private struct Harness {
     let server: FakeServer
     let loginItem: FakeLoginItem
     let helper: FakeHelper
+    let helperSession: FakeHelperSession
+    let legacyCleanup: FakeLegacyCleanup
     let hostsEditor: FakeHostsEditor
     let quitDecision: FakeQuitDecision
     let setupDecision: FakeSetupDecision
@@ -255,6 +307,8 @@ private struct Harness {
         self.commandRunner = FakeCommandRunner()
         self.hostsEditor = FakeHostsEditor()
         self.helper = FakeHelper()
+        self.helperSession = FakeHelperSession()
+        self.legacyCleanup = FakeLegacyCleanup()
         self.installer = Installer(
             caPEMURL: ca.caCertificatePEMURL,
             runner: runner,
@@ -287,6 +341,7 @@ private struct Harness {
         self.loginItem.onRegister = { [orderLog] in orderLog.append("autostart") }
         self.loginItem.onUnregister = { [orderLog] in orderLog.append("autostart") }
         self.helper.onRegister = { [orderLog] in orderLog.append("helper") }
+        self.legacyCleanup.onClean = { [orderLog] in orderLog.append("legacy") }
         self.hostsEditor.onRequest = { [orderLog] in orderLog.append("hosts") }
         self.quitDecision.onTerminate = { [orderLog] in orderLog.append("quit") }
         self.dataRemover.onRemove = { [orderLog] in orderLog.append("data") }
@@ -296,7 +351,8 @@ private struct Harness {
         AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: loginItem, quitDecision: quitDecision,
-            helper: helper,
+            helper: helper, helperSession: helperSession,
+            legacyCleanup: legacyCleanup,
             setupDecision: setupDecision,
             uninstallDecision: uninstallDecision,
             dataRemover: dataRemover,
@@ -460,22 +516,6 @@ struct AppModelTests {
         #expect(FileManager.default.fileExists(atPath: base.appending(path: "stats.sqlite").path))
     }
 
-    @Test func agentPlistUsesBundleRelativeProgramAndConditionalKeepAlive() throws {
-        // Guards the LaunchAgent contract: the program path must follow the signed
-        // bundle wherever it lives, and KeepAlive must not fight Quit.
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // OpenProxyAppTests
-            .deletingLastPathComponent()   // Tests
-            .deletingLastPathComponent()   // repo root
-        let data = try Data(contentsOf: root.appending(path: "Resources/dev.openproxy.app.plist"))
-        let dict = try #require(
-            try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
-
-        #expect(dict["ProgramArguments"] == nil)
-        #expect(dict["BundleProgram"] as? String == "Contents/MacOS/OpenProxyApp")
-        #expect((dict["KeepAlive"] as? [String: Any])?["SuccessfulExit"] as? Bool == false)
-    }
-
     @Test func loginItemRegistrationFailureBecomesWarning() throws {
         let h = try Harness()
         h.loginItem.registerError = LoginItemTestError.denied
@@ -554,6 +594,25 @@ struct AppModelTests {
         await model.refresh()
 
         #expect(model.loginItemStatus == .requiresApproval)
+    }
+
+    @Test func helperSessionTracksHelperAvailability() async throws {
+        let h = try Harness()
+        h.helper.status = .enabled
+        let model = h.model()
+
+        await model.refresh()
+
+        #expect(h.helperSession.starts >= 1)
+        let startsWhileEnabled = h.helperSession.starts
+
+        h.helper.status = .requiresApproval
+        await model.refresh()
+
+        // A disabled/unavailable helper must not keep a live session: closing it is what makes
+        // the helper remove the managed hosts line.
+        #expect(h.helperSession.starts == startsWhileEnabled)
+        #expect(h.helperSession.stops >= 1)
     }
 
     // MARK: - Autostart is tied to Install/Uninstall, not to launch
@@ -1019,6 +1078,7 @@ struct AppModelTests {
 
     @Test func installSetsSetupCompleteAndRoutingActive() async throws {
         let h = try Harness()
+        h.helper.status = .enabled
         let model = h.model()
 
         await model.install()
@@ -1039,10 +1099,125 @@ struct AppModelTests {
         #expect(h.orderLog.sequence == ["trust", "helper", "autostart", "hosts", "nodeenv"])
     }
 
+    @Test func startRemovesLegacyRegistrationsBeforeNewSetupRegistrations() async throws {
+        // An upgrade must drop the old LaunchAgent and LaunchDaemon before the new setup
+        // registers the helper or autostart, or the app can start twice and the old daemon
+        // can hold dev.openproxy.helper.
+        let h = try Harness()
+        h.helper.status = .notRegistered
+        h.helper.statusAfterRegister = .enabled
+        h.setupDecision.confirm = true
+        let model = h.model()
+
+        await model.start()
+
+        #expect(h.legacyCleanup.count == 1)
+        let sequence = h.orderLog.sequence
+        #expect(sequence.first == "legacy")
+        #expect(sequence.firstIndex(of: "legacy")! < sequence.firstIndex(of: "helper")!)
+        #expect(sequence.firstIndex(of: "legacy")! < sequence.firstIndex(of: "autostart")!)
+    }
+
+    @Test func laterLaunchRemovesLegacyRegistrationsBeforeRestoringTheRoute() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.legacyCleanup.count == 1)
+        let sequence = h.orderLog.sequence
+        #expect(sequence.first == "legacy")
+        #expect(sequence.firstIndex(of: "legacy")! < sequence.firstIndex(of: "hosts")!)
+    }
+
+    @Test func failedLegacyDaemonRemovalBlocksSetupAndRestore() async throws {
+        // A still-registered old daemon may hold dev.openproxy.helper against the new helper.
+        // First launch: the setup must not even start. Later launch: no route edit at all.
+        let setup = try Harness(hostsText: "127.0.0.1 localhost\n")
+        setup.setupDecision.confirm = true
+        setup.helper.status = .notRegistered
+        setup.legacyCleanup.report = LegacyServiceCleanupReport(
+            daemonFailure: "old helper daemon: still registered")
+        let setupModel = setup.model()
+
+        await setupModel.start()
+
+        #expect(setup.orderLog.sequence.first == "legacy")
+        #expect(setup.setupDecision.count == 0)
+        #expect(setup.helper.registerCount == 0)
+        #expect(setup.hostsEditor.requests.isEmpty)
+        #expect(!setupModel.settings.setupComplete)
+        #expect(setupModel.routingState == .error("legacy helper still registered"))
+        #expect(setupModel.warnings.contains { $0.key == .legacyMigration })
+        #expect(setupModel.canRetrySetup)
+
+        let restore = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        restore.helper.status = .enabled
+        restore.loginItem.status = .enabled
+        restore.legacyCleanup.report = LegacyServiceCleanupReport(
+            daemonFailure: "old helper daemon: still registered")
+        let restoreModel = restore.model()
+        restoreModel.settings.setupComplete = true
+
+        await restoreModel.start()
+
+        #expect(restore.hostsEditor.requests.isEmpty)
+        #expect(restoreModel.routingState == .error("legacy helper still registered"))
+        #expect(restoreModel.canRetrySetup)
+    }
+
+    @Test func legacyAgentFailureWarnsButDoesNotBlockTheRestore() async throws {
+        // Only the daemon conflicts with the new helper over the Mach service.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .enabled
+        h.legacyCleanup.report = LegacyServiceCleanupReport(
+            agentFailure: "old app agent: still registered")
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(model.routingState == .active)
+        #expect(h.hostsEditor.requests == [true])
+        #expect(model.warnings.contains {
+            $0.key == .legacyMigration && $0.message.contains("old app agent")
+        })
+        #expect(!model.canRetrySetup)
+    }
+
+    @Test func retrySetupRetriesTheLegacyDaemonRemovalAndThenInstalls() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .notRegistered
+        h.helper.statusAfterRegister = .enabled
+        h.legacyCleanup.report = LegacyServiceCleanupReport(
+            daemonFailure: "old helper daemon: still registered")
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(model.routingState == .error("legacy helper still registered"))
+        #expect(h.legacyCleanup.count == 1)
+
+        h.legacyCleanup.report = LegacyServiceCleanupReport()
+        await model.retrySetup()
+
+        #expect(h.legacyCleanup.count == 2)
+        #expect(model.routingState == .active)
+        #expect(h.hostsEditor.requests == [true])
+        #expect(!model.warnings.contains { $0.key == .legacyMigration })
+    }
+
     @Test func installWaitsForAutostartApprovalBeforeAddingHosts() async throws {
         // Autostart must be enabled before anything routes here: an approved-but-pending
         // registration is a wait, and the hosts entry/Node env follow once it flips.
         let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .notRegistered
+        h.helper.statusAfterRegister = .enabled
         h.loginItem.status = .requiresApproval
         h.loginItem.statusAfterRegister = .requiresApproval
         h.waiting.onPoll = { h.loginItem.status = .enabled }
@@ -1053,7 +1228,7 @@ struct AppModelTests {
         #expect(h.loginItem.registerCount == 1)
         #expect(h.waiting.count == 1)
         #expect(h.helper.openApprovalCount == 1)
-        #expect(h.runner.scripts.count == 1)
+        #expect(h.hostsEditor.requests == [true])
         #expect(model.settings.setupComplete)
         #expect(model.routingState == .active)
         #expect(!model.warnings.contains { $0.key == .autostart })
@@ -1079,6 +1254,8 @@ struct AppModelTests {
 
     @Test func installContinuesWhenAutostartIsApprovedLater() async throws {
         let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .notRegistered
+        h.helper.statusAfterRegister = .enabled
         h.loginItem.status = .requiresApproval
         h.loginItem.statusAfterRegister = .requiresApproval
         let model = h.model()
@@ -1091,7 +1268,7 @@ struct AppModelTests {
 
         #expect(model.settings.setupComplete)
         #expect(model.routingState == .active)
-        #expect(h.runner.scripts.count == 1)
+        #expect(h.hostsEditor.requests == [true])
     }
 
     @Test func installDoesNotRouteOrWaitWhenAutostartRegistrationFails() async throws {
@@ -1116,6 +1293,181 @@ struct AppModelTests {
                 $0.key == .autostart && $0.message.contains("Autostart registration failed")
             })
         }
+    }
+
+    @Test func laterLaunchReRegistersAMissingHelper() async throws {
+        // A completed setup can lose its helper (the user turned the background item off, or a
+        // reinstall dropped it). The launch must ask for it again instead of silently showing a
+        // dead route, and must not add hosts until it is enabled.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .notFound
+        h.helper.statusAfterRegister = .requiresApproval
+        h.loginItem.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.helper.registerCount == 1)
+        #expect(h.helper.openApprovalCount == 1)
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(model.warnings.contains { $0.message.contains("needs approval") })
+        #expect(model.canRetrySetup)
+    }
+
+    @Test func laterLaunchStartsTheSessionAfterReRegisteringAHelper() async throws {
+        // The re-registration path used to update the status only. Without start(), the editor's
+        // reconnect flag stayed off and a later connection loss was never repaired.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .notFound
+        h.helper.statusAfterRegister = .enabled
+        h.loginItem.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.helper.registerCount == 1)
+        #expect(h.helperSession.starts >= 1)
+        #expect(h.hostsEditor.requests == [true])
+        #expect(model.routingState == .active)
+    }
+
+    @Test func existingHostsRouteIsNotActiveWhenTheHelperCannotConfirmTheSession() async throws {
+        // The line is already present, but that edit is also the session check. If the helper
+        // cannot answer, the route has no dead-man switch and must not read as active.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = HostsEditingError.timedOut
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(model.routingState != .active)
+        #expect(model.warnings.contains { $0.message.contains("could not confirm") })
+        #expect(model.warnings.contains { $0.key == .helperSession })
+        #expect(model.canRetrySetup)
+    }
+
+    @Test func sessionConnectedWhileAutostartIsOffDoesNotAddOrActivateTheRoute() async throws {
+        // A reconnect is not permission to route: with autostart off the restore must stay
+        // off, even though the hosts line is already present.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .notRegistered
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+        h.helperSession.emit(.connected)
+        try await Task.sleep(for: .milliseconds(20))
+
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(model.routingState != .active)
+    }
+
+    @Test func refreshWithHostsEntryButHelperNeedingApprovalShowsUnprotectedError() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .requiresApproval
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.refresh()
+
+        #expect(model.routingState == .error("routing is not protected"))
+        #expect(model.warnings.contains {
+            $0.key == .helperSession && $0.message.contains("still routed")
+        })
+        #expect(model.canRetrySetup)
+    }
+
+    @Test func helperApprovalWithAnExistingRouteShowsUnprotectedError() async throws {
+        // A completed setup with a routed line and a helper waiting for approval must not look
+        // merely inactive: the route has no dead-man switch until the helper is enabled.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .requiresApproval
+        h.loginItem.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.helper.openApprovalCount == 1)
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(model.routingState == .error("routing is not protected"))
+        #expect(model.warnings.contains {
+            $0.key == .helperSession && $0.message.contains("still routed")
+        })
+        #expect(model.warnings.contains {
+            $0.key == .install && $0.message.contains("needs approval")
+        })
+        #expect(model.canRetrySetup)
+    }
+
+    @Test func routingErrorClearsAfterTheSessionReconnects() async throws {
+        // The confirmation failure leaves an error and a warning; a later real session must
+        // clear both without a manual Retry setup.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = HostsEditingError.timedOut
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+        #expect(isRoutingError(model.routingState))
+        #expect(model.warnings.contains { $0.key == .helperSession })
+
+        h.hostsEditor.error = nil
+        h.helperSession.emit(.connected)
+
+        #expect(await h.waitUntil { model.routingState == .active })
+        #expect(!model.warnings.contains { $0.key == .helperSession })
+    }
+
+    @Test func reconnectRestoresTheLineTheHelperRemovedDuringARestart() async throws {
+        // The helper removes the line when the session drops, but the last status probe may
+        // still cache "present". A reconnect must restore from the current hosts state, not
+        // from that cached flag.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+        await model.start()
+        #expect(model.routingState == .active)
+        let requestsBefore = h.hostsEditor.requests.count
+
+        try "127.0.0.1 localhost\n".write(
+            to: h.directory.appending(path: "hosts"), atomically: true, encoding: .utf8)
+        #expect(model.status.hostsEntry)
+
+        h.helperSession.emit(.disconnected)
+        #expect(await h.waitUntil { model.routingState == .error("helper session lost") })
+
+        h.helperSession.emit(.connected)
+        #expect(await h.waitUntil { model.routingState == .active })
+        #expect(h.hostsEditor.requests.count == requestsBefore + 1)
+        #expect(h.hostsEditor.requests.last == true)
+    }
+
+    @Test func disconnectWithARoutedHostsEntrySetsAnError() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+        await model.start()
+        #expect(model.routingState == .active)
+
+        h.helperSession.emit(.disconnected)
+
+        #expect(await h.waitUntil { model.routingState == .error("helper session lost") })
+        #expect(model.routingState != .active)
+        #expect(model.warnings.contains { $0.key == .helperSession })
+    }
+
+    private func isRoutingError(_ state: RoutingState) -> Bool {
+        if case .error = state { return true }
+        return false
     }
 
     @Test func laterLaunchDoesNotRestoreHostsWithoutAutostart() async throws {
@@ -1297,6 +1649,7 @@ struct AppModelTests {
 
     @Test func retrySetupIsNotOfferedOrRunWhenSetupIsComplete() async throws {
         let h = try Harness()
+        h.helper.status = .enabled
         let model = h.model()
         await model.install()
         #expect(model.settings.setupComplete)
@@ -1721,7 +2074,7 @@ struct AppGraphTests {
         defer { try? FileManager.default.removeItem(at: bundle) }
 
         #expect(AppGraph.helperIsBundled(inBundleAt: bundle) == false)
-        try Data().write(to: daemonDir.appending(path: "dev.openproxy.helper.plist"))
+        try Data().write(to: daemonDir.appending(path: "dev.openproxy.helperd3.plist"))
         #expect(AppGraph.helperIsBundled(inBundleAt: bundle))
     }
 }

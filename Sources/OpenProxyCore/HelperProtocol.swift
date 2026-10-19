@@ -6,7 +6,7 @@ import Foundation
 /// that runs caller-supplied input is a privilege-escalation hole.
 public enum HelperConstants {
     /// The Mach service the daemon advertises and the app connects to. Must match
-    /// `MachServices` in `Resources/dev.openproxy.helper.plist`.
+    /// `MachServices` in `Resources/dev.openproxy.helperd3.plist`.
     public static let machServiceName = "dev.openproxy.helper"
 
     /// The only client the daemon accepts: a process signed as the OpenProxy app.
@@ -56,4 +56,10 @@ public enum HelperConstants {
     /// Adds (`present == true`) or removes the managed openproxy line, then flushes the DNS
     /// cache. `reply` is nil on success, otherwise a short error text.
     func setHostsEntry(present: Bool, reply: @escaping (String?) -> Void)
+
+    /// Marks this connection as the live app session. The helper removes the managed hosts
+    /// line when the last session connection is invalidated, so a crashed app cannot leave
+    /// `openrouter.ai` routed to a dead proxy. The call also forces the otherwise lazy XPC
+    /// connection open, which cancels the helper's boot-time stale-route cleanup.
+    func beginSession(reply: @escaping (String?) -> Void)
 }

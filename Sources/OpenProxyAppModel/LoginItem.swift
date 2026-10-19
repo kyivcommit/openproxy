@@ -22,31 +22,29 @@ public enum LoginItemStatus: Equatable, Sendable {
         case .notRegistered: "not registered"
         case .enabled: "enabled"
         case .requiresApproval: "needs approval in System Settings"
-        case .notFound: "LaunchAgent missing from the bundle"
+        case .notFound: "not found"
         case .unknown(let raw): "unknown (\(raw))"
         }
     }
 }
 
-/// The production registrar: `SMAppService.agent(plistName:)` over the LaunchAgent
-/// bundled at `Contents/Library/LaunchAgents/<plistName>`.
+/// The production registrar: `SMAppService.mainApp`, macOS's Login Item for the app itself.
+/// It avoids a bundled LaunchAgent and its stored code requirement, which went stale every
+/// time the ad-hoc-signed app bundle was rebuilt. The approved root helper removes the
+/// `/etc/hosts` line when the app exits or crashes, so the route is safe without `KeepAlive`.
 public struct SMAppServiceLoginItem: LoginItemRegistering {
-    private let plistName: String
-
-    public init(plistName: String = "dev.openproxy.app.plist") {
-        self.plistName = plistName
-    }
+    public init() {}
 
     public func register() throws {
-        try SMAppService.agent(plistName: plistName).register()
+        try SMAppService.mainApp.register()
     }
 
     public func unregister() throws {
-        try SMAppService.agent(plistName: plistName).unregister()
+        try SMAppService.mainApp.unregister()
     }
 
     public var status: LoginItemStatus {
-        switch SMAppService.agent(plistName: plistName).status {
+        switch SMAppService.mainApp.status {
         case .notRegistered: .notRegistered
         case .enabled: .enabled
         case .requiresApproval: .requiresApproval
