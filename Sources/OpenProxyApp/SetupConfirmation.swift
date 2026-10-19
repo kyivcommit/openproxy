@@ -12,6 +12,8 @@ struct AlertSetupDecision: SetupDecision {
             + "password, and starts at login."
         alert.addButton(withTitle: "Continue")
         alert.addButton(withTitle: "Not now")
+        // Accessory apps can open a modal alert behind the frontmost app; raise it first.
+        NSApplication.shared.activate()
         return alert.runModal() == .alertFirstButtonReturn
     }
 }
@@ -27,6 +29,8 @@ struct AlertUninstallDecision: UninstallDecision {
             + "away when you delete the app."
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
+        // Accessory apps can open a modal alert behind the frontmost app; raise it first.
+        NSApplication.shared.activate()
         return alert.runModal() == .alertFirstButtonReturn
     }
 }

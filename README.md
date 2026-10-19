@@ -35,6 +35,8 @@ Speed needs the client's key. `throughput_last_30m` and `latency_last_30m` come 
 
 ## First launch
 
+Left click the menu bar icon for a native menu with **Sort**, **Tier** (which holds the Flex settings while that tier is selected), **Refresh** (endpoint data interval), **Stats** and **Status**; right click (or control-click) for **Enabled**, **Start at login**, **Uninstall OpenProxy…** and **Quit OpenProxy**.
+
 Build: `scripts/build-app.sh` → `build/OpenProxy.app` (ad-hoc signed). Open it. On the first launch a welcome dialog explains what will be set up; **Continue** does everything, there is no Install button:
 
 1. A trust dialog for the CA (Touch ID or password). Trust is **per-user**: the CA certificate is imported into your **login keychain**, not the System keychain. It is skipped when the CA is already trusted.
@@ -87,7 +89,7 @@ Restart any other long-running client the same way.
 
 ## Uninstall / emergency removal
 
-macOS has no hook for deleting an app, so use **Uninstall OpenProxy…** at the bottom of the menu *before* you delete it. After a confirmation it removes the hosts line first (the safety-critical step), then autostart, the per-user trust and the certificate from your login keychain, the `NODE_EXTRA_CA_CERTS` variable (only when it still points at our `ca.pem`), best-effort any certificate an older install left in the System keychain, and finally all OpenProxy data (`~/Library/Application Support/openproxy`), then quits. A normal per-user uninstall shows only the system trust-settings authorization that removing the login-keychain trust needs; the admin password prompt appears only when an older install left a certificate or admin-domain trust in the System keychain. The root helper stays registered but idle — it only edits the one hosts line on request — and is dropped when you delete the app, or by switching OpenProxy off in **System Settings → Login Items**.
+macOS has no hook for deleting an app, so use **Uninstall OpenProxy…** from the right-click menu *before* you delete it. After a confirmation it removes the hosts line first (the safety-critical step), then autostart, the per-user trust and the certificate from your login keychain, the `NODE_EXTRA_CA_CERTS` variable (only when it still points at our `ca.pem`), best-effort any certificate an older install left in the System keychain, and finally all OpenProxy data (`~/Library/Application Support/openproxy`), then quits. A normal per-user uninstall shows only the system trust-settings authorization that removing the login-keychain trust needs; the admin password prompt appears only when an older install left a certificate or admin-domain trust in the System keychain. The root helper stays registered but idle — it only edits the one hosts line on request — and is dropped when you delete the app, or by switching OpenProxy off in **System Settings → Login Items**.
 
 If the app is gone or crashed, `openrouter.ai` stays unreachable until the hosts line is removed. Do it manually, then remove the trust and the certificate:
 
