@@ -62,6 +62,7 @@ public enum AppGraph {
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: SMAppServiceLoginItem(), quitDecision: quitDecision,
             helper: SMAppServiceDaemon(), helperSession: hostsEditor,
+            legacyCleanup: SMAppServiceLegacyCleanup(),
             setupDecision: setupDecision,
             uninstallDecision: uninstallDecision,
             dataRemover: AppSupportDataRemover(directory: baseDirectory),

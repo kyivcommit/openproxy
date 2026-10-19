@@ -134,6 +134,20 @@ private final class FakeHelper: HelperRegistering, @unchecked Sendable {
     func openApprovalSettings() { openApprovalCount += 1 }
 }
 
+/// Records the legacy-service cleanup; `onClean` lets a test place it in the step-order log.
+private final class FakeLegacyCleanup: LegacyServiceCleaning, @unchecked Sendable {
+    var onClean: (() -> Void)?
+    private let lock = NSLock()
+    private var _count = 0
+
+    var count: Int { lock.withLock { _count } }
+
+    func removeLegacyRegistrations() {
+        lock.withLock { _count += 1 }
+        onClean?()
+    }
+}
+
 /// Records the helper's live-session signal without opening a real XPC connection.
 private final class FakeHelperSession: HelperSessionKeeping, @unchecked Sendable {
     private let lock = NSLock()
@@ -261,6 +275,7 @@ private struct Harness {
     let loginItem: FakeLoginItem
     let helper: FakeHelper
     let helperSession: FakeHelperSession
+    let legacyCleanup: FakeLegacyCleanup
     let hostsEditor: FakeHostsEditor
     let quitDecision: FakeQuitDecision
     let setupDecision: FakeSetupDecision
@@ -287,6 +302,7 @@ private struct Harness {
         self.hostsEditor = FakeHostsEditor()
         self.helper = FakeHelper()
         self.helperSession = FakeHelperSession()
+        self.legacyCleanup = FakeLegacyCleanup()
         self.installer = Installer(
             caPEMURL: ca.caCertificatePEMURL,
             runner: runner,
@@ -319,6 +335,7 @@ private struct Harness {
         self.loginItem.onRegister = { [orderLog] in orderLog.append("autostart") }
         self.loginItem.onUnregister = { [orderLog] in orderLog.append("autostart") }
         self.helper.onRegister = { [orderLog] in orderLog.append("helper") }
+        self.legacyCleanup.onClean = { [orderLog] in orderLog.append("legacy") }
         self.hostsEditor.onRequest = { [orderLog] in orderLog.append("hosts") }
         self.quitDecision.onTerminate = { [orderLog] in orderLog.append("quit") }
         self.dataRemover.onRemove = { [orderLog] in orderLog.append("data") }
@@ -329,6 +346,7 @@ private struct Harness {
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: loginItem, quitDecision: quitDecision,
             helper: helper, helperSession: helperSession,
+            legacyCleanup: legacyCleanup,
             setupDecision: setupDecision,
             uninstallDecision: uninstallDecision,
             dataRemover: dataRemover,
@@ -1073,6 +1091,40 @@ struct AppModelTests {
         await model.install()
 
         #expect(h.orderLog.sequence == ["trust", "helper", "autostart", "hosts", "nodeenv"])
+    }
+
+    @Test func startRemovesLegacyRegistrationsBeforeNewSetupRegistrations() async throws {
+        // An upgrade must drop the old LaunchAgent and LaunchDaemon before the new setup
+        // registers the helper or autostart, or the app can start twice and the old daemon
+        // can hold dev.openproxy.helper.
+        let h = try Harness()
+        h.helper.status = .notRegistered
+        h.helper.statusAfterRegister = .enabled
+        h.setupDecision.confirm = true
+        let model = h.model()
+
+        await model.start()
+
+        #expect(h.legacyCleanup.count == 1)
+        let sequence = h.orderLog.sequence
+        #expect(sequence.first == "legacy")
+        #expect(sequence.firstIndex(of: "legacy")! < sequence.firstIndex(of: "helper")!)
+        #expect(sequence.firstIndex(of: "legacy")! < sequence.firstIndex(of: "autostart")!)
+    }
+
+    @Test func laterLaunchRemovesLegacyRegistrationsBeforeRestoringTheRoute() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.legacyCleanup.count == 1)
+        let sequence = h.orderLog.sequence
+        #expect(sequence.first == "legacy")
+        #expect(sequence.firstIndex(of: "legacy")! < sequence.firstIndex(of: "hosts")!)
     }
 
     @Test func installWaitsForAutostartApprovalBeforeAddingHosts() async throws {

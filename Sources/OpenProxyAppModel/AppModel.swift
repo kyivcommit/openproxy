@@ -148,6 +148,7 @@ public final class AppModel {
     private let loginItem: LoginItemRegistering
     private let helper: HelperRegistering
     private let helperSession: HelperSessionKeeping
+    private let legacyCleanup: LegacyServiceCleaning
     private let quitDecision: QuitDecision
     private let setupDecision: SetupDecision
     private let uninstallDecision: UninstallDecision
@@ -164,6 +165,7 @@ public final class AppModel {
         quitDecision: QuitDecision,
         helper: HelperRegistering = NoHelperRegistration(),
         helperSession: HelperSessionKeeping = NoHelperSession(),
+        legacyCleanup: LegacyServiceCleaning = NoLegacyServiceCleaning(),
         setupDecision: SetupDecision = NoSetupDecision(),
         uninstallDecision: UninstallDecision = NoUninstallDecision(),
         dataRemover: AppDataRemoving = NoAppDataRemoving(),
@@ -179,6 +181,7 @@ public final class AppModel {
         self.loginItem = loginItem
         self.helper = helper
         self.helperSession = helperSession
+        self.legacyCleanup = legacyCleanup
         self.quitDecision = quitDecision
         self.setupDecision = setupDecision
         self.uninstallDecision = uninstallDecision
@@ -196,6 +199,10 @@ public final class AppModel {
     }
 
     public func start() async {
+        // Upgrades still carry the old LaunchAgent and LaunchDaemon; drop them before any new
+        // registration or restore, so the app cannot start twice and the old daemon cannot
+        // hold dev.openproxy.helper against the new one.
+        legacyCleanup.removeLegacyRegistrations()
         observeHelperSessionIfNeeded()
         guard await startServer(ifFailed: "The hosts entry was left unchanged.") else { return }
         await refresh()
