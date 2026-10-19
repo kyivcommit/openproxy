@@ -3,4 +3,6 @@ spike/*.key
 .DS_Store
 build/
 /docs/
+# Local symlink to docs/AGENTS.md; the real file lives in the docs repo.
+/AGENTS.md
 /spike/

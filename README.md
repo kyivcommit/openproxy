@@ -41,7 +41,7 @@ Build: `scripts/build-app.sh` → `build/OpenProxy.app` (ad-hoc signed). Open it
 
 1. A trust dialog for the CA (Touch ID or password). Trust is **per-user**: the CA certificate is imported into your **login keychain**, not the System keychain. It is skipped when the CA is already trusted.
 2. A small root helper (`dev.openproxy.helper`, a launch daemon registered with `SMAppService`) edits `/etc/hosts` without a password prompt. macOS asks you once to approve it in **System Settings → Login Items**; the app opens that pane and continues by itself when approval arrives. The helper has exactly one operation: add or remove the managed hosts line. Uninstall keeps it registered but idle; it is dropped when you delete the app, or by switching OpenProxy off in **System Settings → Login Items**.
-3. Autostart (a LaunchAgent, so the proxy is back after login) and `NODE_EXTRA_CA_CERTS` for processes started afterwards (see [Client trust](#client-trust)); if the last step fails it only shows a warning.
+3. Autostart is the app's login item (`SMAppService.mainApp`), and the approved root helper removes the managed `/etc/hosts` line if the app exits or crashes, so clients are not left routed to a dead proxy; `NODE_EXTRA_CA_CERTS` is set for processes started afterwards (see [Client trust](#client-trust)); if the last step fails it only shows a warning.
 
 The hosts entry is written only after the CA is verified as trusted, the helper and autostart are enabled, so clients are never routed to a proxy that will not come back after login. **Not now** in the welcome dialog skips only the system setup (CA trust, root helper, hosts entry, autostart, Node env): the app still creates its local data (the CA files and the stats database) and runs the proxy, which stays idle because nothing routes to it. The welcome dialog asks again on the next launch. When a step stops waiting for approval or fails, the menu shows **Retry setup**, which runs the setup again without the welcome dialog.
 
@@ -89,9 +89,9 @@ Restart any other long-running client the same way.
 
 ## Uninstall / emergency removal
 
-macOS has no hook for deleting an app, so use **Uninstall OpenProxy…** from the right-click menu *before* you delete it. After a confirmation it removes the hosts line first (the safety-critical step), then autostart, the per-user trust and the certificate from your login keychain, the `NODE_EXTRA_CA_CERTS` variable (only when it still points at our `ca.pem`), best-effort any certificate an older install left in the System keychain, and finally all OpenProxy data (`~/Library/Application Support/openproxy`), then quits. A normal per-user uninstall shows only the system trust-settings authorization that removing the login-keychain trust needs; the admin password prompt appears only when an older install left a certificate or admin-domain trust in the System keychain. The root helper stays registered but idle — it only edits the one hosts line on request — and is dropped when you delete the app, or by switching OpenProxy off in **System Settings → Login Items**.
+macOS has no hook for deleting an app, so use **Uninstall OpenProxy…** from the right-click menu *before* you delete it. After a confirmation it removes the hosts line first (the safety-critical step), then autostart, the per-user trust and the certificate from your login keychain, the `NODE_EXTRA_CA_CERTS` variable (only when it still points at our `ca.pem`), best-effort any certificate an older install left in the System keychain, and finally all OpenProxy data (`~/Library/Application Support/openproxy`), then quits. A normal per-user uninstall shows only the system trust-settings authorization that removing the login-keychain trust needs; the admin password prompt appears only when an older install left a certificate or admin-domain trust in the System keychain. The root helper stays registered but idle — it only edits the one hosts line and watches the app's session — and is dropped when you delete the app, or by switching OpenProxy off in **System Settings → Login Items**.
 
-If the app is gone or crashed, `openrouter.ai` stays unreachable until the hosts line is removed. Do it manually, then remove the trust and the certificate:
+If the helper is unavailable (not approved, or the app was removed without uninstalling), the managed hosts line can outlive the app. Remove it manually, then remove the trust and the certificate:
 
 ```sh
 # 1. unblock openrouter.ai
@@ -127,7 +127,7 @@ CI (`.github/workflows/ci.yml`) builds, tests and packages on macOS.
 
 - Trust is **per-user**: the CA is trusted and stored only in your login keychain, not system-wide, and the private key is a file (`ca.key`, mode 600) under `~/Library/Application Support/openproxy/`. The CA is name-constrained to `openrouter.ai`, but anyone who can read the key could impersonate that one host to this Mac. Treat the directory as sensitive.
 - `Authorization` headers are forwarded to OpenRouter only and never logged or stored.
-- While the hosts entry is present and the app is not running (for example after a crash; autostart restarts it), `openrouter.ai` is unreachable from this Mac.
+- While the hosts entry is present and the app is not running, `openrouter.ai` is unreachable from this Mac. The helper removes the line when the app exits or crashes, so this window is short.
 - The root helper accepts connections only from a process signed with the OpenProxy app's own signing identifier (and, for a signed release build, the same Team ID) and can only add or remove the one managed hosts line. With ad-hoc signing that identifier is not a strong secret: any local process can sign itself with it, so the worst case is toggling that single hosts line.
 
 ## License

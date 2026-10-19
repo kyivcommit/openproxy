@@ -22,9 +22,8 @@ public struct RunningApplicationInstances: RunningInstanceProviding {
 /// Decides whether a just-launched instance should exit because another instance of the same
 /// app is already running. Pure, so the policy is unit-tested without processes.
 ///
-/// The autostart LaunchAgent (`RunAtLoad`) makes launchd start a second copy while the manually
-/// started one keeps running — two menu bar icons. The duplicate yields with `exit(0)`, so
-/// launchd does not treat it as a crash and restart it.
+/// A login-item launch can overlap with a manually started instance — two menu bar icons. The
+/// duplicate yields with `exit(0)`, so launchd does not treat it as a crash and restart it.
 public enum SingleInstanceGuard {
     /// True when any listed PID is not our own.
     public static func shouldYield(otherPIDs: [Int32], ownPID: Int32) -> Bool {

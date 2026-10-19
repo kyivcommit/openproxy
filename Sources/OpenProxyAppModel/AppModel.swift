@@ -141,6 +141,7 @@ public final class AppModel {
     private let server: ProxyServerControlling
     private let loginItem: LoginItemRegistering
     private let helper: HelperRegistering
+    private let helperSession: HelperSessionKeeping
     private let quitDecision: QuitDecision
     private let setupDecision: SetupDecision
     private let uninstallDecision: UninstallDecision
@@ -156,6 +157,7 @@ public final class AppModel {
         loginItem: LoginItemRegistering,
         quitDecision: QuitDecision,
         helper: HelperRegistering = NoHelperRegistration(),
+        helperSession: HelperSessionKeeping = NoHelperSession(),
         setupDecision: SetupDecision = NoSetupDecision(),
         uninstallDecision: UninstallDecision = NoUninstallDecision(),
         dataRemover: AppDataRemoving = NoAppDataRemoving(),
@@ -170,6 +172,7 @@ public final class AppModel {
         self.server = server
         self.loginItem = loginItem
         self.helper = helper
+        self.helperSession = helperSession
         self.quitDecision = quitDecision
         self.setupDecision = setupDecision
         self.uninstallDecision = uninstallDecision
@@ -193,6 +196,7 @@ public final class AppModel {
     }
 
     public func stop() async {
+        helperSession.stop()
         await server.stop()
         serverRunning = false
     }
@@ -213,22 +217,38 @@ public final class AppModel {
     }
 
     /// First launch: ask once, then run the automatic setup. Later launches: silently restore
-    /// the route when the setup is already complete.
+    /// the route when the setup is already complete. A helper registration can disappear (the
+    /// user switched the background item off, or the app bundle was rebuilt), so try once to
+    /// bring it back before deciding that the route must stay off.
     private func setupOrRestoreRouting() async {
         guard settings.setupComplete else {
             guard setupDecision.confirmSetup() else { return }
             await install()
             return
         }
+        if helperStatus != .enabled {
+            switch installer.helperReadiness() {
+            case .enabled:
+                helperStatus = .enabled
+            case .requiresApproval:
+                installer.openHelperApprovalSettings()
+                warn(.install, "The root helper needs approval in System Settings -> Login Items. "
+                    + "Approve OpenProxy, then choose Retry setup in the OpenProxy menu.")
+                return
+            case .unavailable:
+                break
+            }
+        }
         await restoreRouting()
     }
 
     /// True when the menu should offer Retry setup: the setup never completed (and is not
-    /// currently running), or it completed but autostart was turned off since — the Control
-    /// window leaves the route removed in that state, so the setup must be runnable again.
+    /// currently running), or it completed but autostart or the root helper is gone since —
+    /// the route is unsafe in either state, so the setup must be runnable again.
     public var canRetrySetup: Bool {
         guard !settings.setupComplete else {
-            return routingState != .settingUp && loginItemStatus != .enabled
+            return routingState != .settingUp
+                && (loginItemStatus != .enabled || helperStatus != .enabled)
         }
         switch routingState {
         case .waitingForApproval, .error: return true
@@ -299,10 +319,11 @@ public final class AppModel {
                 }
             }
 
-            // (c) autostart: a LaunchAgent must be enabled before anything routes here, or a
-            // crash would leave openrouter.ai pointing at a dead proxy. Only a pending approval
-            // is a wait (poll it with the injected clock); any other non-enabled status is a
-            // real failure, so stop at once and leave Retry setup available.
+            // (c) autostart: the login item must be enabled before anything routes here. The
+            // helper removes the hosts line if the app exits or crashes, so the route cannot
+            // outlive the proxy. Only a pending approval is a wait (poll it with the injected
+            // clock); any other non-enabled status is a real failure, so stop at once and leave
+            // Retry setup available.
             registerLoginItem()
             if loginItemStatus == .requiresApproval {
                 installer.openHelperApprovalSettings()
@@ -375,15 +396,20 @@ public final class AppModel {
         return false
     }
 
-    /// Every later launch: if the CA is trusted, the helper is enabled, autostart is enabled and
-    /// the hosts entry is missing, re-add it silently. Never runs when the proxy could not bind,
-    /// and never adds the route while autostart is off.
+    /// Every later launch: if the CA is trusted, the helper is enabled and autostart is enabled,
+    /// keep the helper session open and make sure the hosts entry is present. The edit is a
+    /// no-op when the line is already there, but it establishes the session the helper uses as
+    /// its dead-man switch. Never runs when the proxy could not bind, and never adds the route
+    /// while autostart is off.
     private func restoreRouting() async {
         guard serverRunning else { return }
-        guard status.caTrusted, helperStatus == .enabled, loginItemStatus == .enabled,
-              !status.hostsEntry
-        else {
+        guard status.caTrusted, helperStatus == .enabled, loginItemStatus == .enabled else {
             if status.hostsEntry { routingState = .active }
+            return
+        }
+        if status.hostsEntry {
+            routingState = .active
+            try? await installer.setHostsEntry(present: true)
             return
         }
         routingState = .settingUp
@@ -485,6 +511,7 @@ public final class AppModel {
 
         // 5. Quit.
         routingState = .inactive
+        helperSession.stop()
         quitDecision.terminate()
     }
 
@@ -496,6 +523,7 @@ public final class AppModel {
         if helperStatus == .enabled {
             do {
                 try await installer.setHostsEntry(present: false)
+                helperSession.stop()
                 quitDecision.terminate()
                 return
             } catch {
@@ -509,6 +537,7 @@ public final class AppModel {
         // openrouter.ai is still routed here. Only a confirmed `.absent` is safe to quit on.
         switch installer.hostsEntryState() {
         case .absent:
+            helperSession.stop()
             quitDecision.terminate()
         case .present:
             await quitAfterConfirmation()
@@ -545,6 +574,7 @@ public final class AppModel {
                 return
             }
         }
+        helperSession.stop()
         quitDecision.terminate()
     }
 
@@ -572,6 +602,10 @@ public final class AppModel {
             status = await installer.status()
             loginItemStatus = loginItem.status
             helperStatus = helper.status
+            // Keep the helper session alive only while the daemon is usable. The session is
+            // the helper's signal that the app is still running; `stop()` also removes the
+            // managed hosts line, which is what the user expects when the helper is gone.
+            if helperStatus == .enabled { helperSession.start() } else { helperSession.stop() }
             // The regenerated-CA warning stops being true once the current CA is trusted and
             // its hosts entry is in place; until then it stays visible.
             if status.caTrusted && status.hostsEntry {

@@ -15,7 +15,7 @@ public enum AppGraph {
     /// osascript fallback stays available; in a built app the helper must work.
     static func helperIsBundled(inBundleAt bundleURL: URL = Bundle.main.bundleURL) -> Bool {
         FileManager.default.fileExists(atPath: bundleURL
-            .appending(path: "Contents/Library/LaunchDaemons/dev.openproxy.helper.plist").path)
+            .appending(path: "Contents/Library/LaunchDaemons/dev.openproxy.helperd.plist").path)
     }
 
     @MainActor
@@ -40,11 +40,15 @@ public enum AppGraph {
         let catalog = EndpointCatalog(
             fetcher: UpstreamEndpointsFetcher(client: upstream),
             ttl: { [settingsStore] in TimeInterval(settingsStore.settings.pollMinutes * 60) })
+        // One editor serves both the hosts edits and the helper's live-session signal. The
+        // helper removes the hosts line when this session closes, so a crash cannot leave
+        // openrouter.ai routed to a dead proxy.
+        let hostsEditor = XPCHostsEditor()
         let installer = Installer(
             caPEMURL: ca.caCertificatePEMURL,
             runner: OsascriptRunner(),
             commandRunner: ShellCommandRunner(),
-            hostsEditor: XPCHostsEditor(),
+            hostsEditor: hostsEditor,
             helper: SMAppServiceDaemon(),
             allowPasswordFallback: !helperIsBundled())
         let server = ProxyServer(
@@ -57,7 +61,7 @@ public enum AppGraph {
         return AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: SMAppServiceLoginItem(), quitDecision: quitDecision,
-            helper: SMAppServiceDaemon(),
+            helper: SMAppServiceDaemon(), helperSession: hostsEditor,
             setupDecision: setupDecision,
             uninstallDecision: uninstallDecision,
             dataRemover: AppSupportDataRemover(directory: baseDirectory),

@@ -134,6 +134,19 @@ private final class FakeHelper: HelperRegistering, @unchecked Sendable {
     func openApprovalSettings() { openApprovalCount += 1 }
 }
 
+/// Records the helper's live-session signal without opening a real XPC connection.
+private final class FakeHelperSession: HelperSessionKeeping, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _starts = 0
+    private var _stops = 0
+
+    var starts: Int { lock.withLock { _starts } }
+    var stops: Int { lock.withLock { _stops } }
+
+    func start() { lock.withLock { _starts += 1 } }
+    func stop() { lock.withLock { _stops += 1 } }
+}
+
 /// Records the hosts edit the installer would route through the helper.
 private final class FakeHostsEditor: HostsEditing, @unchecked Sendable {
     var error: Error?
@@ -230,6 +243,7 @@ private struct Harness {
     let server: FakeServer
     let loginItem: FakeLoginItem
     let helper: FakeHelper
+    let helperSession: FakeHelperSession
     let hostsEditor: FakeHostsEditor
     let quitDecision: FakeQuitDecision
     let setupDecision: FakeSetupDecision
@@ -255,6 +269,7 @@ private struct Harness {
         self.commandRunner = FakeCommandRunner()
         self.hostsEditor = FakeHostsEditor()
         self.helper = FakeHelper()
+        self.helperSession = FakeHelperSession()
         self.installer = Installer(
             caPEMURL: ca.caCertificatePEMURL,
             runner: runner,
@@ -296,7 +311,7 @@ private struct Harness {
         AppModel(
             settingsStore: settingsStore, stats: stats, installer: installer,
             server: server, loginItem: loginItem, quitDecision: quitDecision,
-            helper: helper,
+            helper: helper, helperSession: helperSession,
             setupDecision: setupDecision,
             uninstallDecision: uninstallDecision,
             dataRemover: dataRemover,
@@ -460,22 +475,6 @@ struct AppModelTests {
         #expect(FileManager.default.fileExists(atPath: base.appending(path: "stats.sqlite").path))
     }
 
-    @Test func agentPlistUsesBundleRelativeProgramAndConditionalKeepAlive() throws {
-        // Guards the LaunchAgent contract: the program path must follow the signed
-        // bundle wherever it lives, and KeepAlive must not fight Quit.
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // OpenProxyAppTests
-            .deletingLastPathComponent()   // Tests
-            .deletingLastPathComponent()   // repo root
-        let data = try Data(contentsOf: root.appending(path: "Resources/dev.openproxy.app.plist"))
-        let dict = try #require(
-            try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
-
-        #expect(dict["ProgramArguments"] == nil)
-        #expect(dict["BundleProgram"] as? String == "Contents/MacOS/OpenProxyApp")
-        #expect((dict["KeepAlive"] as? [String: Any])?["SuccessfulExit"] as? Bool == false)
-    }
-
     @Test func loginItemRegistrationFailureBecomesWarning() throws {
         let h = try Harness()
         h.loginItem.registerError = LoginItemTestError.denied
@@ -554,6 +553,25 @@ struct AppModelTests {
         await model.refresh()
 
         #expect(model.loginItemStatus == .requiresApproval)
+    }
+
+    @Test func helperSessionTracksHelperAvailability() async throws {
+        let h = try Harness()
+        h.helper.status = .enabled
+        let model = h.model()
+
+        await model.refresh()
+
+        #expect(h.helperSession.starts >= 1)
+        let startsWhileEnabled = h.helperSession.starts
+
+        h.helper.status = .requiresApproval
+        await model.refresh()
+
+        // A disabled/unavailable helper must not keep a live session: closing it is what makes
+        // the helper remove the managed hosts line.
+        #expect(h.helperSession.starts == startsWhileEnabled)
+        #expect(h.helperSession.stops >= 1)
     }
 
     // MARK: - Autostart is tied to Install/Uninstall, not to launch
@@ -1118,6 +1136,26 @@ struct AppModelTests {
         }
     }
 
+    @Test func laterLaunchReRegistersAMissingHelper() async throws {
+        // A completed setup can lose its helper (the user turned the background item off, or a
+        // reinstall dropped it). The launch must ask for it again instead of silently showing a
+        // dead route, and must not add hosts until it is enabled.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .notFound
+        h.helper.statusAfterRegister = .requiresApproval
+        h.loginItem.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.helper.registerCount == 1)
+        #expect(h.helper.openApprovalCount == 1)
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(model.warnings.contains { $0.message.contains("needs approval") })
+        #expect(model.canRetrySetup)
+    }
+
     @Test func laterLaunchDoesNotRestoreHostsWithoutAutostart() async throws {
         let h = try Harness(hostsText: "127.0.0.1 localhost\n")
         h.helper.status = .enabled
@@ -1297,6 +1335,7 @@ struct AppModelTests {
 
     @Test func retrySetupIsNotOfferedOrRunWhenSetupIsComplete() async throws {
         let h = try Harness()
+        h.helper.status = .enabled
         let model = h.model()
         await model.install()
         #expect(model.settings.setupComplete)
@@ -1721,7 +1760,7 @@ struct AppGraphTests {
         defer { try? FileManager.default.removeItem(at: bundle) }
 
         #expect(AppGraph.helperIsBundled(inBundleAt: bundle) == false)
-        try Data().write(to: daemonDir.appending(path: "dev.openproxy.helper.plist"))
+        try Data().write(to: daemonDir.appending(path: "dev.openproxy.helperd.plist"))
         #expect(AppGraph.helperIsBundled(inBundleAt: bundle))
     }
 }

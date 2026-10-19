@@ -14,7 +14,7 @@ struct HelperRegistrationTests {
     }
 
     @Test func machServiceNameMatchesThePlistContract() {
-        // The app connects to this name; Resources/dev.openproxy.helper.plist must advertise it.
+        // The app connects to this name; Resources/dev.openproxy.helperd.plist must advertise it.
         #expect(HelperConstants.machServiceName == "dev.openproxy.helper")
     }
 
@@ -54,5 +54,29 @@ struct HelperRegistrationTests {
 
     @Test func defaultConnectionRequirementMatchesTheDefaultIdentifier() throws {
         #expect(HelperConstants.connectionRequirement == (try HelperConstants.requirement(forAppIdentifier: "dev.openproxy.app")))
+    }
+
+    @Test func lastSessionCloseIsTheDeadManSignal() {
+        var tracker = HelperConnectionTracker()
+        #expect(tracker.isIdle)
+
+        tracker.opened()
+        tracker.opened()
+        #expect(!tracker.isIdle)
+        let firstClose = tracker.closed()
+        #expect(!firstClose)
+        let lastClose = tracker.closed()
+        #expect(lastClose)
+        #expect(tracker.isIdle)
+    }
+
+    @Test func aStrayCloseCannotMakeTheTrackerNegative() {
+        var tracker = HelperConnectionTracker()
+        let firstClose = tracker.closed()
+        #expect(firstClose)
+        #expect(tracker.isIdle)
+        let secondClose = tracker.closed()
+        #expect(secondClose)
+        #expect(tracker.isIdle)
     }
 }
