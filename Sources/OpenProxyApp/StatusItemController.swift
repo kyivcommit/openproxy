@@ -11,6 +11,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let statusItem: NSStatusItem
     private let model: AppModel?
     private let startupError: String?
+    /// Left-click menu while open; its Stats, Status and warning rows follow model refreshes.
+    private var openMenu: NSMenu?
+    private var statsSub: NSMenu?
+    private var statusSub: NSMenu?
+    private static let warningTag = 77
 
     init(model: AppModel?, startupError: String? = nil) {
         self.model = model
@@ -30,10 +35,48 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// The 5 s refresh loop runs only while the left-click menu is open.
     func menuWillOpen(_ menu: NSMenu) {
         model?.menuVisibilityChanged(true)
+        if menu === openMenu { trackInfo(menu) }
     }
 
     func menuDidClose(_ menu: NSMenu) {
         model?.menuVisibilityChanged(false)
+        if menu === openMenu { openMenu = nil }
+    }
+
+    /// Re-renders the info rows whenever the model changes while the menu is open; the
+    /// observation re-arms itself and stops once the menu closes.
+    private func trackInfo(_ menu: NSMenu) {
+        guard let model, menu === openMenu else { return }
+        withObservationTracking {
+            fillInfo(model)
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self, let menu = self.openMenu else { return }
+                self.trackInfo(menu)
+            }
+        }
+    }
+
+    private func fillInfo(_ model: AppModel) {
+        guard let menu = openMenu, let statsSub, let statusSub else { return }
+        statsSub.removeAllItems()
+        for line in MenuContent.statsLines(model.summary) { statsSub.addItem(row(line)) }
+        statusSub.removeAllItems()
+        for line in MenuContent.statusLines(
+            model.status, loginItem: model.loginItemStatus, helper: model.helperStatus,
+            routingLabel: model.routingLabel) {
+            statusSub.addItem(row(line))
+        }
+        for item in menu.items where item.tag == Self.warningTag { menu.removeItem(item) }
+        let anchor = menu.indexOfItem(withSubmenu: statusSub) + 1
+        let warnings = MenuContent.warningLines(
+            unreachable: model.unreachableWarning, untrustedCA: model.untrustedCAWarning,
+            warnings: model.warnings)
+        for (offset, line) in warnings.enumerated() {
+            let item = row(line)
+            item.tag = Self.warningTag
+            menu.insertItem(item, at: anchor + offset)
+        }
     }
 
     @objc private func handleClick() {
@@ -97,26 +140,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         })
 
         menu.addItem(.separator())
-        menu.addItem(submenu("Stats (24h)") { sub in
-            for line in MenuContent.statsLines(model.summary) {
-                sub.addItem(self.row(line))
-            }
-        })
-        menu.addItem(submenu("Status") { sub in
-            for line in MenuContent.statusLines(
-                model.status,
-                loginItem: model.loginItemStatus,
-                helper: model.helperStatus,
-                routingLabel: model.routingLabel) {
-                sub.addItem(self.row(line))
-            }
-        })
-        for line in MenuContent.warningLines(
-            unreachable: model.unreachableWarning,
-            untrustedCA: model.untrustedCAWarning,
-            warnings: model.warnings) {
-            menu.addItem(row(line))
-        }
+        let stats = submenu("Stats (24h)") { _ in }
+        let status = submenu("Status") { _ in }
+        menu.addItem(stats)
+        menu.addItem(status)
+        openMenu = menu
+        statsSub = stats.submenu
+        statusSub = status.submenu
+        fillInfo(model)
 
         if model.canRetrySetup {
             menu.addItem(.separator())
