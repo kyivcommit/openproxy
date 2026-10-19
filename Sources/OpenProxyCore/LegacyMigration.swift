@@ -41,18 +41,29 @@ public struct SMAppServiceLegacyCleanup: LegacyServiceCleaning {
         return LegacyServiceCleanupReport(
             daemonFailure: Self.remove(
                 name: "dev.openproxy.helper legacy daemon",
+                stubExists: Self.stubExists("Contents/Library/LaunchDaemons/dev.openproxy.helper.plist"),
                 status: { daemon.status },
                 unregister: { try daemon.unregister() }),
             agentFailure: Self.remove(
                 name: "dev.openproxy.app legacy agent",
+                stubExists: Self.stubExists("Contents/Library/LaunchAgents/dev.openproxy.app.plist"),
                 status: { agent.status },
                 unregister: { try agent.unregister() }))
     }
 
-    /// Removes one legacy service. Returns nil only when it is confirmed gone: a missing plist
-    /// or any other unregister failure means the service may still be registered.
+    /// `.notFound` means two different things: the service is absent, or its bundled plist is
+    /// missing. The stub check separates the benign case from a packaging error.
+    private static func stubExists(_ relativePath: String) -> Bool {
+        FileManager.default.fileExists(
+            atPath: Bundle.main.bundleURL.appending(path: relativePath).path)
+    }
+
+    /// Removes one legacy service. Returns nil only when it is confirmed gone: `.notRegistered`,
+    /// `.notFound` with the compatibility stub present, or a successful unregister. A missing
+    /// stub or any other unregister failure means the service may still be registered.
     static func remove(
         name: String,
+        stubExists: Bool,
         status: () -> SMAppService.Status,
         unregister: () throws -> Void
     ) -> String? {
@@ -60,8 +71,12 @@ public struct SMAppServiceLegacyCleanup: LegacyServiceCleaning {
         case .notRegistered:
             return nil
         case .notFound:
-            return "\(name): legacy plist is missing from the bundle, so it cannot be "
-                + "unregistered. Remove it in System Settings -> Login Items."
+            guard stubExists else {
+                return "\(name): legacy plist is missing from the bundle, so it cannot be "
+                    + "unregistered. Remove it in System Settings -> Login Items."
+            }
+            // The stub is present and the system has no registration for it: confirmed absent.
+            return nil
         case .enabled, .requiresApproval:
             break
         @unknown default:
