@@ -15,7 +15,7 @@ public enum AppGraph {
     /// osascript fallback stays available; in a built app the helper must work.
     static func helperIsBundled(inBundleAt bundleURL: URL = Bundle.main.bundleURL) -> Bool {
         FileManager.default.fileExists(atPath: bundleURL
-            .appending(path: "Contents/Library/LaunchDaemons/dev.openproxy.helperd.plist").path)
+            .appending(path: "Contents/Library/LaunchDaemons/dev.openproxy.helperd3.plist").path)
     }
 
     @MainActor

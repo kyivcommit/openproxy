@@ -14,7 +14,7 @@ struct HelperRegistrationTests {
     }
 
     @Test func machServiceNameMatchesThePlistContract() {
-        // The app connects to this name; Resources/dev.openproxy.helperd.plist must advertise it.
+        // The app connects to this name; Resources/dev.openproxy.helperd3.plist must advertise it.
         #expect(HelperConstants.machServiceName == "dev.openproxy.helper")
     }
 

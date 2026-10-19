@@ -13,7 +13,7 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" \
 cp .build/release/OpenProxyApp "$app/Contents/MacOS/OpenProxyApp"
 cp .build/release/OpenProxyHelper "$app/Contents/MacOS/OpenProxyHelper"
 cp Resources/Info.plist "$app/Contents/Info.plist"
-cp Resources/dev.openproxy.helperd.plist "$app/Contents/Library/LaunchDaemons/dev.openproxy.helperd.plist"
+cp Resources/dev.openproxy.helperd3.plist "$app/Contents/Library/LaunchDaemons/dev.openproxy.helperd3.plist"
 
 # Sign nested code first, then the app; avoid --deep (it re-signs the helper unnecessarily and
 # can change the binary hash launchd recorded for the daemon). SMAppService.daemon needs a

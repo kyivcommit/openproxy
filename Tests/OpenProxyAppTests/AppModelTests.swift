@@ -1794,7 +1794,7 @@ struct AppGraphTests {
         defer { try? FileManager.default.removeItem(at: bundle) }
 
         #expect(AppGraph.helperIsBundled(inBundleAt: bundle) == false)
-        try Data().write(to: daemonDir.appending(path: "dev.openproxy.helperd.plist"))
+        try Data().write(to: daemonDir.appending(path: "dev.openproxy.helperd3.plist"))
         #expect(AppGraph.helperIsBundled(inBundleAt: bundle))
     }
 }

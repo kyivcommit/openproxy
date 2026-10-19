@@ -6,7 +6,7 @@ import Foundation
 /// that runs caller-supplied input is a privilege-escalation hole.
 public enum HelperConstants {
     /// The Mach service the daemon advertises and the app connects to. Must match
-    /// `MachServices` in `Resources/dev.openproxy.helperd.plist`.
+    /// `MachServices` in `Resources/dev.openproxy.helperd3.plist`.
     public static let machServiceName = "dev.openproxy.helper"
 
     /// The only client the daemon accepts: a process signed as the OpenProxy app.

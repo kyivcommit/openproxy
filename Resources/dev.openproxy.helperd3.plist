@@ -2,16 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>Label</key>
-	<string>dev.openproxy.helperd2</string>
 	<key>BundleProgram</key>
 	<string>Contents/MacOS/OpenProxyHelper</string>
-	<key>RunAtLoad</key>
-	<true/>
+	<key>Label</key>
+	<string>dev.openproxy.helperd3</string>
 	<key>MachServices</key>
 	<dict>
 		<key>dev.openproxy.helper</key>
 		<true/>
 	</dict>
+	<key>RunAtLoad</key>
+	<true/>
 </dict>
 </plist>

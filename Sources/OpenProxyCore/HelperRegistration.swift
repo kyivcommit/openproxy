@@ -36,15 +36,16 @@ public protocol HelperRegistering: Sendable {
 /// The production registrar: `SMAppService.daemon(plistName:)` over the launch daemon bundled
 /// at `Contents/Library/LaunchDaemons/<plistName>`.
 ///
-/// The plist is `dev.openproxy.helperd.plist` and its launchd label is
-/// `dev.openproxy.helperd2`; the Mach service stays `dev.openproxy.helper`. The distinct
+/// The plist is `dev.openproxy.helperd3.plist` and its launchd label is
+/// `dev.openproxy.helperd3`; the Mach service stays `dev.openproxy.helper`. The distinct
 /// label gives the daemon a fresh background-item record when an ad-hoc rebuild changes its
 /// signature; reusing the old label made macOS keep the previous binary's checksum and
-/// launchd refused to spawn the rebuilt helper.
+/// launchd refused to spawn the rebuilt helper. The file name and label must match for
+/// launchd to import `MachServices`.
 public struct SMAppServiceDaemon: HelperRegistering {
     private let plistName: String
 
-    public init(plistName: String = "dev.openproxy.helperd.plist") {
+    public init(plistName: String = "dev.openproxy.helperd3.plist") {
         self.plistName = plistName
     }
 
