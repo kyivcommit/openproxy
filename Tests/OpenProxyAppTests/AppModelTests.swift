@@ -1367,7 +1367,7 @@ struct AppModelTests {
         #expect(model.routingState != .active)
     }
 
-    @Test func refreshWithHostsEntryButHelperNeedingApprovalDoesNotActivate() async throws {
+    @Test func refreshWithHostsEntryButHelperNeedingApprovalShowsUnprotectedError() async throws {
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
         h.helper.status = .requiresApproval
         let model = h.model()
@@ -1375,7 +1375,34 @@ struct AppModelTests {
 
         await model.refresh()
 
-        #expect(model.routingState != .active)
+        #expect(model.routingState == .error("routing is not protected"))
+        #expect(model.warnings.contains {
+            $0.key == .helperSession && $0.message.contains("still routed")
+        })
+        #expect(model.canRetrySetup)
+    }
+
+    @Test func helperApprovalWithAnExistingRouteShowsUnprotectedError() async throws {
+        // A completed setup with a routed line and a helper waiting for approval must not look
+        // merely inactive: the route has no dead-man switch until the helper is enabled.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .requiresApproval
+        h.loginItem.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.helper.openApprovalCount == 1)
+        #expect(h.hostsEditor.requests.isEmpty)
+        #expect(model.routingState == .error("routing is not protected"))
+        #expect(model.warnings.contains {
+            $0.key == .helperSession && $0.message.contains("still routed")
+        })
+        #expect(model.warnings.contains {
+            $0.key == .install && $0.message.contains("needs approval")
+        })
+        #expect(model.canRetrySetup)
     }
 
     @Test func routingErrorClearsAfterTheSessionReconnects() async throws {

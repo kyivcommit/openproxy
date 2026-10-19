@@ -118,6 +118,18 @@ public final class AppModel {
         return false
     }
 
+    /// A routed line without a live helper session has no dead-man switch. Tell the user how
+    /// to make it safe when the helper cannot be used (for example while approval is pending).
+    private static let unprotectedRouteMessage =
+        "openrouter.ai is still routed here, but the root helper, autostart or CA trust is not "
+        + "ready. Approve OpenProxy in System Settings -> Login Items, or remove the line "
+        + "manually: sudo sed -i '' '/# openproxy/d' /etc/hosts && sudo dscacheutil -flushcache."
+
+    private func markRoutingUnprotected() {
+        routingState = .error("routing is not protected")
+        warn(.helperSession, Self.unprotectedRouteMessage)
+    }
+
     /// Derived from `status`, so it stays visible for as long as the danger lasts
     /// (proxy quit/crashed with the hosts entry still routed) and clears itself.
     public var unreachableWarning: String? { status.unreachableWarning }
@@ -271,6 +283,7 @@ public final class AppModel {
                 installer.openHelperApprovalSettings()
                 warn(.install, "The root helper needs approval in System Settings -> Login Items. "
                     + "Approve OpenProxy, then choose Retry setup in the OpenProxy menu.")
+                if status.hostsEntry { markRoutingUnprotected() }
                 return
             case .unavailable:
                 break
@@ -499,9 +512,7 @@ public final class AppModel {
             if status.hostsEntry {
                 // A routed line without the helper, autostart or CA trust has no dead-man
                 // switch: it must not read as a healthy route.
-                routingState = .error("routing is not protected")
-                warn(.helperSession, "openrouter.ai is still routed here, but the helper, "
-                    + "autostart or CA trust is not ready. Fix setup or remove the route.")
+                markRoutingUnprotected()
             } else if routingState != .settingUp {
                 routingState = .inactive
             }
@@ -733,10 +744,8 @@ public final class AppModel {
                         routingState = .active
                         clearWarnings([.helperSession])
                     }
-                } else if routingState == .active {
-                    routingState = .error("routing is not protected")
-                    warn(.helperSession, "openrouter.ai is still routed here, but the helper, "
-                        + "autostart or CA trust is not ready. Fix setup or remove the route.")
+                } else if routingState == .active || routingState == .inactive {
+                    markRoutingUnprotected()
                 }
             }
             waiters.forEach { $0.resume() }
