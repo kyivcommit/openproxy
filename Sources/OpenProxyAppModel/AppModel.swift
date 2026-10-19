@@ -42,6 +42,7 @@ public enum WarningKey: Hashable, Sendable {
     case autostart
     case nodeEnv
     case helperSession
+    case legacyMigration
 }
 
 public struct Warning: Equatable, Sendable, Identifiable {
@@ -139,6 +140,9 @@ public final class AppModel {
     /// Whether `server.start()` already bound the port. Guards Install from a
     /// second bind (and from installing hosts before anything listens).
     private var serverRunning = false
+    /// Set when the old daemon could not be removed: it may still hold the Mach service, so
+    /// the route must stay off until a retry succeeds.
+    private var legacyDaemonRemovalFailed = false
 
     private var currentSettings: Settings
     private let settingsStore: SettingsStore
@@ -202,11 +206,23 @@ public final class AppModel {
         // Upgrades still carry the old LaunchAgent and LaunchDaemon; drop them before any new
         // registration or restore, so the app cannot start twice and the old daemon cannot
         // hold dev.openproxy.helper against the new one.
-        legacyCleanup.removeLegacyRegistrations()
+        applyLegacyCleanup()
         observeHelperSessionIfNeeded()
         guard await startServer(ifFailed: "The hosts entry was left unchanged.") else { return }
         await refresh()
         await setupOrRestoreRouting()
+    }
+
+    /// Runs the legacy-service migration and records what it left behind. A failed daemon
+    /// removal keeps the route off; every failure is surfaced so Retry setup can be offered.
+    private func applyLegacyCleanup() {
+        let report = legacyCleanup.removeLegacyRegistrations()
+        legacyDaemonRemovalFailed = report.blocksRouting
+        if report.hasFailures {
+            warn(.legacyMigration, report.message ?? "Legacy service cleanup failed.")
+        } else {
+            clearWarnings([.legacyMigration])
+        }
     }
 
     public func stop() async {
@@ -235,6 +251,10 @@ public final class AppModel {
     /// user switched the background item off, or the app bundle was rebuilt), so try once to
     /// bring it back before deciding that the route must stay off.
     private func setupOrRestoreRouting() async {
+        guard !legacyDaemonRemovalFailed else {
+            routingState = .error("legacy helper still registered")
+            return
+        }
         guard settings.setupComplete else {
             guard setupDecision.confirmSetup() else { return }
             await install()
@@ -263,6 +283,7 @@ public final class AppModel {
     /// currently running), or it completed but autostart or the root helper is gone since —
     /// the route is unsafe in either state, so the setup must be runnable again.
     public var canRetrySetup: Bool {
+        if legacyDaemonRemovalFailed { return true }
         guard !settings.setupComplete else {
             guard routingState != .settingUp else { return false }
             if isRoutingError { return true }
@@ -314,6 +335,15 @@ public final class AppModel {
     /// failing), autostart (also a wait when approval is pending), the hosts entry, then the
     /// Node env. `setupComplete` is set only when the critical steps succeed.
     public func install() async {
+        // Retry setup after a failed legacy daemon removal retries the migration first; a
+        // still-registered old daemon may hold the Mach service the new helper needs.
+        if legacyDaemonRemovalFailed {
+            applyLegacyCleanup()
+            guard !legacyDaemonRemovalFailed else {
+                routingState = .error("legacy helper still registered")
+                return
+            }
+        }
         observeHelperSessionIfNeeded()
         guard await startServer(ifFailed: "Setup was skipped; the hosts entry was left unchanged.") else {
             await refresh()
@@ -460,6 +490,10 @@ public final class AppModel {
     /// its dead-man switch. Never runs when the proxy could not bind, and never adds the route
     /// while autostart is off.
     private func restoreRouting() async {
+        guard !legacyDaemonRemovalFailed else {
+            routingState = .error("legacy helper still registered")
+            return
+        }
         guard serverRunning else { return }
         guard status.caTrusted, helperStatus == .enabled, loginItemStatus == .enabled else {
             if status.hostsEntry {
@@ -688,7 +722,11 @@ public final class AppModel {
             }
             // A later launch that already has the route shows it as active without a restore,
             // but only while every protection is actually in place right now.
-            if settings.setupComplete, status.hostsEntry, routingState != .settingUp {
+            if legacyDaemonRemovalFailed, routingState == .active {
+                routingState = .error("legacy helper still registered")
+            }
+            if settings.setupComplete, status.hostsEntry, routingState != .settingUp,
+               !legacyDaemonRemovalFailed {
                 if status.caTrusted, helperStatus == .enabled, loginItemStatus == .enabled,
                    helperSession.isSessionReady {
                     if routingState == .inactive || isRoutingError {

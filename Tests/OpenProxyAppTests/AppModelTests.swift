@@ -135,16 +135,22 @@ private final class FakeHelper: HelperRegistering, @unchecked Sendable {
 }
 
 /// Records the legacy-service cleanup; `onClean` lets a test place it in the step-order log.
+/// Mutating `report` between calls makes the retry path testable.
 private final class FakeLegacyCleanup: LegacyServiceCleaning, @unchecked Sendable {
     var onClean: (() -> Void)?
+    var report = LegacyServiceCleanupReport()
     private let lock = NSLock()
     private var _count = 0
 
     var count: Int { lock.withLock { _count } }
 
-    func removeLegacyRegistrations() {
-        lock.withLock { _count += 1 }
+    func removeLegacyRegistrations() -> LegacyServiceCleanupReport {
+        let report = lock.withLock { () -> LegacyServiceCleanupReport in
+            _count += 1
+            return self.report
+        }
         onClean?()
+        return report
     }
 }
 
@@ -1125,6 +1131,85 @@ struct AppModelTests {
         let sequence = h.orderLog.sequence
         #expect(sequence.first == "legacy")
         #expect(sequence.firstIndex(of: "legacy")! < sequence.firstIndex(of: "hosts")!)
+    }
+
+    @Test func failedLegacyDaemonRemovalBlocksSetupAndRestore() async throws {
+        // A still-registered old daemon may hold dev.openproxy.helper against the new helper.
+        // First launch: the setup must not even start. Later launch: no route edit at all.
+        let setup = try Harness(hostsText: "127.0.0.1 localhost\n")
+        setup.setupDecision.confirm = true
+        setup.helper.status = .notRegistered
+        setup.legacyCleanup.report = LegacyServiceCleanupReport(
+            daemonFailure: "old helper daemon: still registered")
+        let setupModel = setup.model()
+
+        await setupModel.start()
+
+        #expect(setup.orderLog.sequence.first == "legacy")
+        #expect(setup.setupDecision.count == 0)
+        #expect(setup.helper.registerCount == 0)
+        #expect(setup.hostsEditor.requests.isEmpty)
+        #expect(!setupModel.settings.setupComplete)
+        #expect(setupModel.routingState == .error("legacy helper still registered"))
+        #expect(setupModel.warnings.contains { $0.key == .legacyMigration })
+        #expect(setupModel.canRetrySetup)
+
+        let restore = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        restore.helper.status = .enabled
+        restore.loginItem.status = .enabled
+        restore.legacyCleanup.report = LegacyServiceCleanupReport(
+            daemonFailure: "old helper daemon: still registered")
+        let restoreModel = restore.model()
+        restoreModel.settings.setupComplete = true
+
+        await restoreModel.start()
+
+        #expect(restore.hostsEditor.requests.isEmpty)
+        #expect(restoreModel.routingState == .error("legacy helper still registered"))
+        #expect(restoreModel.canRetrySetup)
+    }
+
+    @Test func legacyAgentFailureWarnsButDoesNotBlockTheRestore() async throws {
+        // Only the daemon conflicts with the new helper over the Mach service.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .enabled
+        h.legacyCleanup.report = LegacyServiceCleanupReport(
+            agentFailure: "old app agent: still registered")
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(model.routingState == .active)
+        #expect(h.hostsEditor.requests == [true])
+        #expect(model.warnings.contains {
+            $0.key == .legacyMigration && $0.message.contains("old app agent")
+        })
+        #expect(!model.canRetrySetup)
+    }
+
+    @Test func retrySetupRetriesTheLegacyDaemonRemovalAndThenInstalls() async throws {
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .notRegistered
+        h.helper.statusAfterRegister = .enabled
+        h.legacyCleanup.report = LegacyServiceCleanupReport(
+            daemonFailure: "old helper daemon: still registered")
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(model.routingState == .error("legacy helper still registered"))
+        #expect(h.legacyCleanup.count == 1)
+
+        h.legacyCleanup.report = LegacyServiceCleanupReport()
+        await model.retrySetup()
+
+        #expect(h.legacyCleanup.count == 2)
+        #expect(model.routingState == .active)
+        #expect(h.hostsEditor.requests == [true])
+        #expect(!model.warnings.contains { $0.key == .legacyMigration })
     }
 
     @Test func installWaitsForAutostartApprovalBeforeAddingHosts() async throws {
