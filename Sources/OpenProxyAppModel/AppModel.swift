@@ -230,6 +230,9 @@ public final class AppModel {
             switch installer.helperReadiness() {
             case .enabled:
                 helperStatus = .enabled
+                // Arm the persistent session before the hosts edit. Without this flag the
+                // editor's reconnect path stays disabled if the helper later drops.
+                helperSession.start()
             case .requiresApproval:
                 installer.openHelperApprovalSettings()
                 warn(.install, "The root helper needs approval in System Settings -> Login Items. "
@@ -306,7 +309,10 @@ public final class AppModel {
 
             // (b) helper: register once; approval is a wait, not a failure.
             switch installer.helperReadiness() {
-            case .enabled, .unavailable:
+            case .enabled:
+                helperStatus = .enabled
+                helperSession.start()
+            case .unavailable:
                 break
             case .requiresApproval:
                 installer.openHelperApprovalSettings()
@@ -408,8 +414,17 @@ public final class AppModel {
             return
         }
         if status.hostsEntry {
-            routingState = .active
-            try? await installer.setHostsEntry(present: true)
+            // The line is already there, but this edit also proves the helper session works.
+            // Do not claim "active" if that confirmation failed: without the session the
+            // helper cannot remove the line when this app exits or crashes.
+            do {
+                try await installer.setHostsEntry(present: true)
+                routingState = .active
+            } catch {
+                warn(.install, "openrouter.ai is routed here, but the root helper could not "
+                    + "confirm the session: \(error).")
+                routingState = .error(String(describing: error))
+            }
             return
         }
         routingState = .settingUp

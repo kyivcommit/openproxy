@@ -62,6 +62,9 @@ private final class HelperHosts: @unchecked Sendable {
     private let startupGrace: DispatchTimeInterval
     private var tracker = HelperConnectionTracker()
     private var startupCleanup: DispatchWorkItem?
+    private let cleanupRetry = HelperCleanupRetry()
+    private var cleanupAttempts = 0
+    private var cleanupWork: DispatchWorkItem?
 
     init(hostsPath: String = "/etc/hosts", startupGrace: DispatchTimeInterval = .seconds(10)) {
         self.hostsPath = hostsPath
@@ -81,8 +84,7 @@ private final class HelperHosts: @unchecked Sendable {
 
     func connectionOpened() {
         queue.async {
-            self.startupCleanup?.cancel()
-            self.startupCleanup = nil
+            self.cancelCleanup()
             self.tracker.opened()
         }
     }
@@ -108,18 +110,42 @@ private final class HelperHosts: @unchecked Sendable {
     func setHostsEntry(present: Bool, reply: @escaping (String?) -> Void) {
         let once = ReplyOnce(reply)
         queue.async {
-            if !present {
-                self.startupCleanup?.cancel()
-                self.startupCleanup = nil
-            }
+            // A fresh edit cancels any pending removal: the app is clearly back.
+            self.cancelCleanup()
             once.send(self.apply(present: present))
         }
     }
 
+    private func cancelCleanup() {
+        startupCleanup?.cancel()
+        startupCleanup = nil
+        cleanupWork?.cancel()
+        cleanupWork = nil
+        cleanupAttempts = 0
+    }
+
     private func removeIfIdle() {
-        guard tracker.isIdle else { return }
+        cleanupWork?.cancel()
+        cleanupWork = nil
+        guard tracker.isIdle else {
+            cleanupAttempts = 0
+            return
+        }
         helperLog.log("no app session: removing the managed hosts line")
-        _ = apply(present: false)
+        guard let error = apply(present: false) else {
+            cleanupAttempts = 0
+            return
+        }
+        cleanupAttempts += 1
+        guard let delay = cleanupRetry.delay(afterFailedAttempt: cleanupAttempts) else {
+            let attempts = cleanupAttempts
+            cleanupAttempts = 0
+            helperLog.error("could not remove the managed hosts line after \(attempts) attempts: \(error, privacy: .public)")
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in self?.removeIfIdle() }
+        cleanupWork = work
+        queue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func apply(present: Bool) -> String? {

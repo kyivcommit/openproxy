@@ -1156,6 +1156,40 @@ struct AppModelTests {
         #expect(model.canRetrySetup)
     }
 
+    @Test func laterLaunchStartsTheSessionAfterReRegisteringAHelper() async throws {
+        // The re-registration path used to update the status only. Without start(), the editor's
+        // reconnect flag stayed off and a later connection loss was never repaired.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .notFound
+        h.helper.statusAfterRegister = .enabled
+        h.loginItem.status = .enabled
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(h.helper.registerCount == 1)
+        #expect(h.helperSession.starts >= 1)
+        #expect(h.hostsEditor.requests == [true])
+        #expect(model.routingState == .active)
+    }
+
+    @Test func existingHostsRouteIsNotActiveWhenTheHelperCannotConfirmTheSession() async throws {
+        // The line is already present, but that edit is also the session check. If the helper
+        // cannot answer, the route has no dead-man switch and must not read as active.
+        let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
+        h.helper.status = .enabled
+        h.hostsEditor.error = HostsEditingError.timedOut
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        await model.start()
+
+        #expect(model.routingState != .active)
+        #expect(model.warnings.contains { $0.message.contains("could not confirm") })
+        #expect(model.warnings.contains { $0.key == .install })
+    }
+
     @Test func laterLaunchDoesNotRestoreHostsWithoutAutostart() async throws {
         let h = try Harness(hostsText: "127.0.0.1 localhost\n")
         h.helper.status = .enabled

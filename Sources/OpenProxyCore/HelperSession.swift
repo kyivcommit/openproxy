@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 
 /// Keeps a live XPC connection to the root helper while the app runs. The helper treats the
@@ -38,4 +39,21 @@ public struct HelperConnectionTracker: Equatable, Sendable {
     }
 
     public var isIdle: Bool { active == 0 }
+}
+
+/// Bounded backoff for the dead-man cleanup. The helper retries a failed hosts removal a few
+/// times; if every attempt fails it logs a persistent failure and stops instead of spinning.
+public struct HelperCleanupRetry: Equatable, Sendable {
+    public let maxAttempts: Int
+
+    public init(maxAttempts: Int = 3) {
+        self.maxAttempts = max(1, maxAttempts)
+    }
+
+    /// Delay before the next attempt after `attempt` failed attempts, or nil when the budget
+    /// is exhausted. Attempts 1 and 2 back off by 1 s and 2 s for the default budget.
+    public func delay(afterFailedAttempt attempt: Int) -> DispatchTimeInterval? {
+        guard attempt >= 1, attempt < maxAttempts else { return nil }
+        return .seconds(1 << (attempt - 1))
+    }
 }
