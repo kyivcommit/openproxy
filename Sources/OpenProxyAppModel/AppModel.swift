@@ -257,6 +257,9 @@ public final class AppModel {
             }
             return
         }
+        // An active install() would re-add the hosts entry after this removal, leaving the
+        // route on with autostart off.
+        guard routingState != .settingUp else { return }
         do {
             try await installer.setHostsEntry(present: false)
         } catch {

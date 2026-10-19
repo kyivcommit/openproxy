@@ -1239,6 +1239,27 @@ struct AppModelTests {
         #expect(model.warnings.contains { $0.key == .autostart })
     }
 
+    @Test func setStartAtLoginOffDuringSetupLeavesTheSetupRoute() async throws {
+        // OFF must not race an active install(): it would remove the hosts entry first and
+        // the install would add it back, leaving the route on with autostart off.
+        let h = try Harness(hostsText: "127.0.0.1 localhost\n")
+        h.helper.status = .enabled
+        h.loginItem.status = .enabled
+        h.commandRunner.delay = .milliseconds(200)
+        let model = h.model()
+        model.settings.setupComplete = true
+
+        let run = Task { await model.install() }
+        #expect(await h.waitUntil { model.routingState == .settingUp })
+        await model.setStartAtLogin(false)
+        #expect(h.loginItem.unregisterCount == 0)
+
+        await run.value
+        #expect(model.loginItemStatus == .enabled)
+        #expect(model.routingState == .active)
+        #expect(h.hostsEditor.requests == [true]) // the install add only, no OFF removal
+    }
+
     @Test func relaunchAfterStartAtLoginOffDoesNotReAddHosts() async throws {
         let h = try Harness(hostsText: "127.0.0.1 openrouter.ai # openproxy\n")
         let model = h.model()
